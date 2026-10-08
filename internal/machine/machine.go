@@ -146,16 +146,30 @@ func Detect(ctx context.Context, info func(ctx context.Context) (Fingerprint, er
 	return detect(ctx, execRun, info)
 }
 
-func detect(ctx context.Context, run runFunc, info func(ctx context.Context) (Fingerprint, error)) (Machine, error) {
+// LocalName is the machine name alone, from the host name (scutil). A command
+// that needs no Docker, such as removing this Mac's heartbeat variable, uses it.
+func LocalName(ctx context.Context) (string, error) {
+	return localName(ctx, execRun)
+}
+
+func localName(ctx context.Context, run runFunc) (string, error) {
 	out, err := run(ctx, "scutil", "--get", "LocalHostName")
 	if err != nil {
-		return Machine{}, fmt.Errorf("reading LocalHostName: %w", err)
+		return "", fmt.Errorf("reading LocalHostName: %w", err)
 	}
 	name, err := Name(strings.TrimSpace(string(out)))
 	if err != nil {
-		return Machine{}, fmt.Errorf("deriving the machine name: %w; the host name must contain a letter or a digit", err)
+		return "", fmt.Errorf("deriving the machine name: %w; the host name must contain a letter or a digit", err)
 	}
-	out, err = run(ctx, "ioreg", "-rd1", "-c", "IOPlatformExpertDevice")
+	return name, nil
+}
+
+func detect(ctx context.Context, run runFunc, info func(ctx context.Context) (Fingerprint, error)) (Machine, error) {
+	name, err := localName(ctx, run)
+	if err != nil {
+		return Machine{}, err
+	}
+	out, err := run(ctx, "ioreg", "-rd1", "-c", "IOPlatformExpertDevice")
 	if err != nil {
 		return Machine{}, fmt.Errorf("reading IOPlatformUUID: %w", err)
 	}

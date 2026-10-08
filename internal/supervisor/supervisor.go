@@ -38,9 +38,12 @@ const (
 	runnerGroupID = 1
 
 	defaultDiscoverEvery = 10 * time.Minute
-	// defaultDrain is above the longest job timeout of the served projects
+	// DefaultDrain is above the longest job timeout of the served projects
 	// and below the launchd ExitTimeOut of 45 minutes.
-	defaultDrain = 40 * time.Minute
+	DefaultDrain = 40 * time.Minute
+	// DefaultHealthAddr is where the health endpoint listens, and so the
+	// address whose binding is the single-instance lock.
+	DefaultHealthAddr = "127.0.0.1:8737"
 
 	// A 409 on session create is retried for conflictWindow: a stale session
 	// of this Mac cleared in 21–39 s when measured.
@@ -67,12 +70,13 @@ const (
 
 // Config configures a Supervisor. Zero durations take their defaults.
 type Config struct {
-	// HealthAddr is bound first; binding it is the single-instance lock.
+	// HealthAddr is bound first; binding it is the single-instance lock
+	// (DefaultHealthAddr).
 	HealthAddr string
 	// DiscoverEvery is the discovery period (10 min).
 	DiscoverEvery time.Duration
 	// Drain bounds a drain, from its start to the last scale set delete
-	// (40 min).
+	// (DefaultDrain).
 	Drain time.Duration
 	// Probe serves OnlyRepo alone, under probe- names and the probe instance.
 	Probe     bool
@@ -200,17 +204,25 @@ type Deps struct {
 
 // Snapshot is the pool's state for the health endpoint and the heartbeat.
 type Snapshot struct {
-	Version, Commit, Machine string
-	Slots, InUse, Busy       int
-	Docker, Probe            bool
-	Projects                 []ProjectHealth
+	Version  string          `json:"version"`
+	Commit   string          `json:"commit"`
+	Machine  string          `json:"machine"`
+	Slots    int             `json:"slots"`
+	InUse    int             `json:"in_use"`
+	Busy     int             `json:"busy"`
+	Docker   bool            `json:"docker"`
+	Probe    bool            `json:"probe"`
+	Projects []ProjectHealth `json:"projects"`
 }
 
 // ProjectHealth is one project's state. Healthy means its listener runs on an
 // open session and its image passed the preflight.
 type ProjectHealth struct {
-	Repo, Identity, Image, Reason string
-	Healthy                       bool
+	Repo     string `json:"repo"`
+	Identity string `json:"identity"`
+	Image    string `json:"image"`
+	Reason   string `json:"reason"`
+	Healthy  bool   `json:"healthy"`
 }
 
 // Supervisor runs the pool; see Run.
@@ -242,7 +254,10 @@ func New(cfg Config, deps Deps) *Supervisor {
 		cfg.DiscoverEvery = defaultDiscoverEvery
 	}
 	if cfg.Drain <= 0 {
-		cfg.Drain = defaultDrain
+		cfg.Drain = DefaultDrain
+	}
+	if cfg.HealthAddr == "" {
+		cfg.HealthAddr = DefaultHealthAddr
 	}
 	if cfg.Instance == "" {
 		cfg.Instance = defaultInstance
@@ -452,6 +467,21 @@ func (s *Supervisor) shutdown(life context.Context, stopLife context.CancelFunc)
 		<-done
 		return err
 	}
+}
+
+// FailOnLoginLoss ends Run with a terminal error if err means the GitHub login
+// is gone (gh logged out, or a token GitHub refuses after it was read again),
+// the same classification every other GitHub call of the pool gets. It reports
+// whether it did. Callers outside the supervisor, such as the heartbeat, use it
+// so that a lost login ends the process with exit 0 instead of being logged
+// forever.
+func (s *Supervisor) FailOnLoginLoss(err error) bool {
+	t := loginRejected(err)
+	if t == nil {
+		return false
+	}
+	s.fail(t)
+	return true
 }
 
 // fail reports a fatal error to Run; the first one wins.

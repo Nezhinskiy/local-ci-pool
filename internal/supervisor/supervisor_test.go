@@ -795,3 +795,50 @@ func TestDrainBoundRemovesAndUnregistersLeftRunners(t *testing.T) {
 		t.Fatal("the runner left at the bound was not unregistered")
 	}
 }
+
+// A login lost anywhere outside the supervisor (the heartbeat's variable
+// write) ends the run the way the supervisor's own GitHub calls do: terminal.
+// Any other error leaves the run alone.
+func TestFailOnLoginLossEndsRunTerminal(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+
+	if h.sup.FailOnLoginLoss(errors.New("a transient failure")) {
+		t.Fatal("a transient error was taken for a lost login")
+	}
+	if !h.running() {
+		t.Fatal("Run returned for a transient error")
+	}
+	if !h.sup.FailOnLoginLoss(fmt.Errorf("setting a variable: %w", github.ErrUnauthorized)) {
+		t.Fatal("a rejected token was not taken for a lost login")
+	}
+	err := h.wait(defaultWait)
+	if !errors.Is(err, ErrTerminal) || !strings.Contains(err.Error(), "gh login rejected") {
+		t.Fatalf("Run = %v, want terminal gh login rejected", err)
+	}
+}
+
+func TestFailOnLoginLossForUnreadableToken(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+
+	if !h.sup.FailOnLoginLoss(fmt.Errorf("%w: gh auth token exited with status 1", ghauth.ErrNoToken)) {
+		t.Fatal("an unreadable token was not taken for a lost login")
+	}
+	err := h.wait(defaultWait)
+	if !errors.Is(err, ErrTerminal) || !strings.Contains(err.Error(), "gh logged out") {
+		t.Fatalf("Run = %v, want terminal gh logged out", err)
+	}
+}
+
+func TestDefaultsAreWhatCmdAndPlistAssume(t *testing.T) {
+	s := New(Config{}, Deps{})
+	if s.cfg.Drain != 40*time.Minute || DefaultDrain != 40*time.Minute {
+		t.Errorf("drain = %v, want 40m", s.cfg.Drain)
+	}
+	if s.cfg.HealthAddr != "127.0.0.1:8737" || DefaultHealthAddr != "127.0.0.1:8737" {
+		t.Errorf("health address = %q, want 127.0.0.1:8737", s.cfg.HealthAddr)
+	}
+}

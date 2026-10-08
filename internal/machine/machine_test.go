@@ -230,3 +230,24 @@ func TestRunnerArch(t *testing.T) {
 		}
 	}
 }
+
+func TestLocalName(t *testing.T) {
+	run := func(host string, err error) runFunc {
+		return func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if name != "scutil" || strings.Join(args, " ") != "--get LocalHostName" {
+				t.Errorf("unexpected command %s %v", name, args)
+			}
+			return []byte(host), err
+		}
+	}
+	got, err := localName(context.Background(), run("Example-MacBook\n", nil))
+	if err != nil || got != "examplemacbo" {
+		t.Fatalf("localName = %q, %v", got, err)
+	}
+	if _, err := localName(context.Background(), run("", errors.New("x"))); err == nil || !strings.Contains(err.Error(), "LocalHostName") {
+		t.Fatalf("scutil failure = %v", err)
+	}
+	if _, err := localName(context.Background(), run("!!!\n", nil)); !errors.Is(err, ErrHostName) {
+		t.Fatalf("bad host name = %v, want ErrHostName", err)
+	}
+}
