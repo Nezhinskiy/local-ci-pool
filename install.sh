@@ -26,15 +26,20 @@ LOG_DIR="$HOME/Library/Logs/local-ci-pool"
 DOMAIN="gui/$(id -u)"
 
 # The launchd ExitTimeOut of the agent is 2700 s; after a bootout the installer
-# waits that long plus a margin for launchd to report the agent gone. The
-# three knobs below exist so that the tests do not wait for real.
+# waits that long plus a margin for launchd to report the agent gone, and as
+# long again for the old process to let go of the health address. The knobs
+# below exist so that the tests do not wait for real.
 WAIT_LIMIT="${LOCAL_CI_INSTALL_WAIT_LIMIT:-2760}"
 WAIT_POLL="${LOCAL_CI_INSTALL_POLL:-2}"
 WAIT_PROGRESS="${LOCAL_CI_INSTALL_PROGRESS:-60}"
+HEALTH_POLL="${LOCAL_CI_INSTALL_HEALTH_POLL:-2}"
 
 DRY=0
 UNINSTALL=0
 VERSION=""
+# NEW_VERSION is the version the downloaded binary reports; /healthz must
+# report the same once it is loaded.
+NEW_VERSION=""
 TMP=""
 # STOPPED is 1 from the moment the installer asks launchd to unload the old
 # pool until the new one is loaded; a failure in between leaves no pool running.
@@ -54,8 +59,9 @@ usage: install.sh [--version vX.Y.Z] [--dry-run]
 
   --version vX.Y.Z  install this release instead of the latest
   --dry-run         verify the release, then print what would be placed or run
-  --uninstall       delete this Mac's heartbeat variables, stop the pool and
-                    remove the agent and the binary
+  --uninstall       stop the pool and wait until launchd has let go of it,
+                    then delete this Mac's heartbeat variables (pool forget),
+                    then remove the agent and the binary
 EOF
 }
 
@@ -83,6 +89,12 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+# Without these, bash 3.2 runs the EXIT trap after a SIGTERM with $? = 0, so
+# cleanup would not say that the old pool is stopped, and a SIGINT sent to the
+# script alone does not stop it at all. Exiting from the signal's own trap
+# hands cleanup the signal's status.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 parse_args() {
   while [ $# -gt 0 ]; do
@@ -201,10 +213,15 @@ fetch() {
 
   say "verifying the build provenance of $(basename "$archive")"
   # The archive must come from this repository's release workflow, run for
-  # this very tag.
+  # this very tag, on a GitHub-hosted runner when this gh can check that.
+  local help deny=""
+  help="$(gh attestation verify --help 2>&1 || true)"
+  case "$help" in
+    *--deny-self-hosted-runners*) deny="--deny-self-hosted-runners" ;;
+  esac
   if ! gh attestation verify "$archive" --repo "$REPO" \
     --signer-workflow "$REPO/.github/workflows/release.yml" \
-    --source-ref "refs/tags/$VERSION"; then
+    --source-ref "refs/tags/$VERSION" ${deny:+"$deny"}; then
     die "the attestation of $(basename "$archive") did not verify; nothing was installed"
   fi
 
@@ -213,7 +230,11 @@ fetch() {
   [ -f "$TMP/x/pool" ] || die "the archive has no pool binary"
   [ -f "$TMP/x/launchd/$LABEL.plist.tmpl" ] || die "the archive has no launchd template"
   chmod 0755 "$TMP/x/pool"
-  say "release: $("$TMP/x/pool" version)"
+  local release
+  release="$("$TMP/x/pool" version)"
+  NEW_VERSION="${release%% *}"
+  [ -n "$NEW_VERSION" ] || die "the downloaded pool does not report its version"
+  say "release: $release"
 }
 
 # stage_binary and stage_plist prepare the new files next to the old ones, so
@@ -280,6 +301,32 @@ wait_gone() {
   done
 }
 
+# wait_port_free polls the health address until nothing accepts a connection
+# on it, for at most WAIT_LIMIT seconds, saying so every WAIT_PROGRESS seconds.
+# launchd can stop listing an agent whose process is still draining; a new pool
+# started then cannot bind the address, exits with "terminal: already running"
+# and is not restarted. curl's exit status 7 is "could not connect".
+wait_port_free() {
+  local addr="$1" began="$SECONDS" next="$WAIT_PROGRESS" waited rc
+  while :; do
+    rc=0
+    curl -s -o /dev/null --max-time 2 "http://$addr/healthz" > /dev/null 2>&1 || rc=$?
+    if [ "$rc" = 7 ]; then
+      return 0
+    fi
+    waited=$((SECONDS - began))
+    if [ "$waited" -ge "$WAIT_LIMIT" ]; then
+      STOPPED=0 # a process still holds the address, so the "stopped" line would be false
+      die "something still answers on $addr ${waited}s after launchd let go of the pool: the old pool may still be finishing its jobs. No installed file was changed, but nothing restarts the pool once it exits. Check 'lsof -iTCP@$addr -sTCP:LISTEN' and $LOG_DIR/pool.log, then run this script again"
+    fi
+    if [ "$waited" -ge "$next" ]; then
+      say "still waiting for the old pool to release $addr (${waited}s)"
+      next=$((next + WAIT_PROGRESS))
+    fi
+    sleep "$WAIT_POLL"
+  done
+}
+
 # bootstrap_agent loads the agent. A short retry covers launchd still tearing
 # the old job down after it stopped being visible.
 bootstrap_agent() {
@@ -302,16 +349,58 @@ health_addr() {
   printf '%s' "$addr"
 }
 
-# wait_healthy reports whether the pool answers. A first start downloads the
-# runner and builds images, so a slow answer is not a failure.
-wait_healthy() {
-  local addr="$1"
+# log_size prints the size of the pool's log, so that what the new pool
+# writes can be told from what earlier runs wrote.
+log_size() {
+  if [ -f "$LOG_DIR/pool.log" ]; then
+    wc -c < "$LOG_DIR/pool.log" | tr -d ' '
+  else
+    printf '0'
+  fi
+}
+
+# terminal_since prints the first "terminal:" line the pool logged after byte
+# offset $1, if any.
+terminal_since() {
+  [ -f "$LOG_DIR/pool.log" ] || return 0
+  tail -c +"$(($1 + 1))" "$LOG_DIR/pool.log" | grep -m 1 'terminal: ' || true
+}
+
+# wait_new_pool waits until /healthz reports the version just installed. An
+# answer from another version means an old pool still holds the address; a
+# "terminal:" line in the log since the load means the new pool gave up (it
+# exits 0, so launchd does not restart it). Either way the installer says so
+# and restarts the agent once with launchctl kickstart -k. A first start
+# downloads the runner and builds images, so a slow answer is not a failure.
+wait_new_pool() {
+  local addr="$1" want="$2" mark="$3" kicked=0 body got problem
   for _ in $(seq 1 30); do
-    if curl -fsS --max-time 2 "http://$addr/healthz" > /dev/null 2>&1; then
-      say "the pool answers on http://$addr/healthz"
+    got=""
+    if body="$(curl -sS --max-time 2 "http://$addr/healthz" 2> /dev/null)"; then
+      got="$(printf '%s' "$body" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+    fi
+    if [ "$got" = "$want" ]; then
+      say "the pool $want answers on http://$addr/healthz"
       return 0
     fi
-    sleep 2
+    problem=""
+    if [ -n "$got" ]; then
+      problem="http://$addr/healthz reports version $got, not $want: an old pool still answers there"
+    else
+      problem="$(terminal_since "$mark")"
+      [ -z "$problem" ] || problem="the new pool stopped at once: $problem"
+    fi
+    if [ -n "$problem" ]; then
+      if [ "$kicked" = 1 ]; then
+        warn "WARNING: $problem, even after a restart. The new pool is not serving; read $LOG_DIR/pool.log, stop whatever holds $addr, then run: launchctl kickstart -k $DOMAIN/$LABEL"
+        return 1
+      fi
+      warn "WARNING: $problem. Restarting the agent once: launchctl kickstart -k $DOMAIN/$LABEL"
+      mark="$(log_size)"
+      launchctl kickstart -k "$DOMAIN/$LABEL" || warn "launchctl kickstart failed"
+      kicked=1
+    fi
+    sleep "$HEALTH_POLL"
   done
   warn "the pool does not answer on http://$addr/healthz yet; read $LOG_DIR/pool.log"
 }
@@ -331,13 +420,16 @@ install_pool() {
   fi
   act "unload a running pool, if any: launchctl bootout $DOMAIN/$LABEL" bootout_agent
   act "wait until launchd no longer lists it (the pool finishes its jobs first, up to 45 minutes; gives up after $WAIT_LIMIT s)" wait_gone
+  act "wait until nothing answers on $addr (the old process has exited; gives up after $WAIT_LIMIT s)" wait_port_free "$addr"
   act "replace $BIN and $PLIST with the staged files" commit_staged
+  local mark
+  mark="$(log_size)"
   act "load the agent: launchctl bootstrap $DOMAIN $PLIST" bootstrap_agent
   STOPPED=0
   if [ "$DRY" = 1 ]; then
-    say "would: wait for http://$addr/healthz"
+    say "would: wait for http://$addr/healthz to report $NEW_VERSION"
   else
-    wait_healthy "$addr"
+    wait_new_pool "$addr" "$NEW_VERSION" "$mark"
   fi
 }
 

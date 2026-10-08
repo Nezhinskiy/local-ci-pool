@@ -12,7 +12,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // The installer is driven with stubs for every tool that would touch the real
@@ -32,6 +35,13 @@ const (
 // $STUB_LOG; the ones whose behaviour a test varies read STUB_* variables.
 var stubScripts = map[string]string{
 	"gh": `#!/bin/sh
+# The flag probe is logged apart, so "gh attestation verify " is the check itself.
+if [ "$1 $2 $3" = "attestation verify --help" ]; then
+	echo "gh-help attestation verify" >> "$STUB_LOG"
+	echo "      --signer-workflow string   Enforce that the workflow that signed the attestation matches"
+	[ "${STUB_GH_OLD:-0}" = 1 ] || echo "      --deny-self-hosted-runners   Fail verification for attestations generated on self-hosted runners"
+	exit 0
+fi
 echo "gh $*" >> "$STUB_LOG"
 case "$1 $2" in
 "auth status") exit "${STUB_GH_AUTH_EXIT:-0}" ;;
@@ -71,6 +81,7 @@ b=gone; p=gone
 case "$1" in
 bootout)
 	echo "at-bootout binary=$b plist=$p" >> "$STUB_LOG"
+	rm -f "$STUB_LOG.loaded" "$STUB_LOG.kicked"
 	[ -z "$STUB_BOOTOUT_MSG" ] || echo "$STUB_BOOTOUT_MSG" >&2
 	exit "${STUB_BOOTOUT_EXIT:-0}" ;;
 print)
@@ -83,13 +94,41 @@ print)
 	exit 113 ;;
 bootstrap)
 	echo "at-bootstrap binary=$b plist=$p" >> "$STUB_LOG"
-	exit "${STUB_BOOTSTRAP_EXIT:-0}" ;;
+	[ "${STUB_BOOTSTRAP_EXIT:-0}" = 0 ] || exit "$STUB_BOOTSTRAP_EXIT"
+	touch "$STUB_LOG.loaded"
+	if [ -n "${STUB_LOG_AT_LOAD:-}" ]; then
+		mkdir -p "$HOME/Library/Logs/local-ci-pool"
+		echo "$STUB_LOG_AT_LOAD" >> "$HOME/Library/Logs/local-ci-pool/pool.log"
+	fi
+	exit 0 ;;
+kickstart)
+	touch "$STUB_LOG.kicked"
+	exit 0 ;;
 esac
 exit 0
 `,
+	// Before the agent is loaded, curl reaches the old pool for
+	// STUB_PORT_BUSY calls, then nothing listens (exit 7). Once it is loaded,
+	// /healthz reports STUB_NEW_VERSION, and STUB_KICKED_VERSION after a
+	// kickstart; "none" means nothing listens.
 	"curl": `#!/bin/sh
 echo "curl $*" >> "$STUB_LOG"
-echo '{"slots":4,"projects":[]}'
+if [ -e "$STUB_LOG.loaded" ]; then
+	v="${STUB_NEW_VERSION:-v0.1.0}"
+	if [ -e "$STUB_LOG.kicked" ] && [ -n "${STUB_KICKED_VERSION:-}" ]; then v="$STUB_KICKED_VERSION"; fi
+	[ "$v" != none ] || exit 7
+	echo "{\"version\":\"$v\",\"commit\":\"abc1234\",\"machine\":\"examplemacbo\",\"slots\":4,\"projects\":[]}"
+	exit 0
+fi
+f="$STUB_LOG.busy"
+n=$(cat "$f" 2>/dev/null || echo "${STUB_PORT_BUSY:-0}")
+if [ "$n" -gt 0 ]; then
+	echo $((n - 1)) > "$f"
+	echo '{"version":"v0.0.9"}'
+	exit 0
+fi
+echo 0 > "$f"
+exit 7
 `,
 	"scutil": `#!/bin/sh
 echo "scutil $*" >> "$STUB_LOG"
@@ -208,6 +247,7 @@ func (e *env) install(args ...string) (string, error) {
 		"STUB_LOG=" + e.log,
 		"STUB_ARCHIVE_SRC=" + e.archive,
 		"LOCAL_CI_INSTALL_POLL=0.05",
+		"LOCAL_CI_INSTALL_HEALTH_POLL=0.05",
 		"TMPDIR=" + e.t.TempDir(),
 	}
 	for k, v := range e.vars {
@@ -287,7 +327,8 @@ func TestInstallDryRunVerifiesAttestation(t *testing.T) {
 	for _, want := range []string{
 		"would: unload a running pool", "would: wait until launchd no longer lists it",
 		"would: stage the binary", "would: render the launchd agent", "would: replace", "would: load the agent",
-		"would: wait for http://127.0.0.1:8737/healthz",
+		"would: wait until nothing answers on 127.0.0.1:8737",
+		"would: wait for http://127.0.0.1:8737/healthz to report v0.1.0",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the dry run does not announce %q:\n%s", want, out)
@@ -1090,4 +1131,269 @@ func TestInstallRefusesToRunAsRoot(t *testing.T) {
 			}
 		}
 	}
+}
+
+// launchd can stop listing an agent whose process is still draining. The
+// installer then waits until nothing answers on the health address before it
+// replaces the files and loads the new pool, which could not bind it.
+func TestInstallWaitsForTheOldPoolToReleaseTheAddress(t *testing.T) {
+	e := newEnv(t)
+	e.placeInstalled()
+	e.vars["STUB_PORT_BUSY"] = "3"
+	out, err := e.install()
+	if err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	calls := e.calls()
+	gone := index(calls, "launchctl print ")
+	replaced := index(calls, "mv ")
+	if gone < 0 || replaced < 0 {
+		t.Fatalf("calls: %v", calls)
+	}
+	probes := 0
+	for _, c := range calls[gone:replaced] {
+		if strings.HasPrefix(c, "curl ") {
+			probes++
+		}
+	}
+	if probes != 4 {
+		t.Fatalf("%d health probes before the files were replaced, want 3 answered plus 1 refused: %v", probes, calls)
+	}
+}
+
+func TestInstallGivesUpWhenTheAddressStaysTaken(t *testing.T) {
+	e := newEnv(t)
+	e.placeInstalled()
+	oldBin, _ := os.ReadFile(e.binPath())
+	e.vars["STUB_PORT_BUSY"] = "1000000"
+	e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "2"
+	e.vars["LOCAL_CI_INSTALL_PROGRESS"] = "1"
+	out, err := e.install()
+	if err == nil || !strings.Contains(out, "something still answers on 127.0.0.1:8737") {
+		t.Fatalf("want a refusal, got %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "still waiting for the old pool to release 127.0.0.1:8737") {
+		t.Errorf("no progress line while waiting:\n%s", out)
+	}
+	if index(e.calls(), "launchctl bootstrap") >= 0 {
+		t.Error("the new pool was loaded while the address was taken")
+	}
+	if newBin, _ := os.ReadFile(e.binPath()); !bytes.Equal(oldBin, newBin) {
+		t.Error("the binary was replaced while the old pool still answered")
+	}
+	if strings.Contains(out, "is stopped") {
+		t.Errorf("a pool still answers, so it is not stopped:\n%s", out)
+	}
+}
+
+// After the load, /healthz must report the version just installed. Another
+// version, or a "terminal:" line the new pool logged, is reported loudly and
+// the agent is restarted once.
+func TestInstallRequiresTheNewVersionOnHealthz(t *testing.T) {
+	const kick = "launchctl kickstart -k gui/" + stubUID + "/" + label
+	kicks := func(calls []string) int {
+		n := 0
+		for _, c := range calls {
+			if c == kick {
+				n++
+			}
+		}
+		return n
+	}
+	t.Run("the new version answers", func(t *testing.T) {
+		e := newEnv(t)
+		out, err := e.install()
+		if err != nil || !strings.Contains(out, "the pool v0.1.0 answers on http://127.0.0.1:8737/healthz") {
+			t.Fatalf("%v\n%s", err, out)
+		}
+		if n := kicks(e.calls()); n != 0 {
+			t.Fatalf("%d restarts of a healthy new pool", n)
+		}
+	})
+	t.Run("an old version answers, a restart fixes it", func(t *testing.T) {
+		e := newEnv(t)
+		e.vars["STUB_NEW_VERSION"] = "v0.0.9"
+		e.vars["STUB_KICKED_VERSION"] = "v0.1.0"
+		out, err := e.install()
+		if err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+		for _, want := range []string{"WARNING: http://127.0.0.1:8737/healthz reports version v0.0.9, not v0.1.0", "the pool v0.1.0 answers"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output lacks %q:\n%s", want, out)
+			}
+		}
+		if n := kicks(e.calls()); n != 1 {
+			t.Fatalf("%d restarts, want 1", n)
+		}
+	})
+	t.Run("an old version keeps answering", func(t *testing.T) {
+		e := newEnv(t)
+		e.vars["STUB_NEW_VERSION"] = "v0.0.9"
+		out, err := e.install()
+		if err == nil || !strings.Contains(out, "even after a restart") {
+			t.Fatalf("want a loud failure, got %v\n%s", err, out)
+		}
+		if n := kicks(e.calls()); n != 1 {
+			t.Fatalf("%d restarts, want exactly 1", n)
+		}
+	})
+	t.Run("the new pool logged terminal", func(t *testing.T) {
+		e := newEnv(t)
+		e.vars["STUB_NEW_VERSION"] = "none"
+		e.vars["STUB_LOG_AT_LOAD"] = `level=ERROR msg="terminal: already running: 127.0.0.1:8737 is in use"`
+		e.vars["STUB_KICKED_VERSION"] = "v0.1.0"
+		out, err := e.install()
+		if err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+		if !strings.Contains(out, "WARNING: the new pool stopped at once:") || !strings.Contains(out, "terminal: already running") {
+			t.Errorf("the terminal exit is not reported:\n%s", out)
+		}
+		if n := kicks(e.calls()); n != 1 {
+			t.Fatalf("%d restarts, want 1", n)
+		}
+	})
+	t.Run("a terminal line from an earlier run", func(t *testing.T) {
+		e := newEnv(t)
+		write(t, filepath.Join(e.home, "Library", "Logs", "local-ci-pool", "pool.log"),
+			"level=ERROR msg=\"terminal: gh logged out\"\n", 0o644)
+		e.vars["STUB_NEW_VERSION"] = "none" // a first start is slow to answer
+		out, err := e.install()
+		if err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+		if n := kicks(e.calls()); n != 0 || strings.Contains(out, "WARNING") {
+			t.Fatalf("an old log line was taken for the new pool's (%d restarts):\n%s", n, out)
+		}
+		if !strings.Contains(out, "does not answer on http://127.0.0.1:8737/healthz yet") {
+			t.Errorf("a slow first start is not reported:\n%s", out)
+		}
+	})
+}
+
+// An upgrade interrupted after the old pool was stopped must still say so.
+// Without its INT and TERM traps, bash 3.2 runs the EXIT trap after a SIGTERM
+// with $? = 0 (so no line), and ignores a SIGINT sent to the script alone.
+func TestInstallInterruptedAfterTheStopSaysSo(t *testing.T) {
+	for name, sig := range map[string]os.Signal{"SIGTERM": syscall.SIGTERM, "SIGINT": os.Interrupt} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.placeInstalled()
+			e.vars["STUB_PRINT_SUCCESSES"] = "1000000"
+			e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "100000"
+			cmd, out := e.startInstall()
+			deadline := time.Now().Add(20 * time.Second)
+			for index(e.calls(), "launchctl print ") < 0 {
+				if time.Now().After(deadline) {
+					_ = cmd.Process.Kill()
+					t.Fatalf("the installer never reached the wait:\n%s", out.String())
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := cmd.Process.Signal(sig); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatalf("the interrupted installer exited 0:\n%s", out.String())
+				}
+			case <-time.After(20 * time.Second):
+				_ = cmd.Process.Kill()
+				t.Fatal("the installer did not stop on the signal")
+			}
+			if !strings.Contains(out.String(), strandedLine) {
+				t.Errorf("output lacks the line about the stopped pool:\n%s", out.String())
+			}
+			if exists(e.binPath()+".new") || exists(e.plistPath()+".new") {
+				t.Error("a staged file was left behind")
+			}
+		})
+	}
+}
+
+// The provenance check refuses an archive built on a self-hosted runner when
+// this gh can check that, and still works with a gh that cannot.
+func TestInstallDeniesSelfHostedBuildsWhenGhCan(t *testing.T) {
+	for name, tc := range map[string]struct {
+		old  string
+		want bool
+	}{"current gh": {"0", true}, "older gh": {"1", false}} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.vars["STUB_GH_OLD"] = tc.old
+			if out, err := e.install("--dry-run"); err != nil {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			calls := e.calls()
+			i := index(calls, "gh attestation verify ")
+			if i < 0 {
+				t.Fatalf("no verification: %v", calls)
+			}
+			if got := strings.Contains(calls[i], " --deny-self-hosted-runners"); got != tc.want {
+				t.Fatalf("verify %q: --deny-self-hosted-runners present = %v, want %v", calls[i], got, tc.want)
+			}
+		})
+	}
+}
+
+// The help states the uninstall order: stop and wait, then forget, then
+// remove (a heartbeat written between a forget and the stop would survive).
+func TestUninstallHelpStatesTheOrder(t *testing.T) {
+	e := newEnv(t)
+	out, err := e.install("--help")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	stop := strings.Index(out, "stop the pool and wait until launchd has let go of it")
+	forget := strings.Index(out, "delete this Mac's heartbeat variables (pool forget)")
+	remove := strings.Index(out, "remove the agent and the binary")
+	if stop < 0 || forget < stop || remove < forget {
+		t.Fatalf("the help does not give stop, forget, remove in order:\n%s", out)
+	}
+}
+
+// startInstall starts install.sh like install, without waiting for it.
+func (e *env) startInstall(args ...string) (*exec.Cmd, *syncBuffer) {
+	e.t.Helper()
+	bash, _ := exec.LookPath("bash")
+	cmd := exec.Command(bash, append([]string{"install.sh"}, args...)...)
+	cmd.Env = []string{
+		"HOME=" + e.home,
+		"PATH=" + e.stubs + ":/usr/bin:/bin",
+		"STUB_LOG=" + e.log,
+		"STUB_ARCHIVE_SRC=" + e.archive,
+		"LOCAL_CI_INSTALL_POLL=0.05",
+		"LOCAL_CI_INSTALL_HEALTH_POLL=0.05",
+		"TMPDIR=" + e.t.TempDir(),
+	}
+	for k, v := range e.vars {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	out := &syncBuffer{}
+	cmd.Stdout, cmd.Stderr = out, out
+	if err := cmd.Start(); err != nil {
+		e.t.Fatal(err)
+	}
+	return cmd, out
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
