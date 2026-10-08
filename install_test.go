@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -82,11 +83,31 @@ case "$1" in
 bootout)
 	echo "at-bootout binary=$b plist=$p" >> "$STUB_LOG"
 	rm -f "$STUB_LOG.loaded" "$STUB_LOG.kicked"
+	touch "$STUB_LOG.out"
 	[ -z "$STUB_BOOTOUT_MSG" ] || echo "$STUB_BOOTOUT_MSG" >&2
 	exit "${STUB_BOOTOUT_EXIT:-0}" ;;
 print)
-	# The agent stays visible for STUB_PRINT_SUCCESSES calls, then is gone.
 	echo "at-print binary=$b" >> "$STUB_LOG"
+	if [ ! -e "$STUB_LOG.out" ]; then
+		# Before a bootout the agent is loaded when STUB_POOL_PID names a
+		# process (or STUB_RUNNING_NO_PID is set), and launchd shows the pid
+		# while that process runs, the way launchctl print lays it out.
+		if [ -n "${STUB_RUNNING_NO_PID:-}" ]; then
+			printf 'gui/501/x = {\n\tstate = running\n}\n'
+			exit 0
+		fi
+		[ -n "${STUB_POOL_PID:-}" ] || exit 113
+		printf 'gui/501/` + label + ` = {\n\tactive count = 1\n\tpath = /x.plist\n'
+		if kill -0 "$STUB_POOL_PID" 2>/dev/null; then
+			printf '\tstate = running\n\tprogram = /x/pool\n\tenvironment = {\n\t\tXPC_SERVICE_NAME => x\n\t}\n\truns = 1\n\tpid = %s\n\timmediate reason = speculative\n' "$STUB_POOL_PID"
+		else
+			printf '\tstate = not running\n\truns = 1\n\tlast exit code = 0\n'
+		fi
+		printf '}\n'
+		exit 0
+	fi
+	# After a bootout the agent stays visible for STUB_PRINT_SUCCESSES calls,
+	# then is gone.
 	f="$STUB_LOG.print"
 	n=$(cat "$f" 2>/dev/null || echo "${STUB_PRINT_SUCCESSES:-0}")
 	if [ "$n" -gt 0 ]; then echo $((n - 1)) > "$f"; exit 0; fi
@@ -96,6 +117,7 @@ bootstrap)
 	echo "at-bootstrap binary=$b plist=$p" >> "$STUB_LOG"
 	[ "${STUB_BOOTSTRAP_EXIT:-0}" = 0 ] || exit "$STUB_BOOTSTRAP_EXIT"
 	touch "$STUB_LOG.loaded"
+	rm -f "$STUB_LOG.out"
 	if [ -n "${STUB_LOG_AT_LOAD:-}" ]; then
 		mkdir -p "$HOME/Library/Logs/local-ci-pool"
 		echo "$STUB_LOG_AT_LOAD" >> "$HOME/Library/Logs/local-ci-pool/pool.log"
@@ -325,7 +347,8 @@ func TestInstallDryRunVerifiesAttestation(t *testing.T) {
 		t.Errorf("a dry run placed files under %s/Library", e.home)
 	}
 	for _, want := range []string{
-		"would: unload a running pool", "would: wait until launchd no longer lists it",
+		"would: stop a running pool, if any: kill -TERM", "would: unload the agent: launchctl bootout",
+		"would: wait until launchd no longer lists it",
 		"would: stage the binary", "would: render the launchd agent", "would: replace", "would: load the agent",
 		"would: wait until nothing answers on 127.0.0.1:8737",
 		"would: wait for http://127.0.0.1:8737/healthz to report v0.1.0",
@@ -636,7 +659,7 @@ func TestUninstallDryRunChangesNothing(t *testing.T) {
 	if !exists(e.binPath()) || !exists(e.plistPath()) {
 		t.Error("a dry run removed files")
 	}
-	for _, want := range []string{"would: unload the pool", "would: wait until launchd no longer lists it", "would: delete this Mac's heartbeat variables", "would: remove"} {
+	for _, want := range []string{"would: stop the pool, if it runs: kill -TERM", "would: unload the agent", "would: wait until launchd no longer lists it", "would: delete this Mac's heartbeat variables", "would: remove"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
 		}
@@ -809,16 +832,37 @@ func TestPlistKeys(t *testing.T) {
 		t.Errorf("PATH %q lacks /usr/sbin (scutil, ioreg)", path)
 	}
 
-	// launchd must not kill a pool that is still draining: ExitTimeOut is
-	// above the pool's own drain bound, which the pool itself reports.
-	drain := poolDefaults(t).DrainSeconds
-	exitTimeOut, _ := top["ExitTimeOut"].(int)
-	if exitTimeOut != 2700 {
+	// ExitTimeOut stays, but it does not protect the drain: macOS clamps a
+	// LaunchAgent's exit timeout to 60 s (launchctl print reports
+	// "exit timeout = 60" for this plist on macOS 27.0.1), so a bootout or a
+	// logout SIGKILLs a pool still draining after a minute. What protects the
+	// drain is that the installer, not launchd, sends the stop signal and
+	// waits for the process (TestUpgradeSignalsThePoolItselfBeforeTheBootout,
+	// TestUninstallSignalsThePoolItselfBeforeTheBootout), and that its wait
+	// outlasts the drain the pool reports. The supervisor's own test keeps the
+	// drain plus the cleanup after it under 45 minutes.
+	if top["ExitTimeOut"] != 2700 {
 		t.Errorf("ExitTimeOut = %v, want 2700", top["ExitTimeOut"])
 	}
-	if exitTimeOut <= drain {
-		t.Errorf("ExitTimeOut %d must exceed the drain default %d s", exitTimeOut, drain)
+	drain := poolDefaults(t).DrainSeconds
+	if wait := installerWaitLimit(t); wait <= drain || wait < 45*60 {
+		t.Errorf("the installer waits %d s for the pool to exit; it must exceed the drain default %d s and 45 minutes", wait, drain)
 	}
+}
+
+// installerWaitLimit reads the default of WAIT_LIMIT from install.sh.
+func installerWaitLimit(t *testing.T) int {
+	t.Helper()
+	b, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?m)^WAIT_LIMIT="\$\{LOCAL_CI_INSTALL_WAIT_LIMIT:-([0-9]+)\}"$`).FindSubmatch(b)
+	if m == nil {
+		t.Fatal("install.sh has no WAIT_LIMIT default")
+	}
+	n, _ := strconv.Atoi(string(m[1]))
+	return n
 }
 
 func hasPathEntry(path, dir string) bool {
@@ -923,7 +967,7 @@ func TestInstallGivesUpWhenLaunchdKeepsThePool(t *testing.T) {
 	if err == nil || !strings.Contains(out, "launchd still has") {
 		t.Fatalf("want a refusal, got %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "still waiting for the pool") {
+	if !strings.Contains(out, "still waiting for launchd to unload the agent") {
 		t.Errorf("no progress line while waiting:\n%s", out)
 	}
 	if index(e.calls(), "launchctl bootstrap") >= 0 || exists(e.binPath()) || exists(e.plistPath()) {
@@ -1071,21 +1115,27 @@ func TestInstallStoppedLineOnlyWhenTrue(t *testing.T) {
 	if out, err := e.install(); err == nil || strings.Contains(out, "is stopped") {
 		t.Fatalf("verify failure: %v\n%s", err, out)
 	}
-	// the pool never leaves: it is still running, so it is not "stopped"
+	// the pool never finishes its drain: it is still running, so it is not
+	// "stopped"
+	e = newEnv(t)
+	e.startPool(-1)
+	e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "1"
+	out, err = e.install()
+	if err == nil || strings.Contains(out, "is stopped") || !strings.Contains(out, "is still finishing its jobs") {
+		t.Fatalf("timeout: %v\n%s", err, out)
+	}
+	// launchd keeps the agent after the bootout: the message says so itself
 	e = newEnv(t)
 	e.vars["STUB_PRINT_SUCCESSES"] = "1000000"
 	e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "1"
 	out, err = e.install()
-	if err == nil || strings.Contains(out, "is stopped") || !strings.Contains(out, "asked to stop and is still finishing its jobs") {
-		t.Fatalf("timeout: %v\n%s", err, out)
-	}
-	if strings.Contains(out, "nothing else was changed") {
-		t.Errorf("the timeout message claims nothing changed:\n%s", out)
+	if err == nil || strings.Contains(out, "is stopped") || !strings.Contains(out, "launchd still has") {
+		t.Fatalf("launchd timeout: %v\n%s", err, out)
 	}
 	// uninstall has no new pool to miss
 	e = newEnv(t)
 	e.placeInstalled()
-	e.vars["STUB_PRINT_SUCCESSES"] = "1000000"
+	e.startPool(-1)
 	e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "1"
 	if out, err := e.install("--uninstall"); err == nil || strings.Contains(out, "is stopped") {
 		t.Fatalf("uninstall timeout: %v\n%s", err, out)
@@ -1340,19 +1390,25 @@ func TestInstallDeniesSelfHostedBuildsWhenGhCan(t *testing.T) {
 	}
 }
 
-// The help states the uninstall order: stop and wait, then forget, then
-// remove (a heartbeat written between a forget and the stop would survive).
+// The help states the uninstall order: stop and wait, then unload, then
+// forget, then remove (a heartbeat written between a forget and the stop would
+// survive), and that the installer sends the stop signal itself.
 func TestUninstallHelpStatesTheOrder(t *testing.T) {
 	e := newEnv(t)
 	out, err := e.install("--help")
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	stop := strings.Index(out, "stop the pool and wait until launchd has let go of it")
-	forget := strings.Index(out, "delete this Mac's heartbeat variables (pool forget)")
-	remove := strings.Index(out, "remove the agent and the binary")
-	if stop < 0 || forget < stop || remove < forget {
-		t.Fatalf("the help does not give stop, forget, remove in order:\n%s", out)
+	flat := strings.Join(strings.Fields(out), " ")
+	stop := strings.Index(flat, "stop the pool (SIGTERM, then wait until it has finished its jobs and exited")
+	unload := strings.Index(flat, "unload it from launchd")
+	forget := strings.Index(flat, "delete this Mac's heartbeat variables (pool forget)")
+	remove := strings.Index(flat, "remove the agent and the binary")
+	if stop < 0 || unload < stop || forget < unload || remove < forget {
+		t.Fatalf("the help does not give stop, unload, forget, remove in order:\n%s", out)
+	}
+	if !strings.Contains(flat, "launchd gives an agent at most 60 seconds to exit") {
+		t.Errorf("the help does not say why the installer sends the signal:\n%s", out)
 	}
 }
 
@@ -1396,4 +1452,163 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// poolProcess is the script of startPool's stand-in for a running pool: it
+// logs the SIGTERM it gets, then exits DRAIN_TICKS ticks of 20 ms later (a
+// drain), or never when DRAIN_TICKS is negative.
+const poolProcess = `term=0
+trap 'echo "pool-process TERM" >> "$STUB_LOG"; term=1' TERM
+: > "$STUB_LOG.ready"
+n=0
+while :; do
+	if [ "$term" = 1 ] && [ "$DRAIN_TICKS" -ge 0 ]; then
+		if [ "$n" -ge "$DRAIN_TICKS" ]; then
+			echo "pool-process exit" >> "$STUB_LOG"
+			exit 0
+		fi
+		n=$((n + 1))
+	fi
+	sleep 0.02
+done
+`
+
+// startPool starts a stand-in for the running pool and makes the stub
+// launchctl print report its pid while it runs, as launchd does. The process
+// is reaped as soon as it exits (a zombie would still answer kill -0) and
+// killed when the test ends.
+func (e *env) startPool(drainTicks int) {
+	e.t.Helper()
+	cmd := exec.Command("/bin/sh", "-c", poolProcess)
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "STUB_LOG=" + e.log, "DRAIN_TICKS=" + strconv.Itoa(drainTicks)}
+	if err := cmd.Start(); err != nil {
+		e.t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	e.t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		<-done
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for !exists(e.log + ".ready") {
+		if time.Now().After(deadline) {
+			e.t.Fatal("the stand-in pool did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	e.vars["STUB_POOL_PID"] = strconv.Itoa(cmd.Process.Pid)
+}
+
+// macOS clamps a LaunchAgent's exit timeout to 60 s, so a launchctl bootout
+// of a draining pool kills it a minute later and its running jobs are lost.
+// The upgrade therefore sends the pool SIGTERM itself, waits until the process
+// has exited (its drain), and only then boots the agent out and replaces the
+// files.
+func TestUpgradeSignalsThePoolItselfBeforeTheBootout(t *testing.T) {
+	e := newEnv(t)
+	e.placeInstalled()
+	e.startPool(15) // drains for 0.3 s, several of the installer's 50 ms polls
+	e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "20"
+	out, err := e.install()
+	if err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	calls := e.calls()
+	term := index(calls, "pool-process TERM")
+	exited := index(calls, "pool-process exit")
+	bootout := index(calls, "launchctl bootout ")
+	replaced := index(calls, "mv ")
+	if term < 0 || exited < term || bootout < exited || replaced < bootout {
+		t.Fatalf("want SIGTERM, the pool's exit, bootout, then the rename; calls: %v", calls)
+	}
+	if at := index(calls, "at-bootout "); calls[at] != "at-bootout binary=present plist=present" {
+		t.Errorf("a file was touched before the bootout: %v", calls)
+	}
+	for _, want := range []string{"sending the pool (pid " + e.vars["STUB_POOL_PID"] + ") SIGTERM", "the pool has exited"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestUninstallSignalsThePoolItselfBeforeTheBootout(t *testing.T) {
+	e := newEnv(t)
+	e.placeInstalled()
+	e.startPool(15)
+	e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "20"
+	out, err := e.install("--uninstall")
+	if err != nil {
+		t.Fatalf("uninstall failed: %v\n%s", err, out)
+	}
+	calls := e.calls()
+	term := index(calls, "pool-process TERM")
+	exited := index(calls, "pool-process exit")
+	bootout := index(calls, "launchctl bootout ")
+	forget := index(calls, "pool forget")
+	if term < 0 || exited < term || bootout < exited || forget < bootout {
+		t.Fatalf("want SIGTERM, the pool's exit, bootout, then pool forget; calls: %v", calls)
+	}
+	if exists(e.binPath()) || exists(e.plistPath()) {
+		t.Errorf("binary %v, plist %v still exist", exists(e.binPath()), exists(e.plistPath()))
+	}
+}
+
+// A pool still draining at the bound is left alone: it is neither booted out
+// (which would kill it within 60 s) nor replaced or removed, and the installer
+// says what happened.
+func TestStopGivesUpWhenThePoolKeepsDraining(t *testing.T) {
+	for name, args := range map[string][]string{"upgrade": nil, "uninstall": {"--uninstall"}} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.placeInstalled()
+			oldBin, _ := os.ReadFile(e.binPath())
+			e.startPool(-1)
+			e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "2"
+			e.vars["LOCAL_CI_INSTALL_PROGRESS"] = "1"
+			out, err := e.install(args...)
+			if err == nil || !strings.Contains(out, "is still finishing its jobs") || !strings.Contains(out, "Nothing was replaced or removed") {
+				t.Fatalf("want a refusal, got %v\n%s", err, out)
+			}
+			if !strings.Contains(out, "still waiting for the pool to finish its jobs and exit") {
+				t.Errorf("no progress line while waiting:\n%s", out)
+			}
+			calls := e.calls()
+			if index(calls, "pool-process TERM") < 0 {
+				t.Errorf("the pool was never signalled: %v", calls)
+			}
+			for _, c := range calls {
+				if strings.HasPrefix(c, "launchctl bootout") || strings.HasPrefix(c, "mv ") || strings.HasPrefix(c, "pool forget") {
+					t.Errorf("%q ran while the pool was still draining", c)
+				}
+			}
+			if newBin, _ := os.ReadFile(e.binPath()); !bytes.Equal(oldBin, newBin) || !exists(e.plistPath()) {
+				t.Error("an installed file was replaced or removed under a draining pool")
+			}
+			if strings.Contains(out, "is stopped") {
+				t.Errorf("the pool still runs, so it is not stopped:\n%s", out)
+			}
+		})
+	}
+}
+
+// When launchd lists the pool as running but shows no pid, the installer
+// cannot signal it, says that the bootout gives it at most 60 s, and goes on.
+func TestStopWarnsWhenLaunchdShowsNoPid(t *testing.T) {
+	e := newEnv(t)
+	e.placeInstalled()
+	e.vars["STUB_RUNNING_NO_PID"] = "1"
+	out, err := e.install()
+	if err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "launchd reports the pool running but no pid") {
+		t.Errorf("no warning:\n%s", out)
+	}
+	if index(e.calls(), "launchctl bootout") < 0 {
+		t.Error("the agent was not booted out")
+	}
 }

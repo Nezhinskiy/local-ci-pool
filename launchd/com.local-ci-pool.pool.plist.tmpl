@@ -20,8 +20,9 @@
 	</dict>
 	<key>ThrottleInterval</key>
 	<integer>30</integer>
-	<!-- 45 minutes: longer than the pool's 40 minute drain, so launchd never
-	     kills a pool that is finishing its jobs. -->
+	<!-- Asks for 45 minutes, but macOS clamps a LaunchAgent's exit timeout to
+	     60 s, so this does not protect the drain: install.sh sends the pool
+	     SIGTERM itself and waits for it before it unloads the agent. -->
 	<key>ExitTimeOut</key>
 	<integer>2700</integer>
 	<key>ProcessType</key>

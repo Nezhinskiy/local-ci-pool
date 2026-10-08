@@ -25,10 +25,13 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/local-ci-pool"
 DOMAIN="gui/$(id -u)"
 
-# The launchd ExitTimeOut of the agent is 2700 s; after a bootout the installer
-# waits that long plus a margin for launchd to report the agent gone, and as
-# long again for the old process to let go of the health address. The knobs
-# below exist so that the tests do not wait for real.
+# A stopping pool drains for at most 40 minutes plus 3 to clean up. The
+# installer sends it SIGTERM itself and waits up to WAIT_LIMIT for its process
+# to exit, then as long again for launchd to let go of the agent and for the
+# health address to come free. launchd is not trusted with the drain: macOS
+# clamps a LaunchAgent's ExitTimeOut to 60 s (the plist's 2700 is reported as
+# "exit timeout = 60" by launchctl print on macOS 27.0.1), and SIGKILLs the
+# pool then. The knobs below exist so that the tests do not wait for real.
 WAIT_LIMIT="${LOCAL_CI_INSTALL_WAIT_LIMIT:-2760}"
 WAIT_POLL="${LOCAL_CI_INSTALL_POLL:-2}"
 WAIT_PROGRESS="${LOCAL_CI_INSTALL_PROGRESS:-60}"
@@ -41,8 +44,8 @@ VERSION=""
 # report the same once it is loaded.
 NEW_VERSION=""
 TMP=""
-# STOPPED is 1 from the moment the installer asks launchd to unload the old
-# pool until the new one is loaded; a failure in between leaves no pool running.
+# STOPPED is 1 from the moment the installer asks the old pool to stop until
+# the new one is loaded; a failure in between leaves no pool running.
 STOPPED=0
 
 say() { printf '%s\n' "$*"; }
@@ -59,9 +62,14 @@ usage: install.sh [--version vX.Y.Z] [--dry-run]
 
   --version vX.Y.Z  install this release instead of the latest
   --dry-run         verify the release, then print what would be placed or run
-  --uninstall       stop the pool and wait until launchd has let go of it,
-                    then delete this Mac's heartbeat variables (pool forget),
-                    then remove the agent and the binary
+  --uninstall       stop the pool (SIGTERM, then wait until it has finished
+                    its jobs and exited, up to 46 minutes), unload it from
+                    launchd, then delete this Mac's heartbeat variables
+                    (pool forget), then remove the agent and the binary
+
+An upgrade stops the running pool the same way before it replaces anything.
+The installer sends the signal itself because launchd gives an agent at most
+60 seconds to exit before it kills it, whatever the plist asks for.
 EOF
 }
 
@@ -268,10 +276,57 @@ stage_plist() {
   fi
 }
 
-# bootout_agent asks launchd to unload the agent. It does not rely on the call
-# to wait for the pool's drain: launchd may answer at once ("Operation now in
-# progress", "Input/output error") while the pool is still finishing jobs, so
-# wait_gone is what decides. "Not loaded" is the normal case on a first install.
+# agent_pid prints the pid launchd reports for the agent ("pid = N" in
+# launchctl print), or nothing when the agent is not loaded or not running. It
+# never fails: a print of an agent that is not loaded exits non-zero.
+agent_pid() {
+  launchctl print "$DOMAIN/$LABEL" 2> /dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1 || true
+}
+
+# stop_pool sends the running pool SIGTERM and waits until its process has
+# exited, for at most WAIT_LIMIT seconds, saying so every WAIT_PROGRESS
+# seconds. The pool then finishes its running jobs (up to 40 minutes, plus 3 to
+# clean up), deletes its scale sets and exits 0, which launchd does not restart
+# (KeepAlive SuccessfulExit=false). The signal comes from here and not from
+# launchctl bootout: launchd clamps a LaunchAgent's exit timeout to 60 s and
+# SIGKILLs a pool still draining after that, losing its running jobs.
+stop_pool() {
+  local pid began next waited
+  pid="$(agent_pid)"
+  if [ -z "$pid" ]; then
+    if launchctl print "$DOMAIN/$LABEL" 2> /dev/null | grep -q 'state = running'; then
+      warn "launchd reports the pool running but no pid; unloading it with launchctl bootout, which gives it at most 60 s to finish its jobs"
+    else
+      say "no pool is running"
+    fi
+    return 0
+  fi
+  say "sending the pool (pid $pid) SIGTERM; it finishes its running jobs, then exits"
+  if ! kill -TERM "$pid" 2> /dev/null; then
+    kill -0 "$pid" 2> /dev/null || return 0 # it exited meanwhile
+    die "cannot signal the pool (pid $pid); nothing was changed"
+  fi
+  began="$SECONDS"
+  next="$WAIT_PROGRESS"
+  while kill -0 "$pid" 2> /dev/null; do
+    waited=$((SECONDS - began))
+    if [ "$waited" -ge "$WAIT_LIMIT" ]; then
+      STOPPED=0 # the pool is still running, so the "stopped" line would be false
+      die "the pool (pid $pid) is still finishing its jobs ${waited}s after it was asked to stop. Nothing was replaced or removed. It exits once its drain ends, and launchd does not restart it then (workflows fall back to hosted runners). Do not unload it with launchctl bootout, which kills it within 60 s; check $LOG_DIR/pool.log, then run this script again"
+    fi
+    if [ "$waited" -ge "$next" ]; then
+      say "still waiting for the pool to finish its jobs and exit (${waited}s)"
+      next=$((next + WAIT_PROGRESS))
+    fi
+    sleep "$WAIT_POLL"
+  done
+  say "the pool has exited"
+}
+
+# bootout_agent asks launchd to unload the agent, whose process stop_pool has
+# already seen exit, so this is quick. It still does not rely on the call to
+# block: wait_gone is what decides. "Not loaded" is the normal case on a first
+# install.
 bootout_agent() {
   local err
   if ! err="$(launchctl bootout "$DOMAIN/$LABEL" 2>&1)"; then
@@ -283,18 +338,17 @@ bootout_agent() {
 }
 
 # wait_gone polls launchd until it no longer knows the agent, for at most
-# WAIT_LIMIT seconds (the plist's ExitTimeOut plus a margin), and says so every
-# WAIT_PROGRESS seconds. A pool draining its jobs takes up to 40 minutes.
+# WAIT_LIMIT seconds, and says so every WAIT_PROGRESS seconds.
 wait_gone() {
   local began="$SECONDS" next="$WAIT_PROGRESS" waited
   while launchctl print "$DOMAIN/$LABEL" > /dev/null 2>&1; do
     waited=$((SECONDS - began))
     if [ "$waited" -ge "$WAIT_LIMIT" ]; then
-      STOPPED=0 # the pool is still running, so the "stopped" line would be false
-      die "launchd still has $DOMAIN/$LABEL after ${waited}s. The pool was asked to stop and is still finishing its jobs; no installed file was changed, but once it exits nothing restarts it (workflows fall back to hosted runners). Check 'launchctl print $DOMAIN/$LABEL' and $LOG_DIR/pool.log, then run this script again"
+      STOPPED=0 # the message below says what is running
+      die "launchd still has $DOMAIN/$LABEL ${waited}s after the bootout. No installed file was changed, and the pool it ran was asked to stop, so nothing serves this Mac (workflows fall back to hosted runners). Check 'launchctl print $DOMAIN/$LABEL' and $LOG_DIR/pool.log, then run this script again"
     fi
     if [ "$waited" -ge "$next" ]; then
-      say "still waiting for the pool to finish its jobs and exit (${waited}s)"
+      say "still waiting for launchd to unload the agent (${waited}s)"
       next=$((next + WAIT_PROGRESS))
     fi
     sleep "$WAIT_POLL"
@@ -418,9 +472,10 @@ install_pool() {
   if [ "$DRY" != 1 ]; then
     STOPPED=1
   fi
-  act "unload a running pool, if any: launchctl bootout $DOMAIN/$LABEL" bootout_agent
-  act "wait until launchd no longer lists it (the pool finishes its jobs first, up to 45 minutes; gives up after $WAIT_LIMIT s)" wait_gone
-  act "wait until nothing answers on $addr (the old process has exited; gives up after $WAIT_LIMIT s)" wait_port_free "$addr"
+  act "stop a running pool, if any: kill -TERM <the pid launchctl print reports>, then wait until it has exited (it finishes its jobs first, up to 43 minutes; gives up after $WAIT_LIMIT s and changes nothing)" stop_pool
+  act "unload the agent: launchctl bootout $DOMAIN/$LABEL" bootout_agent
+  act "wait until launchd no longer lists it (gives up after $WAIT_LIMIT s)" wait_gone
+  act "wait until nothing answers on $addr (gives up after $WAIT_LIMIT s)" wait_port_free "$addr"
   act "replace $BIN and $PLIST with the staged files" commit_staged
   local mark
   mark="$(log_size)"
@@ -444,12 +499,13 @@ remove_files() {
   rmdir "$BIN_DIR" "$SUPPORT_DIR" 2> /dev/null || true
 }
 
-# uninstall_pool stops the pool first and waits until launchd has let go of
-# it: the heartbeat dies with the process, so only then does deleting the
-# variables stick.
+# uninstall_pool stops the pool first and waits until its process has exited
+# and launchd has let go of it: the heartbeat dies with the process, so only
+# then does deleting the variables stick.
 uninstall_pool() {
-  act "unload the pool: launchctl bootout $DOMAIN/$LABEL" bootout_agent
-  act "wait until launchd no longer lists it (the pool finishes its jobs first, up to 45 minutes; gives up after $WAIT_LIMIT s)" wait_gone
+  act "stop the pool, if it runs: kill -TERM <the pid launchctl print reports>, then wait until it has exited (it finishes its jobs first, up to 43 minutes; gives up after $WAIT_LIMIT s and changes nothing)" stop_pool
+  act "unload the agent: launchctl bootout $DOMAIN/$LABEL" bootout_agent
+  act "wait until launchd no longer lists it (gives up after $WAIT_LIMIT s)" wait_gone
   if [ -x "$BIN" ]; then
     act "delete this Mac's heartbeat variables ($BIN forget)" forget_heartbeats
   else

@@ -104,8 +104,8 @@ func usageError(stderr io.Writer, msg string) int {
 	return exitUsage
 }
 
-// defaults are the built-in settings the installer's plist depends on: the
-// launchd ExitTimeOut must exceed the drain.
+// defaults are the built-in settings the installer depends on: its wait for a
+// stopping pool must exceed the drain, and it probes the health address.
 type defaults struct {
 	DrainSeconds int    `json:"drain_seconds"`
 	HealthAddr   string `json:"health_addr"`
