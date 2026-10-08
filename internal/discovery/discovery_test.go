@@ -31,6 +31,10 @@ func TestParseMarkerForms(t *testing.T) {
 			`{"dockerfile":"ci/runner/Dockerfile","inputs":["pyproject.toml","ci/runner","uv.lock"]}`,
 			Marker{Dockerfile: "ci/runner/Dockerfile", Inputs: []string{"pyproject.toml", "ci/runner", "uv.lock"}},
 		},
+		"dot-slash prefixes are cleaned": {
+			`{"dockerfile":"./infra/ci-runner/Dockerfile","inputs":["./infra/ci-runner"]}`,
+			Marker{Dockerfile: "infra/ci-runner/Dockerfile", Inputs: []string{"infra/ci-runner"}},
+		},
 		"surrounding whitespace": {
 			"\n  {\"image\":\"x@" + digest + "\"}\n",
 			Marker{Image: "x@" + digest},
@@ -75,6 +79,9 @@ func TestParseMarkerForms(t *testing.T) {
 		"empty input":                    {`{"dockerfile":"d/Dockerfile","inputs":[""]}`, "empty"},
 		"pathspec magic input":           {`{"dockerfile":"d/Dockerfile","inputs":[":(glob)d"]}`, "relative"},
 		"option-like input":              {`{"dockerfile":"d/Dockerfile","inputs":["-d"]}`, "relative"},
+		"option-like after cleaning":     {`{"dockerfile":"./-d/Dockerfile","inputs":["./-d"]}`, "relative"},
+		"magic after cleaning":           {`{"dockerfile":"d/Dockerfile","inputs":["d","./:(glob)d"]}`, "relative"},
+		"option-like dockerfile cleaned": {`{"dockerfile":"./-Dockerfile","inputs":["."]}`, "relative"},
 		"trailing data":                  {`{"image":"x@` + digest + `"} {}`, "trailing"},
 		"not an object":                  {`["x"]`, ""},
 		"not json":                       {`image: x`, ""},
@@ -230,6 +237,34 @@ func TestDiscoverSkips(t *testing.T) {
 		if strings.HasPrefix(c, "o/pubrepo") {
 			t.Errorf("read the marker of a public repository: %s", c)
 		}
+	}
+}
+
+// The re-check answers under the repository's current name. One that moved
+// to another owner, or was renamed, since the listing is skipped as a known
+// reason (not errored); a rename that changes only the case is kept.
+func TestDiscoverSkipsARepoMovedSinceTheListing(t *testing.T) {
+	src := &fakeSource{
+		listing: []github.Repo{priv("moved"), priv("cased")},
+		repos: map[string]github.Repo{
+			"o/moved": {FullName: "someone-else/moved", Name: "moved", DefaultBranch: "main", Private: true},
+			"o/cased": {FullName: "O/Cased", Name: "Cased", DefaultBranch: "main", Private: true},
+		},
+		files: map[string]string{"o/moved@main": goodMarker, "o/cased@main": goodMarker},
+	}
+	log, buf := testLog()
+	res, err := Discover(context.Background(), src, Options{}, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Projects) != 1 || res.Projects[0].Repo != "o/cased" {
+		t.Fatalf("projects = %+v, want only o/cased", res.Projects)
+	}
+	if len(res.Errored) != 0 {
+		t.Fatalf("errored = %v; a moved repository is a known skip", res.Errored)
+	}
+	if !strings.Contains(buf.String(), "moved since the listing") {
+		t.Errorf("the skip is not logged:\n%s", buf.String())
 	}
 }
 

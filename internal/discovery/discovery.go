@@ -92,20 +92,32 @@ func ParseMarker(b []byte) (Marker, error) {
 // cleaned. Absolute paths, ".." segments, empty paths, pathspec magic (":")
 // and option-like names ("-") are refused, and so are the glob characters * ?
 // and [, because git would read them as wildcards in a pathspec: the value ends
-// up in git arguments.
+// up in git arguments. The checks hold for the cleaned value too, which is the
+// one returned: "./-x" cleans to "-x" and is refused.
 func CleanRepoPath(p string) (string, error) {
+	if err := plainRelative(p); err != nil {
+		return "", err
+	}
+	clean := path.Clean(p)
+	if err := plainRelative(clean); err != nil {
+		return "", err
+	}
+	return clean, nil
+}
+
+func plainRelative(p string) error {
 	if p == "" {
-		return "", errors.New("path is empty")
+		return errors.New("path is empty")
 	}
 	if strings.ContainsAny(p, "\x00\\*?[") || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "-") || strings.HasPrefix(p, ":") {
-		return "", errors.New("must be a plain relative path")
+		return errors.New("must be a plain relative path")
 	}
 	for _, seg := range strings.Split(p, "/") {
 		if seg == ".." {
-			return "", errors.New("must not contain a .. segment")
+			return errors.New("must not contain a .. segment")
 		}
 	}
-	return path.Clean(p), nil
+	return nil
 }
 
 var (
@@ -195,6 +207,13 @@ func Discover(ctx context.Context, src Source, opt Options, log *slog.Logger) (R
 		}
 		if !cur.Private {
 			log.Info("skipping repository: no longer private", "repo", r.FullName)
+			continue
+		}
+		// A transferred or renamed repository answers under its new name; it
+		// is served under that name once a listing shows it. A rename that
+		// changes only the case is the same repository.
+		if !strings.EqualFold(cur.FullName, r.FullName) {
+			log.Info("skipping repository: moved since the listing", "repo", r.FullName, "now", cur.FullName)
 			continue
 		}
 		ref := opt.MarkerRef

@@ -223,8 +223,12 @@ func TestUsageErrorsExitTwo(t *testing.T) {
 		"probe without a repo":    {"run", "--probe"},
 		"repo without probe":      {"run", "--only-repo", "example/alpha"},
 		"marker ref without both": {"run", "--marker-ref", "x"},
-		"stray argument":          {"run", "extra"},
-		"version takes none":      {"version", "x"},
+		// A second main instance would skip the lock and sweep the
+		// installed pool's containers.
+		"health addr without probe":         {"run", "--health-addr", "127.0.0.1:8738"},
+		"default health addr without probe": {"run", "--health-addr", "127.0.0.1:8737"},
+		"stray argument":                    {"run", "extra"},
+		"version takes none":                {"version", "x"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			p := newFakePool()
@@ -244,7 +248,7 @@ func TestRealWiringSecondInstanceExitsZero(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
-	code, _, stderr := do(t, realServices(), "run", "--health-addr", ln.Addr().String())
+	code, _, stderr := do(t, realServices(), "run", "--probe", "--only-repo", "example/alpha", "--health-addr", ln.Addr().String())
 	if code != 0 || !strings.Contains(stderr, "terminal: already running") {
 		t.Fatalf("exit %d, stderr %q; want 0 and terminal: already running", code, stderr)
 	}
@@ -258,7 +262,7 @@ func TestHealthAddrMustBeLoopback(t *testing.T) {
 		t.Run("refuses "+addr, func(t *testing.T) {
 			p := newFakePool()
 			p.runErr = terminalErr("stop")
-			code, _, stderr := do(t, poolServices(p, &recVars{}), "run", "--health-addr", addr)
+			code, _, stderr := do(t, poolServices(p, &recVars{}), "run", "--probe", "--only-repo", "example/alpha", "--health-addr", addr)
 			if code != 2 || !strings.Contains(stderr, "--health-addr") {
 				t.Fatalf("exit %d, stderr %q; want a usage error naming --health-addr", code, stderr)
 			}
@@ -271,7 +275,7 @@ func TestHealthAddrMustBeLoopback(t *testing.T) {
 		t.Run("accepts "+addr, func(t *testing.T) {
 			p := newFakePool()
 			p.runErr = terminalErr("stop")
-			if code, _, stderr := do(t, poolServices(p, &recVars{}), "run", "--health-addr", addr); code != 0 {
+			if code, _, stderr := do(t, poolServices(p, &recVars{}), "run", "--probe", "--only-repo", "example/alpha", "--health-addr", addr); code != 0 {
 				t.Fatalf("exit %d, stderr %q", code, stderr)
 			}
 			if p.cfg.HealthAddr != addr {

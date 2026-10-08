@@ -30,7 +30,7 @@ const (
 const usage = `usage: pool <command>
 
 commands:
-  run [--probe --only-repo OWNER/NAME [--marker-ref REF]] [--health-addr ADDR]
+  run [--probe --only-repo OWNER/NAME [--marker-ref REF] [--health-addr ADDR]]
                  serve the private repositories that opted in
   forget         delete this Mac's heartbeat variable from every repository
   version        print the version and the commit
@@ -150,7 +150,7 @@ func cmdRun(ctx context.Context, args []string, stderr io.Writer, svc services) 
 	probe := fs.Bool("probe", false, "serve one repository under probe names")
 	onlyRepo := fs.String("only-repo", "", "with --probe: the repository (OWNER/NAME) to serve")
 	markerRef := fs.String("marker-ref", "", "with --probe: read the marker at this ref instead of the default branch")
-	healthAddr := fs.String("health-addr", supervisor.DefaultHealthAddr, "health endpoint address; binding it is the single-instance lock")
+	healthAddr := fs.String("health-addr", supervisor.DefaultHealthAddr, "with --probe: health endpoint address; binding it is the single-instance lock")
 	if err := fs.Parse(args); err != nil {
 		return usageError(stderr, err.Error())
 	}
@@ -161,6 +161,11 @@ func cmdRun(ctx context.Context, args []string, stderr io.Writer, svc services) 
 		return usageError(stderr, "--probe needs --only-repo")
 	case !*probe && (*onlyRepo != "" || *markerRef != ""):
 		return usageError(stderr, "--only-repo and --marker-ref belong to --probe")
+	case !*probe && flagSet(fs, "health-addr"):
+		// The default address is the lock that keeps a second main instance
+		// from starting; one that skipped it would sweep the installed pool's
+		// containers. A probe has its own instance label.
+		return usageError(stderr, "--health-addr belongs to --probe")
 	}
 	if err := checkHealthAddr(*healthAddr); err != nil {
 		return usageError(stderr, err.Error())
@@ -210,6 +215,13 @@ func cmdRun(ctx context.Context, args []string, stderr io.Writer, svc services) 
 	}
 	log.Error("exiting so that launchd starts the pool again", "error", runErr.Error())
 	return exitError
+}
+
+// flagSet reports whether the flag was given on the command line.
+func flagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) { set = set || f.Name == name })
+	return set
 }
 
 func cmdForget(ctx context.Context, args []string, stdout, stderr io.Writer, svc services) int {
