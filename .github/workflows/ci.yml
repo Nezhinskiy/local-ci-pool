@@ -1,0 +1,107 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - name: Install analysis tools
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: staticcheck
+        run: staticcheck ./...
+      - name: govulncheck
+        run: govulncheck ./...
+      - name: go test
+        run: go test -race ./...
+      - name: actionlint
+        run: actionlint
+
+  deny-list:
+    # Secrets are not exposed to fork pull requests, so a fork PR skips this
+    # job and the push run after the merge covers it.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan tree, file names and commit messages
+        env:
+          DENYLIST: ${{ secrets.DENYLIST }}
+          RANGE_FROM: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          RANGE_TO: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          patterns="$(mktemp)"
+          trap 'rm -f "$patterns"' EXIT
+          # One fixed string per line; blank lines would match everything.
+          printf '%s\n' "$DENYLIST" | tr -d '\r' | grep -v '^[[:space:]]*$' > "$patterns" || true
+          if [ ! -s "$patterns" ]; then
+            echo "::error::the DENYLIST secret is empty or not available; the scan cannot run"
+            exit 1
+          fi
+
+          # Matched text is never printed: the log of a public repository is public.
+          bad=0
+
+          name_hits="$(git ls-files | grep -Fi -f "$patterns" || true)"
+          if [ -n "$name_hits" ]; then
+            echo "::error::$(printf '%s\n' "$name_hits" | wc -l | tr -d ' ') tracked file name(s) match the deny-list"
+            bad=1
+          fi
+
+          content_hits="$(git ls-files -z | xargs -0 -r grep -aFil -f "$patterns" -- | grep -vFi -f "$patterns" || true)"
+          if [ -n "$content_hits" ]; then
+            echo "::error::file contents match the deny-list in:"
+            printf '%s\n' "$content_hits"
+            bad=1
+          fi
+
+          if [ -z "$RANGE_FROM" ] || [[ "$RANGE_FROM" =~ ^0+$ ]] || ! git cat-file -e "${RANGE_FROM}^{commit}" 2>/dev/null; then
+            range="$RANGE_TO"
+          else
+            range="$RANGE_FROM..$RANGE_TO"
+          fi
+          commit_hits="$(git rev-list "$range" | while read -r c; do
+            if git log -1 --format=%B "$c" | grep -Fi -f "$patterns" > /dev/null; then
+              echo "$c"
+            fi
+          done)"
+          if [ -n "$commit_hits" ]; then
+            echo "::error::commit messages match the deny-list in:"
+            printf '%s\n' "$commit_hits"
+            bad=1
+          fi
+
+          exit "$bad"

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["helpers:pinGitHubActionDigests"],
+  "enabledManagers": ["gomod", "github-actions"],
+  "minimumReleaseAge": "3 days",
+  "internalChecksFilter": "strict",
+  "automerge": false,
+  "dependencyDashboard": true,
+  "packageRules": [
+    {
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["github.com/actions/scaleset"],
+      "rangeStrategy": "pin",
+      "groupName": null
+    },
+    {
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["github.com/actions/scaleset"],
+      "matchUpdateTypes": ["minor", "major"],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}
