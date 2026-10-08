@@ -5,6 +5,8 @@ package image
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -12,14 +14,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/build"
-	"github.com/docker/docker/api/types/container"
-	dockerimage "github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/client"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
 	"github.com/Nezhinskiy/local-ci-pool/internal/dockerutil"
@@ -40,14 +38,14 @@ var preflightTimeout = 60 * time.Second
 // Docker is the part of the Docker API this package uses. *client.Client
 // satisfies it.
 type Docker interface {
-	ImageInspect(ctx context.Context, imageID string, opts ...client.ImageInspectOption) (dockerimage.InspectResponse, error)
-	ImagePull(ctx context.Context, ref string, options dockerimage.PullOptions) (io.ReadCloser, error)
-	ImageBuild(ctx context.Context, buildContext io.Reader, options build.ImageBuildOptions) (build.ImageBuildResponse, error)
-	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error)
-	ContainerStart(ctx context.Context, containerID string, options container.StartOptions) error
-	ContainerWait(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error)
-	ContainerLogs(ctx context.Context, containerID string, options container.LogsOptions) (io.ReadCloser, error)
-	ContainerRemove(ctx context.Context, containerID string, options container.RemoveOptions) error
+	ImageInspect(ctx context.Context, imageID string, opts ...client.ImageInspectOption) (client.ImageInspectResult, error)
+	ImagePull(ctx context.Context, ref string, options client.ImagePullOptions) (client.ImagePullResponse, error)
+	ImageBuild(ctx context.Context, buildContext io.Reader, options client.ImageBuildOptions) (client.ImageBuildResult, error)
+	ContainerCreate(ctx context.Context, options client.ContainerCreateOptions) (client.ContainerCreateResult, error)
+	ContainerStart(ctx context.Context, containerID string, options client.ContainerStartOptions) (client.ContainerStartResult, error)
+	ContainerWait(ctx context.Context, containerID string, options client.ContainerWaitOptions) client.ContainerWaitResult
+	ContainerLogs(ctx context.Context, containerID string, options client.ContainerLogsOptions) (client.ContainerLogsResult, error)
+	ContainerRemove(ctx context.Context, containerID string, options client.ContainerRemoveOptions) (client.ContainerRemoveResult, error)
 }
 
 // Mirror is the part of mirror.Mirror this package uses.
@@ -61,7 +59,7 @@ type Mirror interface {
 // Ensure makes the project's job image available and returns the reference to
 // run. The image form is pulled by digest and the digest is checked on the pulled
 // image. The Dockerfile form is built from a git archive of the marker's inputs
-// at the ref's commit, tagged local-ci/<identity>:<digest of the inputs>; an
+// at the ref's commit, tagged local-ci/<identity>:<TagDigest>; an
 // existing tag is reused, so a commit that leaves the inputs alone costs nothing.
 func Ensure(ctx context.Context, d Docker, m Mirror, p discovery.Project) (string, error) {
 	switch {
@@ -73,7 +71,7 @@ func Ensure(ctx context.Context, d Docker, m Mirror, p discovery.Project) (strin
 	return "", fmt.Errorf("project %s has an empty marker", p.Repo)
 }
 
-func hasDigest(info dockerimage.InspectResponse, digest string) bool {
+func hasDigest(info client.ImageInspectResult, digest string) bool {
 	for _, rd := range info.RepoDigests {
 		if strings.HasSuffix(rd, "@"+digest) {
 			return true
@@ -92,7 +90,7 @@ func ensurePulled(ctx context.Context, d Docker, ref string) (string, error) {
 	if info, err := d.ImageInspect(ctx, ref); err == nil && hasDigest(info, digest) {
 		return ref, nil
 	}
-	rc, err := d.ImagePull(ctx, ref, dockerimage.PullOptions{})
+	rc, err := d.ImagePull(ctx, ref, client.ImagePullOptions{})
 	if err != nil {
 		return "", fmt.Errorf("pulling %s: %w", ref, err)
 	}
@@ -120,7 +118,7 @@ func ensureBuilt(ctx context.Context, d Docker, m Mirror, p discovery.Project) (
 	if err != nil {
 		return "", fmt.Errorf("digesting the build inputs of %s: %w", p.Repo, err)
 	}
-	tag := "local-ci/" + p.Identity + ":" + digest
+	tag := "local-ci/" + p.Identity + ":" + TagDigest(digest, p.Marker.Dockerfile)
 	if _, err := d.ImageInspect(ctx, tag); err == nil {
 		return tag, nil
 	}
@@ -129,7 +127,7 @@ func ensureBuilt(ctx context.Context, d Docker, m Mirror, p discovery.Project) (
 		return "", fmt.Errorf("archiving the build inputs of %s: %w", p.Repo, err)
 	}
 	defer func() { _ = archive.Close() }()
-	resp, err := d.ImageBuild(ctx, archive, build.ImageBuildOptions{
+	resp, err := d.ImageBuild(ctx, archive, client.ImageBuildOptions{
 		Tags:        []string{tag},
 		Dockerfile:  p.Marker.Dockerfile,
 		Remove:      true,
@@ -146,6 +144,15 @@ func ensureBuilt(ctx context.Context, d Docker, m Mirror, p discovery.Project) (
 		return "", fmt.Errorf("building %s: the image is missing after the build: %w", tag, err)
 	}
 	return tag, nil
+}
+
+// TagDigest is the tag of a built image: the first 12 hex of sha256 over the
+// inputs digest and the Dockerfile path. The inputs digest alone would keep the
+// tag when only the marker's dockerfile field changes to another file inside the
+// same inputs, and a stale image would be reused.
+func TagDigest(inputsDigest, dockerfile string) string {
+	sum := sha256.Sum256([]byte(inputsDigest + "\x00" + dockerfile))
+	return hex.EncodeToString(sum[:])[:12]
 }
 
 // RunUser is the user a job runs as: the image's own USER unless that is empty
@@ -189,21 +196,24 @@ func PreflightVersion(ctx context.Context, d Docker, ref string, m runnermount.M
 	defer cancel()
 
 	init := true
-	created, err := d.ContainerCreate(ctx, &container.Config{
-		Image:      ref,
-		User:       user,
-		Entrypoint: []string{runnermount.Target + "/entrypoint.sh"},
-		Cmd:        []string{"--preflight"},
-		Env:        []string{"HOME=/tmp/home"},
-		Labels:     map[string]string{"local-ci-pool": "preflight"},
-	}, &container.HostConfig{
-		Init:        &init,
-		Mounts:      []mount.Mount{m.Spec},
-		Tmpfs:       map[string]string{"/tmp/home": "rw,mode=1777"},
-		NetworkMode: "none",
-		ExtraHosts:  []string{"host.docker.internal:127.0.0.1", "gateway.docker.internal:127.0.0.1"},
-		Resources:   container.Resources{Memory: preflightMemory},
-	}, nil, nil, "")
+	created, err := d.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config: &container.Config{
+			Image:      ref,
+			User:       user,
+			Entrypoint: []string{runnermount.Target + "/entrypoint.sh"},
+			Cmd:        []string{"--preflight"},
+			Env:        []string{"HOME=/tmp/home"},
+			Labels:     map[string]string{"local-ci-pool": "preflight"},
+		},
+		HostConfig: &container.HostConfig{
+			Init:        &init,
+			Mounts:      []mount.Mount{m.Spec},
+			Tmpfs:       map[string]string{"/tmp/home": "rw,mode=1777"},
+			NetworkMode: "none",
+			ExtraHosts:  []string{"host.docker.internal:127.0.0.1", "gateway.docker.internal:127.0.0.1"},
+			Resources:   container.Resources{Memory: preflightMemory},
+		},
+	})
 	if err != nil {
 		return "", fmt.Errorf("preflight of %s: creating the container: %w", ref, err)
 	}
@@ -212,14 +222,15 @@ func PreflightVersion(ctx context.Context, d Docker, ref string, m runnermount.M
 	defer func() {
 		rmCtx, rmCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer rmCancel()
-		_ = d.ContainerRemove(rmCtx, id, container.RemoveOptions{Force: true, RemoveVolumes: true})
+		_, _ = d.ContainerRemove(rmCtx, id, client.ContainerRemoveOptions{Force: true, RemoveVolumes: true})
 	}()
 
-	if err := d.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
+	if _, err := d.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
 		return "", fmt.Errorf("preflight of %s: starting the container: %w", ref, err)
 	}
 
-	statusCh, errCh := d.ContainerWait(ctx, id, container.WaitConditionNotRunning)
+	waiting := d.ContainerWait(ctx, id, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
+	statusCh, errCh := waiting.Result, waiting.Error
 	var status container.WaitResponse
 	timedOut := false
 	select {
@@ -255,7 +266,7 @@ func PreflightVersion(ctx context.Context, d Docker, ref string, m runnermount.M
 func containerOutput(ctx context.Context, d Docker, id string) string {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	rc, err := d.ContainerLogs(ctx, id, container.LogsOptions{ShowStdout: true, ShowStderr: true, Tail: "100"})
+	rc, err := d.ContainerLogs(ctx, id, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true, Tail: "100"})
 	if err != nil {
 		return fmt.Sprintf("(no output: %v)", err)
 	}

@@ -26,6 +26,12 @@ func TestDrainStream(t *testing.T) {
 		}
 	}
 
+	// A daemon may send only the structured form.
+	err = DrainStream(strings.NewReader(`{"errorDetail":{"message":"detail only"}}` + "\n"))
+	if err == nil || !strings.Contains(err.Error(), "detail only") {
+		t.Fatalf("errorDetail alone must be an error, got %v", err)
+	}
+
 	if err := DrainStream(strings.NewReader(`{"stream":"x"} garbage`)); err == nil {
 		t.Fatal("a corrupt stream must be an error")
 	}

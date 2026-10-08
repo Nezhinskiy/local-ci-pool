@@ -23,6 +23,9 @@ func DrainStream(r io.Reader) error {
 			Stream string `json:"stream"`
 			Status string `json:"status"`
 			Error  string `json:"error"`
+			Detail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
 		}
 		err := dec.Decode(&msg)
 		if errors.Is(err, io.EOF) {
@@ -39,11 +42,15 @@ func DrainStream(r io.Reader) error {
 		if len(tail) > tailLines {
 			tail = tail[len(tail)-tailLines:]
 		}
-		if msg.Error != "" {
+		failure := msg.Error
+		if failure == "" {
+			failure = msg.Detail.Message
+		}
+		if failure != "" {
 			if len(tail) == 0 {
-				return errors.New(msg.Error)
+				return errors.New(failure)
 			}
-			return fmt.Errorf("%s\n%s", msg.Error, strings.Join(tail, "\n"))
+			return fmt.Errorf("%s\n%s", failure, strings.Join(tail, "\n"))
 		}
 	}
 }

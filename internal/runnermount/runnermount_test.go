@@ -12,13 +12,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types/build"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
 	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/client"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
@@ -104,9 +103,9 @@ type builtContext struct {
 }
 
 type fakeDocker struct {
-	images     map[string]image.InspectResponse
+	images     map[string]client.ImageInspectResult
 	builds     int
-	opts       build.ImageBuildOptions
+	opts       client.ImageBuildOptions
 	ctx        builtContext
 	buildErr   error
 	streamBody string // build response body; "" means success
@@ -117,14 +116,14 @@ type fakeDocker struct {
 	removeErrOn string
 }
 
-func (f *fakeDocker) ImageInspect(_ context.Context, ref string, _ ...client.ImageInspectOption) (image.InspectResponse, error) {
+func (f *fakeDocker) ImageInspect(_ context.Context, ref string, _ ...client.ImageInspectOption) (client.ImageInspectResult, error) {
 	if r, ok := f.images[ref]; ok {
 		return r, nil
 	}
-	return image.InspectResponse{}, errdefs.NotFound(errors.New("no such image"))
+	return client.ImageInspectResult{}, cerrdefs.ErrNotFound.WithMessage("no such image")
 }
 
-func (f *fakeDocker) ImageBuild(_ context.Context, r io.Reader, o build.ImageBuildOptions) (build.ImageBuildResponse, error) {
+func (f *fakeDocker) ImageBuild(_ context.Context, r io.Reader, o client.ImageBuildOptions) (client.ImageBuildResult, error) {
 	f.builds++
 	f.opts = o
 	f.ctx = builtContext{files: map[string]*tar.Header{}, body: map[string]string{}}
@@ -135,45 +134,45 @@ func (f *fakeDocker) ImageBuild(_ context.Context, r io.Reader, o build.ImageBui
 			break
 		}
 		if err != nil {
-			return build.ImageBuildResponse{}, err
+			return client.ImageBuildResult{}, err
 		}
 		b, err := io.ReadAll(tr)
 		if err != nil {
-			return build.ImageBuildResponse{}, err
+			return client.ImageBuildResult{}, err
 		}
 		f.ctx.files[hdr.Name] = hdr
 		f.ctx.body[hdr.Name] = string(b)
 	}
 	if f.buildErr != nil {
-		return build.ImageBuildResponse{}, f.buildErr
+		return client.ImageBuildResult{}, f.buildErr
 	}
 	body := f.streamBody
 	if body == "" {
 		body = `{"stream":"Successfully built\n"}` + "\n"
 		if f.images == nil {
-			f.images = map[string]image.InspectResponse{}
+			f.images = map[string]client.ImageInspectResult{}
 		}
 		for _, tag := range o.Tags {
-			f.images[tag] = image.InspectResponse{ID: "sha256:new", Config: &dockerspec.DockerOCIImageConfig{ImageConfig: ocispec.ImageConfig{Labels: o.Labels}}}
+			f.images[tag] = client.ImageInspectResult{InspectResponse: image.InspectResponse{ID: "sha256:new", Config: &dockerspec.DockerOCIImageConfig{ImageConfig: ocispec.ImageConfig{Labels: o.Labels}}}}
 		}
 	}
-	return build.ImageBuildResponse{Body: io.NopCloser(strings.NewReader(body))}, nil
+	return client.ImageBuildResult{Body: io.NopCloser(strings.NewReader(body))}, nil
 }
 
-func (f *fakeDocker) ImageList(context.Context, image.ListOptions) ([]image.Summary, error) {
-	return f.list, nil
+func (f *fakeDocker) ImageList(context.Context, client.ImageListOptions) (client.ImageListResult, error) {
+	return client.ImageListResult{Items: f.list}, nil
 }
 
-func (f *fakeDocker) ImageRemove(_ context.Context, ref string, _ image.RemoveOptions) ([]image.DeleteResponse, error) {
+func (f *fakeDocker) ImageRemove(_ context.Context, ref string, _ client.ImageRemoveOptions) (client.ImageRemoveResult, error) {
 	f.removed = append(f.removed, ref)
 	if f.removeErrOn == ref {
-		return nil, errors.New("conflict: unable to remove")
+		return client.ImageRemoveResult{}, errors.New("conflict: unable to remove")
 	}
-	return nil, nil
+	return client.ImageRemoveResult{}, nil
 }
 
-func (f *fakeDocker) ContainerList(context.Context, container.ListOptions) ([]container.Summary, error) {
-	return f.containers, nil
+func (f *fakeDocker) ContainerList(context.Context, client.ContainerListOptions) (client.ContainerListResult, error) {
+	return client.ContainerListResult{Items: f.containers}, nil
 }
 
 func release(sum string) github.RunnerRelease {
@@ -304,17 +303,17 @@ func keys(m map[string]*tar.Header) []string {
 
 func TestEnsureReusesAnImageBuiltFromTheSameInputs(t *testing.T) {
 	tarball, sum := runnerTarball(t)
-	labelled := func(runnerSHA, ep string) image.InspectResponse {
-		return image.InspectResponse{Config: &dockerspec.DockerOCIImageConfig{ImageConfig: ocispec.ImageConfig{Labels: map[string]string{labelRunnerSHA: runnerSHA, labelEntrypointSHA: ep}}}}
+	labelled := func(runnerSHA, ep string) client.ImageInspectResult {
+		return client.ImageInspectResult{InspectResponse: image.InspectResponse{Config: &dockerspec.DockerOCIImageConfig{ImageConfig: ocispec.ImageConfig{Labels: map[string]string{labelRunnerSHA: runnerSHA, labelEntrypointSHA: ep}}}}}
 	}
 	cases := map[string]struct {
-		have       map[string]image.InspectResponse
+		have       map[string]client.ImageInspectResult
 		wantBuilds int
 	}{
-		"current":               {map[string]image.InspectResponse{"local-ci/runner:2.338.0": labelled(sum, entrypointSHA())}, 0},
-		"older entrypoint":      {map[string]image.InspectResponse{"local-ci/runner:2.338.0": labelled(sum, "old")}, 1},
-		"different runner hash": {map[string]image.InspectResponse{"local-ci/runner:2.338.0": labelled("old", entrypointSHA())}, 1},
-		"unlabelled":            {map[string]image.InspectResponse{"local-ci/runner:2.338.0": {Config: &dockerspec.DockerOCIImageConfig{}}}, 1},
+		"current":               {map[string]client.ImageInspectResult{"local-ci/runner:2.338.0": labelled(sum, entrypointSHA())}, 0},
+		"older entrypoint":      {map[string]client.ImageInspectResult{"local-ci/runner:2.338.0": labelled(sum, "old")}, 1},
+		"different runner hash": {map[string]client.ImageInspectResult{"local-ci/runner:2.338.0": labelled("old", entrypointSHA())}, 1},
+		"unlabelled":            {map[string]client.ImageInspectResult{"local-ci/runner:2.338.0": {InspectResponse: image.InspectResponse{Config: &dockerspec.DockerOCIImageConfig{}}}}, 1},
 		"absent":                {nil, 1},
 	}
 	for name, tc := range cases {
@@ -339,8 +338,8 @@ func TestEnsureReuseNeedsBothHashesToAgree(t *testing.T) {
 	// hashes disagree with each other.
 	tarball, sum := runnerTarball(t)
 	other := strings.Repeat("b", 64)
-	d := &fakeDocker{images: map[string]image.InspectResponse{
-		"local-ci/runner:2.338.0": {Config: &dockerspec.DockerOCIImageConfig{ImageConfig: ocispec.ImageConfig{Labels: map[string]string{labelRunnerSHA: sum, labelEntrypointSHA: entrypointSHA()}}}},
+	d := &fakeDocker{images: map[string]client.ImageInspectResult{
+		"local-ci/runner:2.338.0": {InspectResponse: image.InspectResponse{Config: &dockerspec.DockerOCIImageConfig{ImageConfig: ocispec.ImageConfig{Labels: map[string]string{labelRunnerSHA: sum, labelEntrypointSHA: entrypointSHA()}}}}},
 	}}
 	gh := &fakeGH{rel: github.RunnerRelease{Version: "2.338.0", URL: "u", DigestSHA256: sum, BodySHA256: other}, tarball: tarball}
 	if _, err := Ensure(context.Background(), d, gh, "arm64"); err == nil || !strings.Contains(err.Error(), "body marker") {

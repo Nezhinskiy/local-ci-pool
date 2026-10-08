@@ -11,12 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	dockerimage "github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/client"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/ghauth"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
@@ -44,22 +42,26 @@ func (c *countingSource) Download(ctx context.Context, url string) (io.ReadClose
 
 func runOnce(t *testing.T, ctx context.Context, cli *client.Client, ref string, m runnermount.Mount, user string, entrypoint, cmd []string) (int64, string) {
 	t.Helper()
-	created, err := cli.ContainerCreate(ctx, &container.Config{
-		Image: ref, User: user, Entrypoint: entrypoint, Cmd: cmd, Env: []string{"HOME=/tmp/home"},
-	}, &container.HostConfig{
-		Mounts: []mount.Mount{m.Spec},
-		Tmpfs:  map[string]string{"/tmp/home": "rw,mode=1777"},
-	}, nil, nil, "")
+	created, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config: &container.Config{
+			Image: ref, User: user, Entrypoint: entrypoint, Cmd: cmd, Env: []string{"HOME=/tmp/home"},
+		},
+		HostConfig: &container.HostConfig{
+			Mounts: []mount.Mount{m.Spec},
+			Tmpfs:  map[string]string{"/tmp/home": "rw,mode=1777"},
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
-		_ = cli.ContainerRemove(context.WithoutCancel(ctx), created.ID, container.RemoveOptions{Force: true})
+		_, _ = cli.ContainerRemove(context.WithoutCancel(ctx), created.ID, client.ContainerRemoveOptions{Force: true})
 	}()
-	if err := cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+	if _, err := cli.ContainerStart(ctx, created.ID, client.ContainerStartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	waitCh, errCh := cli.ContainerWait(ctx, created.ID, container.WaitConditionNotRunning)
+	waiting := cli.ContainerWait(ctx, created.ID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
+	waitCh, errCh := waiting.Result, waiting.Error
 	var code int64
 	select {
 	case w := <-waitCh:
@@ -67,7 +69,7 @@ func runOnce(t *testing.T, ctx context.Context, cli *client.Client, ref string, 
 	case err := <-errCh:
 		t.Fatal(err)
 	}
-	logs, err := cli.ContainerLogs(ctx, created.ID, container.LogsOptions{ShowStdout: true, ShowStderr: true})
+	logs, err := cli.ContainerLogs(ctx, created.ID, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,12 +93,13 @@ func haveImage(ctx context.Context, cli *client.Client, ref string) bool {
 func TestRealMount(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = cli.Close() }()
-	info, err := cli.Info(ctx)
+	infoRes, err := cli.Info(ctx, client.InfoOptions{})
+	info := infoRes.Info
 	if err != nil {
 		t.Skipf("Docker is not available: %v", err)
 	}
@@ -176,32 +179,34 @@ func TestRealMount(t *testing.T) {
 	// 5. Prune removes an older unused runner image and spares the current one
 	// and any image a container mounts.
 	cleanup := func(tag string) {
-		_, _ = cli.ImageRemove(context.WithoutCancel(ctx), tag, dockerimage.RemoveOptions{Force: true})
+		_, _ = cli.ImageRemove(context.WithoutCancel(ctx), tag, client.ImageRemoveOptions{Force: true})
 	}
 	const stale, busy = "local-ci/runner:0.0.1-smoke-stale", "local-ci/runner:0.0.2-smoke-busy"
 	for _, tag := range []string{stale, busy} {
-		if err := cli.ImageTag(ctx, m.Spec.Source, tag); err != nil {
+		if _, err := cli.ImageTag(ctx, client.ImageTagOptions{Source: m.Spec.Source, Target: tag}); err != nil {
 			t.Fatal(err)
 		}
 		defer cleanup(tag)
 	}
-	held, err := cli.ContainerCreate(ctx, &container.Config{Image: bareUbuntu, Cmd: []string{"true"}},
-		&container.HostConfig{Mounts: []mount.Mount{{Type: mount.TypeImage, Source: busy, Target: "/opt/local-ci", ReadOnly: true}}}, nil, nil, "")
+	held, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:     &container.Config{Image: bareUbuntu, Cmd: []string{"true"}},
+		HostConfig: &container.HostConfig{Mounts: []mount.Mount{{Type: mount.TypeImage, Source: busy, Target: "/opt/local-ci", ReadOnly: true}}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
-		_ = cli.ContainerRemove(context.WithoutCancel(ctx), held.ID, container.RemoveOptions{Force: true})
+		_, _ = cli.ContainerRemove(context.WithoutCancel(ctx), held.ID, client.ContainerRemoveOptions{Force: true})
 	}()
 	if err := runnermount.Prune(ctx, cli, m.Version); err != nil {
 		t.Fatal(err)
 	}
-	left, err := cli.ImageList(ctx, dockerimage.ListOptions{Filters: filters.NewArgs(filters.Arg("reference", "local-ci/runner:*"))})
+	left, err := cli.ImageList(ctx, client.ImageListOptions{Filters: make(client.Filters).Add("reference", "local-ci/runner:*")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	tags := map[string]bool{}
-	for _, s := range left {
+	for _, s := range left.Items {
 		for _, tag := range s.RepoTags {
 			tags[tag] = true
 		}

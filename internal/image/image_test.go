@@ -3,22 +3,23 @@ package image
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types/build"
-	"github.com/docker/docker/api/types/container"
-	dockerimage "github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/stdcopy"
+	cerrdefs "github.com/containerd/errdefs"
 	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	dockerimage "github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/jsonstream"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/client"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
@@ -35,7 +36,7 @@ type fakeDocker struct {
 	pulls    []string
 
 	builds     int
-	buildOpts  build.ImageBuildOptions
+	buildOpts  client.ImageBuildOptions
 	buildInput string
 	buildBody  string
 	buildErr   error
@@ -48,17 +49,26 @@ type fakeDocker struct {
 	logs        []byte
 	neverExits  bool
 	removed     []string
-	removeOpts  container.RemoveOptions
+	removeOpts  client.ContainerRemoveOptions
 }
 
-func (f *fakeDocker) ImageInspect(_ context.Context, ref string, _ ...client.ImageInspectOption) (dockerimage.InspectResponse, error) {
+func (f *fakeDocker) ImageInspect(_ context.Context, ref string, _ ...client.ImageInspectOption) (client.ImageInspectResult, error) {
 	if r, ok := f.images[ref]; ok {
-		return r, nil
+		return client.ImageInspectResult{InspectResponse: r}, nil
 	}
-	return dockerimage.InspectResponse{}, errdefs.NotFound(errors.New("no such image"))
+	return client.ImageInspectResult{}, cerrdefs.ErrNotFound.WithMessage("no such image")
 }
 
-func (f *fakeDocker) ImagePull(_ context.Context, ref string, _ dockerimage.PullOptions) (io.ReadCloser, error) {
+// pullStream is the fake body of an image pull.
+type pullStream struct{ io.ReadCloser }
+
+func (pullStream) JSONMessages(context.Context) iter.Seq2[jsonstream.Message, error] {
+	return func(func(jsonstream.Message, error) bool) {}
+}
+
+func (pullStream) Wait(context.Context) error { return nil }
+
+func (f *fakeDocker) ImagePull(_ context.Context, ref string, _ client.ImagePullOptions) (client.ImagePullResponse, error) {
 	f.pulls = append(f.pulls, ref)
 	if f.pullErr != nil {
 		return nil, f.pullErr
@@ -73,19 +83,19 @@ func (f *fakeDocker) ImagePull(_ context.Context, ref string, _ dockerimage.Pull
 			f.images[ref] = *f.pullAdds
 		}
 	}
-	return io.NopCloser(strings.NewReader(body)), nil
+	return pullStream{io.NopCloser(strings.NewReader(body))}, nil
 }
 
-func (f *fakeDocker) ImageBuild(_ context.Context, r io.Reader, o build.ImageBuildOptions) (build.ImageBuildResponse, error) {
+func (f *fakeDocker) ImageBuild(_ context.Context, r io.Reader, o client.ImageBuildOptions) (client.ImageBuildResult, error) {
 	f.builds++
 	f.buildOpts = o
 	b, err := io.ReadAll(r)
 	if err != nil {
-		return build.ImageBuildResponse{}, err
+		return client.ImageBuildResult{}, err
 	}
 	f.buildInput = string(b)
 	if f.buildErr != nil {
-		return build.ImageBuildResponse{}, f.buildErr
+		return client.ImageBuildResult{}, f.buildErr
 	}
 	body := f.buildBody
 	if body == "" {
@@ -97,52 +107,56 @@ func (f *fakeDocker) ImageBuild(_ context.Context, r io.Reader, o build.ImageBui
 			f.images[tag] = dockerimage.InspectResponse{ID: "sha256:built"}
 		}
 	}
-	return build.ImageBuildResponse{Body: io.NopCloser(strings.NewReader(body))}, nil
+	return client.ImageBuildResult{Body: io.NopCloser(strings.NewReader(body))}, nil
 }
 
-func (f *fakeDocker) ContainerCreate(_ context.Context, c *container.Config, h *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
-	f.createdCfg, f.createdHost = c, h
-	return container.CreateResponse{ID: "c1"}, nil
+func (f *fakeDocker) ContainerCreate(_ context.Context, o client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
+	f.createdCfg, f.createdHost = o.Config, o.HostConfig
+	return client.ContainerCreateResult{ID: "c1"}, nil
 }
 
-func (f *fakeDocker) ContainerStart(context.Context, string, container.StartOptions) error {
-	return f.startErr
+func (f *fakeDocker) ContainerStart(context.Context, string, client.ContainerStartOptions) (client.ContainerStartResult, error) {
+	return client.ContainerStartResult{}, f.startErr
 }
 
-func (f *fakeDocker) ContainerWait(ctx context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+func (f *fakeDocker) ContainerWait(ctx context.Context, _ string, _ client.ContainerWaitOptions) client.ContainerWaitResult {
 	st := make(chan container.WaitResponse, 1)
 	er := make(chan error, 1)
 	if f.neverExits {
 		go func() { <-ctx.Done(); er <- ctx.Err() }()
-		return st, er
+		return client.ContainerWaitResult{Result: st, Error: er}
 	}
 	st <- container.WaitResponse{StatusCode: f.exit}
-	return st, er
+	return client.ContainerWaitResult{Result: st, Error: er}
 }
 
-func (f *fakeDocker) ContainerLogs(context.Context, string, container.LogsOptions) (io.ReadCloser, error) {
+func (f *fakeDocker) ContainerLogs(context.Context, string, client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
 	return io.NopCloser(bytes.NewReader(f.logs)), nil
 }
 
-func (f *fakeDocker) ContainerRemove(_ context.Context, id string, o container.RemoveOptions) error {
+func (f *fakeDocker) ContainerRemove(_ context.Context, id string, o client.ContainerRemoveOptions) (client.ContainerRemoveResult, error) {
 	f.removed = append(f.removed, id)
 	f.removeOpts = o
-	return nil
+	return client.ContainerRemoveResult{}, nil
 }
 
-// frames builds a multiplexed log stream from stdout and stderr lines.
+// frames builds a multiplexed log stream from stdout and stderr text. The
+// framing is the one stdcopy.StdCopy reads: an 8-byte header (stream type,
+// three zero bytes, big-endian length) and then the payload.
 func frames(t *testing.T, stdout, stderr string) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	if stdout != "" {
-		if _, err := stdcopy.NewStdWriter(&buf, stdcopy.Stdout).Write([]byte(stdout)); err != nil {
-			t.Fatal(err)
+	for _, f := range []struct {
+		kind stdcopy.StdType
+		text string
+	}{{stdcopy.Stdout, stdout}, {stdcopy.Stderr, stderr}} {
+		if f.text == "" {
+			continue
 		}
-	}
-	if stderr != "" {
-		if _, err := stdcopy.NewStdWriter(&buf, stdcopy.Stderr).Write([]byte(stderr)); err != nil {
-			t.Fatal(err)
-		}
+		hdr := []byte{byte(f.kind), 0, 0, 0, 0, 0, 0, 0}
+		binary.BigEndian.PutUint32(hdr[4:], uint32(len(f.text)))
+		buf.Write(hdr)
+		buf.WriteString(f.text)
 	}
 	return buf.Bytes()
 }
@@ -283,6 +297,10 @@ func (f *fakeMirror) Archive(_ context.Context, _, _ string, inputs []string) (i
 	return io.NopCloser(strings.NewReader(f.body)), nil
 }
 
+// alphaTag is the tag of dockerfileProject when the inputs digest is
+// 0123456789ab: it covers the Dockerfile path as well.
+var alphaTag = "local-ci/alpha:" + TagDigest("0123456789ab", "ci/runner/Dockerfile")
+
 func dockerfileProject() discovery.Project {
 	return discovery.Project{
 		Identity: "alpha", Repo: "o/alpha", Ref: "main",
@@ -292,9 +310,9 @@ func dockerfileProject() discovery.Project {
 
 func TestDockerfileFormSkipsBuildWhenTagPresent(t *testing.T) {
 	m := &fakeMirror{commit: strings.Repeat("a", 40), digest: "0123456789ab", body: "TARBYTES"}
-	d := &fakeDocker{images: map[string]dockerimage.InspectResponse{"local-ci/alpha:0123456789ab": {}}}
+	d := &fakeDocker{images: map[string]dockerimage.InspectResponse{alphaTag: {}}}
 	ref, err := Ensure(context.Background(), d, m, dockerfileProject())
-	if err != nil || ref != "local-ci/alpha:0123456789ab" {
+	if err != nil || ref != alphaTag {
 		t.Fatalf("Ensure = %q, %v", ref, err)
 	}
 	if d.builds != 0 || len(m.archives) != 0 {
@@ -309,7 +327,7 @@ func TestDockerfileFormBuildsFromTheArchive(t *testing.T) {
 	m := &fakeMirror{commit: strings.Repeat("a", 40), digest: "0123456789ab", body: "TARBYTES"}
 	d := &fakeDocker{}
 	ref, err := Ensure(context.Background(), d, m, dockerfileProject())
-	if err != nil || ref != "local-ci/alpha:0123456789ab" {
+	if err != nil || ref != alphaTag {
 		t.Fatalf("Ensure = %q, %v", ref, err)
 	}
 	if d.builds != 1 {
@@ -471,5 +489,36 @@ func TestPreflightStartFailure(t *testing.T) {
 	}
 	if len(d.removed) != 1 {
 		t.Errorf("the created container was not removed: %v", d.removed)
+	}
+}
+
+func TestDockerfilePathIsPartOfTheTag(t *testing.T) {
+	newMirror := func() *fakeMirror {
+		return &fakeMirror{commit: strings.Repeat("a", 40), digest: "0123456789ab", body: "x"}
+	}
+	d := &fakeDocker{}
+	first, err := Ensure(context.Background(), d, newMirror(), dockerfileProject())
+	if err != nil || d.builds != 1 {
+		t.Fatalf("first Ensure = %q, %v, builds %d", first, err, d.builds)
+	}
+	// Same commit, same inputs digest, only the marker's dockerfile differs.
+	other := dockerfileProject()
+	other.Marker.Dockerfile = "ci/runner/Dockerfile.alt"
+	second, err := Ensure(context.Background(), d, newMirror(), other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == first {
+		t.Fatalf("a different dockerfile kept the tag %s", first)
+	}
+	if d.builds != 2 || d.buildOpts.Dockerfile != "ci/runner/Dockerfile.alt" {
+		t.Fatalf("builds = %d, dockerfile %q: the changed path must rebuild", d.builds, d.buildOpts.Dockerfile)
+	}
+	// The same path again is a hit.
+	if again, err := Ensure(context.Background(), d, newMirror(), other); err != nil || again != second || d.builds != 2 {
+		t.Fatalf("repeat = %q, %v, builds %d", again, err, d.builds)
+	}
+	if !strings.HasPrefix(first, "local-ci/alpha:") || len(strings.TrimPrefix(first, "local-ci/alpha:")) != 12 {
+		t.Fatalf("tag shape: %s", first)
 	}
 }

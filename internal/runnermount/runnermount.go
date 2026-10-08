@@ -18,12 +18,8 @@ import (
 	"path"
 	"strings"
 
-	"github.com/docker/docker/api/types/build"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/client"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/dockerutil"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
@@ -46,11 +42,11 @@ const (
 // Docker is the part of the Docker API this package uses. *client.Client
 // satisfies it.
 type Docker interface {
-	ImageInspect(ctx context.Context, imageID string, opts ...client.ImageInspectOption) (image.InspectResponse, error)
-	ImageBuild(ctx context.Context, buildContext io.Reader, options build.ImageBuildOptions) (build.ImageBuildResponse, error)
-	ImageList(ctx context.Context, options image.ListOptions) ([]image.Summary, error)
-	ImageRemove(ctx context.Context, imageID string, options image.RemoveOptions) ([]image.DeleteResponse, error)
-	ContainerList(ctx context.Context, options container.ListOptions) ([]container.Summary, error)
+	ImageInspect(ctx context.Context, imageID string, opts ...client.ImageInspectOption) (client.ImageInspectResult, error)
+	ImageBuild(ctx context.Context, buildContext io.Reader, options client.ImageBuildOptions) (client.ImageBuildResult, error)
+	ImageList(ctx context.Context, options client.ImageListOptions) (client.ImageListResult, error)
+	ImageRemove(ctx context.Context, imageID string, options client.ImageRemoveOptions) (client.ImageRemoveResult, error)
+	ContainerList(ctx context.Context, options client.ContainerListOptions) (client.ContainerListResult, error)
 }
 
 // ReleaseSource is the part of the GitHub client this package uses.
@@ -175,7 +171,7 @@ func buildImage(ctx context.Context, d Docker, ref, tarball string, labels map[s
 	go func() { pw.CloseWithError(writeContext(pw, f)) }()
 	defer func() { _ = pr.Close() }()
 
-	resp, err := d.ImageBuild(ctx, pr, build.ImageBuildOptions{
+	resp, err := d.ImageBuild(ctx, pr, client.ImageBuildOptions{
 		Tags:        []string{ref},
 		Dockerfile:  dockerfileName,
 		Remove:      true,
@@ -287,14 +283,16 @@ func Prune(ctx context.Context, d Docker, keep string) error {
 	if !strings.Contains(keep, ":") {
 		keepRef = Ref(keep)
 	}
-	images, err := d.ImageList(ctx, image.ListOptions{Filters: filters.NewArgs(filters.Arg("reference", Repository+":*"))})
+	listed, err := d.ImageList(ctx, client.ImageListOptions{Filters: make(client.Filters).Add("reference", Repository+":*")})
 	if err != nil {
 		return fmt.Errorf("listing runner images: %w", err)
 	}
-	containers, err := d.ContainerList(ctx, container.ListOptions{All: true})
+	images := listed.Items
+	found, err := d.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
 		return fmt.Errorf("listing containers: %w", err)
 	}
+	containers := found.Items
 	inUse := map[string]bool{}
 	for _, c := range containers {
 		inUse[c.ImageID] = true
@@ -315,7 +313,7 @@ func Prune(ctx context.Context, d Docker, keep string) error {
 			if inUse[img.ID] || inUse[tag] {
 				continue
 			}
-			if _, err := d.ImageRemove(ctx, tag, image.RemoveOptions{}); err != nil {
+			if _, err := d.ImageRemove(ctx, tag, client.ImageRemoveOptions{}); err != nil {
 				errs = append(errs, fmt.Errorf("removing %s: %w", tag, err))
 			}
 		}
