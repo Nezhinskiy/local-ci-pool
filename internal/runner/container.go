@@ -34,7 +34,9 @@ const (
 )
 
 // extraHosts point Docker Desktop's host aliases at the container itself, so a
-// job cannot reach services on the Mac through them.
+// job cannot reach services on the Mac through those names. The host gateway
+// address itself still reaches the Mac's loopback; SECURITY.md states that
+// residual.
 var extraHosts = []string{"host.docker.internal:127.0.0.1", "gateway.docker.internal:127.0.0.1"}
 
 // Docker is the part of the Docker API this package uses. *client.Client
