@@ -166,6 +166,23 @@ func (a *Actions) GateSessions() (release func()) {
 	}
 }
 
+// RemoveScaleSet deletes a scale set behind the pool's back, with its session
+// and runners, as a person deleting it in the web UI would.
+func (a *Actions) RemoveScaleSet(name string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	id := a.mustIDLocked(name)
+	delete(a.scaleSets, id)
+	delete(a.sessions, id)
+	for n, r := range a.runners {
+		if r.scaleSet == id {
+			delete(a.runners, n)
+		}
+	}
+	close(a.changed)
+	a.changed = make(chan struct{})
+}
+
 // StaleOnOpen queues, on the next session create, a message with a JobStarted
 // for a runner with no name and a JobCompleted for a runner of a previous
 // process, as github.com delivers after a restart.
@@ -467,6 +484,9 @@ func (a *Actions) createSession(w http.ResponseWriter, r *http.Request, id int) 
 		case <-r.Context().Done():
 			return
 		}
+		if r.Context().Err() != nil {
+			return // the client gave up while it waited
+		}
 	}
 	var req scaleset.RunnerScaleSetSession
 	_ = json.NewDecoder(r.Body).Decode(&req)
@@ -532,6 +552,11 @@ func (a *Actions) getMessage(w http.ResponseWriter, r *http.Request, id int) {
 			a.failGets--
 			a.mu.Unlock()
 			writeJSON(w, http.StatusBadRequest, map[string]string{"message": "scripted failure"})
+			return
+		}
+		if a.scaleSets[id] == nil {
+			a.mu.Unlock()
+			writeJSON(w, http.StatusNotFound, map[string]string{"message": "the scale set does not exist"})
 			return
 		}
 		_, open := a.sessions[id]

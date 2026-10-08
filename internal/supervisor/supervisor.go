@@ -221,6 +221,7 @@ type Supervisor struct {
 	wg sync.WaitGroup
 
 	mu       sync.Mutex
+	life     context.Context // the projects' parent context, set by Run
 	machine  machine.Machine
 	instance string
 	slots    *runner.Slots
@@ -285,11 +286,20 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if errors.Is(err, syscall.EADDRINUSE) {
 			return terminal("already running: %s is in use", s.cfg.HealthAddr)
 		}
-		return fmt.Errorf("binding the health address %s: %w", s.cfg.HealthAddr, err)
+		// A loopback address that cannot be bound for another reason is a
+		// configuration error.
+		return terminal("binding the health address %s: %v", s.cfg.HealthAddr, err)
 	}
 	defer func() { _ = ln.Close() }()
 
+	// The token cache is empty at start, so this reads it from gh.
+	if _, err := s.deps.Token.Token(ctx); err != nil {
+		return terminal("gh logged out: %v; run gh auth login", err)
+	}
 	m, arch, err := s.deps.Detect(ctx)
+	if errors.Is(err, machine.ErrHostName) {
+		return terminal("%v: set a LocalHostName with letters or digits", err)
+	}
 	if err != nil {
 		return fmt.Errorf("detecting the machine: %w", err)
 	}
@@ -305,6 +315,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		instance = "probe-" + m.Owner
 	}
 	mount, err := s.deps.Mount(ctx, arch)
+	if t := loginRejected(err); t != nil {
+		return t
+	}
 	if err != nil {
 		return fmt.Errorf("preparing the runner mount: %w", err)
 	}
@@ -322,6 +335,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	// not cancel them; life ends after the drain.
 	life, stopLife := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopLife()
+	s.mu.Lock()
+	s.life = life
+	s.mu.Unlock()
 	var bg sync.WaitGroup
 	start := func(f func()) {
 		bg.Add(1)
@@ -407,22 +423,18 @@ func (s *Supervisor) requestReconcile() {
 // discover runs one discovery pass and applies it: a new project starts, a
 // project positively gone (absent, public, without a valid marker) drains, a
 // project whose repository errored is left exactly as it is, and a failed
-// listing changes nothing.
+// listing changes nothing, unless it failed because the login is gone.
 func (s *Supervisor) discover(ctx, life context.Context) {
-	s.mu.Lock()
-	gen := s.tokenGen
-	s.mu.Unlock()
 	res, err := discovery.Discover(ctx, s.deps.GitHub, discovery.Options{OnlyRepo: s.cfg.OnlyRepo, MarkerRef: s.cfg.MarkerRef}, s.log)
 	if err != nil {
 		if ctx.Err() != nil {
 			return
 		}
-		s.log.Warn("discovery failed; keeping the current projects", "error", err.Error())
-		if isUnauthorized(err) {
-			if err := s.authFailure(gen); err != nil {
-				s.fail(err)
-			}
+		if t := loginRejected(err); t != nil {
+			s.fail(t)
+			return
 		}
+		s.log.Warn("discovery failed; keeping the current projects", "error", err.Error())
 		return
 	}
 	want := map[string]bool{}
@@ -456,6 +468,9 @@ func (s *Supervisor) discover(ctx, life context.Context) {
 }
 
 func (s *Supervisor) startLocked(life context.Context, p discovery.Project) {
+	if old := s.projects[p.Repo]; old != nil {
+		old.cancel() // a failed project; its goroutine has returned
+	}
 	pr := newProject(s, life, p)
 	s.projects[p.Repo] = pr
 	pr.log.Info("serving the project")
@@ -475,6 +490,16 @@ func (s *Supervisor) drainLocked(life context.Context, pr *project, deadline tim
 			s.mu.Unlock()
 		}
 	}, true)
+}
+
+// requestDrain drains a project from its own goroutine's request, such as a
+// repository found public before a session opens.
+func (s *Supervisor) requestDrain(pr *project) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.projects[pr.repo] == pr && s.life != nil {
+		s.drainLocked(s.life, pr, s.deps.Clock.Now().Add(s.cfg.Drain))
+	}
 }
 
 // goLocked runs f as a project goroutine if ok.
@@ -559,7 +584,9 @@ func (s *Supervisor) newClient(ctx context.Context, repo string) (ScaleSets, int
 	s.mu.Unlock()
 	tok, err := s.deps.Token.Token(ctx)
 	if err != nil {
-		return nil, gen, err
+		// The token is cached, so a read happens only after a refusal
+		// dropped it: gh no longer has a login.
+		return nil, gen, terminal("gh logged out: %v; run gh auth login", err)
 	}
 	c, err := s.deps.Clients(repo, tok)
 	if err != nil {

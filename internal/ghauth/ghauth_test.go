@@ -44,12 +44,12 @@ func TestFailuresAreNotCachedAndEmptyTokenIsRefused(t *testing.T) {
 		}
 		return []byte("  \n"), nil
 	})
-	if _, err := s.Token(context.Background()); err == nil {
-		t.Fatal("want an error when gh fails")
+	if _, err := s.Token(context.Background()); !errors.Is(err, ErrNoToken) {
+		t.Fatalf("want ErrNoToken when gh fails, got %v", err)
 	}
 	_, err := s.Token(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "empty") {
-		t.Fatalf("want an empty-token error, got %v", err)
+	if !errors.Is(err, ErrNoToken) || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("want an empty-token error matching ErrNoToken, got %v", err)
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("a failure must not be cached: run called %d times", calls.Load())

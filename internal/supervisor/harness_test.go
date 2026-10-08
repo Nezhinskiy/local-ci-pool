@@ -77,6 +77,11 @@ type fakeDocker struct {
 	subs       []chan events.Message
 	info       system.Info
 	infoErr    error
+	// createGate, when set, holds every ContainerCreate until it is closed;
+	// with createFirst the container is already listed while it waits.
+	createGate  chan struct{}
+	createFirst bool
+	listHook    func() // runs once, inside the next ContainerList
 }
 
 func newFakeDocker() *fakeDocker {
@@ -87,13 +92,24 @@ func newFakeDocker() *fakeDocker {
 }
 
 func (f *fakeDocker) ContainerCreate(_ context.Context, o client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	c := &fakeContainer{labels: o.Config.Labels, image: o.Config.Image, state: container.StateCreated}
 	if len(o.HostConfig.Mounts) == 1 {
 		c.mount = o.HostConfig.Mounts[0].Source
 	}
-	f.containers[o.Name] = c
+	f.mu.Lock()
+	gate, first := f.createGate, f.createFirst
+	if gate != nil && first {
+		f.containers[o.Name] = c
+	}
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if gate == nil || !first {
+		f.containers[o.Name] = c
+	}
 	return client.ContainerCreateResult{ID: o.Name}, nil
 }
 
@@ -136,6 +152,13 @@ func (f *fakeDocker) Events(context.Context, client.EventsListOptions) client.Ev
 }
 
 func (f *fakeDocker) ContainerList(_ context.Context, o client.ContainerListOptions) (client.ContainerListResult, error) {
+	f.mu.Lock()
+	hook := f.listHook
+	f.listHook = nil
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []container.Summary
@@ -208,6 +231,42 @@ func (f *fakeDocker) runners(image string) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// created lists the containers in the image in any state, sorted.
+func (f *fakeDocker) created(image string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for id, c := range f.containers {
+		if c.image == image {
+			out = append(out, id)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func (f *fakeDocker) gateCreates(first bool) (release func()) {
+	gate := make(chan struct{})
+	f.mu.Lock()
+	f.createGate, f.createFirst = gate, first
+	f.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			f.mu.Lock()
+			f.createGate = nil
+			f.mu.Unlock()
+			close(gate)
+		})
+	}
+}
+
+func (f *fakeDocker) onNextList(hook func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listHook = hook
 }
 
 func (f *fakeDocker) labelsOf(id string) map[string]string {
@@ -355,11 +414,17 @@ type fakeToken struct {
 	mu            sync.Mutex
 	gen           int
 	invalidations int
+	err           error // every read fails with it
+	// errAfter makes every read after an Invalidate fail with err.
+	errAfter bool
 }
 
 func (f *fakeToken) Token(context.Context) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.err != nil && (!f.errAfter || f.gen > 0) {
+		return "", f.err
+	}
 	return fmt.Sprintf("tok-%d", f.gen+1), nil
 }
 
@@ -437,13 +502,15 @@ type harness struct {
 	slots   int
 	logs    *syncBuffer
 
-	mu       sync.Mutex
-	images   map[string]string // identity -> image reference
-	checkErr map[string]error  // image reference -> preflight failure
-	checked  []string
-	detects  int
-	runnerV  []string // the runner versions Mount returns, in turn
-	mounts   int
+	mu        sync.Mutex
+	images    map[string]string // identity -> image reference
+	checkErr  map[string]error  // image reference -> preflight failure
+	checked   []string
+	detects   int
+	runnerV   []string // the runner versions Mount returns, in turn
+	mounts    int
+	mountErr  error
+	detectErr error
 
 	sup    *Supervisor
 	cancel context.CancelFunc
@@ -518,12 +585,19 @@ func (h *harness) deps() Deps {
 		Detect: func(context.Context) (machine.Machine, string, error) {
 			h.mu.Lock()
 			h.detects++
+			err := h.detectErr
 			h.mu.Unlock()
+			if err != nil {
+				return machine.Machine{}, "", err
+			}
 			return machine.Machine{Name: "examplemac", Owner: owner, Slots: h.slots, FP: testFP}, "arm64", nil
 		},
 		Mount: func(context.Context, string) (runnermount.Mount, error) {
 			h.mu.Lock()
 			defer h.mu.Unlock()
+			if h.mountErr != nil {
+				return runnermount.Mount{}, h.mountErr
+			}
 			v := "2.338.0"
 			if len(h.runnerV) > 0 {
 				v = h.runnerV[min(h.mounts, len(h.runnerV)-1)]

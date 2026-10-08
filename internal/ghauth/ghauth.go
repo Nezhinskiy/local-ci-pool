@@ -13,6 +13,10 @@ import (
 	"sync"
 )
 
+// ErrNoToken is wrapped by every error of Token: the token could not be read
+// (gh is not logged in, or not installed, or printed nothing).
+var ErrNoToken = errors.New("reading the GitHub token")
+
 // Source reads and caches the token.
 type Source struct {
 	run func(ctx context.Context) ([]byte, error)
@@ -55,12 +59,12 @@ func (s *Source) Token(ctx context.Context) (string, error) {
 	}
 	out, err := s.run(ctx)
 	if err != nil {
-		return "", fmt.Errorf("reading the GitHub token: %w", err)
+		return "", fmt.Errorf("%w: %w", ErrNoToken, err)
 	}
 	first, _, _ := strings.Cut(string(out), "\n")
 	tok := strings.TrimSpace(first)
 	if tok == "" {
-		return "", errors.New("reading the GitHub token: the token is empty (is `gh` logged in?)")
+		return "", fmt.Errorf("%w: the token is empty (is `gh` logged in?)", ErrNoToken)
 	}
 	s.tok = tok
 	return tok, nil

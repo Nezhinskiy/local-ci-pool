@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"slices"
 	"strings"
@@ -10,6 +11,9 @@ import (
 
 	"github.com/moby/moby/api/types/system"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/ghauth"
+	"github.com/Nezhinskiy/local-ci-pool/internal/github"
+	"github.com/Nezhinskiy/local-ci-pool/internal/machine"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runner"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runnermount"
 )
@@ -17,10 +21,11 @@ import (
 // Two slots, both held by alpha; beta wants one and gets none. When an alpha
 // container exits, beta's runner starts on its listener's next nil-message
 // call, with no other trigger. No JobCompleted is ever delivered, so the
-// release can only come from the exit; the clock runs slowly enough that the
-// watchdog's reconcile cannot stand in for the exit event within the wait.
+// release can only come from the exit; the clock runs at wall speed, so the
+// watchdog's reconcile (first tick at 30 s) cannot stand in for the exit
+// event within the 10 s wait.
 func TestBlockedProjectStartsAfterOtherFinishes(t *testing.T) {
-	h := newHarness(t, 2, 20, "alpha", "beta")
+	h := newHarness(t, 2, 1, "alpha", "beta") // real time: the watchdog's first tick is 30 s away
 	h.start()
 	h.eventually("both projects healthy", func() bool { return h.healthy(alphaRepo) && h.healthy(betaRepo) })
 
@@ -46,7 +51,7 @@ func TestBlockedProjectStartsAfterOtherFinishes(t *testing.T) {
 	h.delivered(alphaSet)
 	exited := time.Now()
 	h.docker.exit(alpha[0])
-	deadline := exited.Add(time.Second) // the watchdog ticks every 1.5 s here
+	deadline := exited.Add(10 * time.Second)
 	for len(h.docker.runners(betaImg)) == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("beta did not start after an alpha container exited")
@@ -275,9 +280,15 @@ func TestFailedProjectDoesNotStopOthers(t *testing.T) {
 	if !h.actions.SessionOpen(betaSet) {
 		t.Fatal("beta has no session")
 	}
+	h.sup.mu.Lock()
+	failed := h.sup.projects[alphaRepo]
+	h.sup.mu.Unlock()
 	// The next discovery pass tries alpha again.
 	h.setCheckErr(h.imageOf("alpha"), nil)
 	h.eventually("alpha healthy after the image is fixed", func() bool { return h.healthy(alphaRepo) })
+	if failed.ctx.Err() == nil {
+		t.Fatal("the replaced failed project's context was never cancelled")
+	}
 }
 
 func TestListenerDeathRestartsAndMarksUnhealthy(t *testing.T) {
@@ -347,7 +358,7 @@ func TestDockerResourceChangeExits(t *testing.T) {
 	h.start()
 	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
 	h.docker.setInfo(func(i *system.Info) { i.MemTotal = 12 << 30 }, nil)
-	err := h.wait(2 * 300 * time.Millisecond)
+	err := h.wait(10 * time.Second)
 	if err == nil || errors.Is(err, ErrTerminal) || !strings.Contains(err.Error(), "docker changed") {
 		t.Fatalf("Run = %v, want a non-terminal Docker-changed error", err)
 	}
@@ -543,5 +554,225 @@ func TestNewRunnerReleaseUsedByNextStarts(t *testing.T) {
 	h.eventually("a runner", func() bool { return len(h.docker.runners(img)) == 1 })
 	if got := h.docker.mountOf(h.docker.runners(img)[0]); got != runnermount.Ref("2.339.0") {
 		t.Fatalf("runner mount %q, want the new release", got)
+	}
+}
+
+// ---- fix round 1 ----
+
+// The runner mount is the first GitHub call: a 401 there has already been
+// retried with a token read again by the GitHub client, so it is terminal.
+func TestStartupWithRejectedTokenIsTerminal(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.mountErr = fmt.Errorf("finding the latest runner release: %w", &github.StatusError{Method: "GET", Path: "/repos/actions/runner/releases/latest", Status: 401})
+	h.start()
+	err := h.wait(defaultWait)
+	if !errors.Is(err, ErrTerminal) || !strings.Contains(err.Error(), "gh login rejected") {
+		t.Fatalf("Run = %v, want terminal gh login rejected", err)
+	}
+}
+
+func TestStartupWithoutTokenIsTerminal(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.tok.err = fmt.Errorf("%w: gh auth token exited with status 1", ghauth.ErrNoToken)
+	h.start()
+	err := h.wait(defaultWait)
+	if !errors.Is(err, ErrTerminal) || !strings.Contains(err.Error(), "gh logged out") {
+		t.Fatalf("Run = %v, want terminal gh logged out", err)
+	}
+	if h.detects != 0 {
+		t.Fatal("Docker was probed before the login was checked")
+	}
+}
+
+func TestDiscoveryUnauthorizedIsTerminal(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.gh.edit(func() {
+		h.gh.listErr = fmt.Errorf("listing: %w", &github.StatusError{Method: "GET", Path: "/user/repos", Status: 401})
+	})
+	err := h.wait(defaultWait)
+	if !errors.Is(err, ErrTerminal) || !strings.Contains(err.Error(), "gh login rejected") {
+		t.Fatalf("Run = %v, want terminal gh login rejected", err)
+	}
+}
+
+// A refusal drops the cached token; a token that then cannot be read means gh
+// was logged out.
+func TestTokenLostAfterRefusalIsTerminal(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.actions.RejectTokens()
+	h.tok.err, h.tok.errAfter = fmt.Errorf("%w: gh auth token exited with status 1", ghauth.ErrNoToken), true
+	h.start()
+	err := h.wait(defaultWait)
+	if !errors.Is(err, ErrTerminal) || !strings.Contains(err.Error(), "gh logged out") {
+		t.Fatalf("Run = %v, want terminal gh logged out", err)
+	}
+}
+
+func TestBadHealthAddressIsTerminal(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.cfg.HealthAddr = "127.0.0.1:99999"
+	h.start()
+	if err := h.wait(defaultWait); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("Run = %v, want terminal", err)
+	}
+}
+
+func TestInvalidHostNameIsTerminal(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.detectErr = fmt.Errorf("deriving the machine name: %w: %q", machine.ErrHostName, "---")
+	h.start()
+	if err := h.wait(defaultWait); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("Run = %v, want terminal", err)
+	}
+}
+
+// A drain that lands while a dead listener's session is closed (the restart
+// waits out its 5 s backoff) still deletes the scale set this process held:
+// it opens a session once more to prove the set is its own. The clock runs at
+// wall speed so the backoff outlasts the drain.
+func TestDrainDuringListenerRestartStillDeletes(t *testing.T) {
+	h := newHarness(t, 2, 1, "alpha")
+	h.cfg.DiscoverEvery = 50 * time.Millisecond
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.actions.FailNextGets(1)
+	h.eventually("the dead listener's session closed", func() bool { return h.actions.Count("DELETE session "+alphaSet) == 1 })
+	h.gh.edit(func() { h.gh.repos[alphaRepo].marker = "" })
+	h.eventually("the scale set deleted", func() bool { return h.actions.ScaleSet(alphaSet) == nil })
+	if n := h.actions.Count("POST session " + alphaSet); n != 2 {
+		t.Fatalf("%d session creates, want 2: the first, and the drain's", n)
+	}
+}
+
+// Once a session create was refused, a drain with no open session leaves the
+// scale set, even when a session could be opened again by then: someone else
+// held it. The clock runs at wall speed: the restart backs off 5 s, is refused
+// once, then waits 3 s, and the drain lands in that wait.
+func TestDrainAfterARefusedSessionLeavesTheScaleSet(t *testing.T) {
+	h := newHarness(t, 2, 1, "alpha")
+	h.cfg.DiscoverEvery = 50 * time.Millisecond
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.actions.SessionConflicts(1)
+	h.actions.FailNextGets(1)
+	deadline := time.Now().Add(10 * time.Second)
+	for h.actions.Count("POST session "+alphaSet) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("no refused reopen")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	h.gh.edit(func() { h.gh.repos[alphaRepo].marker = "" })
+	h.eventually("the drain ended", func() bool { return h.logged("no session held; leaving the scale set") })
+	if h.actions.ScaleSet(alphaSet) == nil || h.actions.Count("DELETE scaleset "+alphaSet) != 0 {
+		t.Fatal("deleted a scale set whose session was refused")
+	}
+}
+
+// Visibility is re-checked before every session open: a repository that
+// turned public is drained instead of served again.
+func TestNowPublicRepoDrainsBeforeReopening(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.cfg.DiscoverEvery = 24 * time.Hour // no discovery pass sees it
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.gh.edit(func() { h.gh.repos[alphaRepo].private = false })
+	h.actions.FailNextGets(1)
+	h.eventually("the scale set deleted", func() bool { return h.actions.ScaleSet(alphaSet) == nil })
+	if !h.logged("no longer private") {
+		t.Fatal("the reason is not logged")
+	}
+	h.eventually("the project removed", func() bool { _, ok := h.health(alphaRepo); return !ok })
+}
+
+// A scale set deleted under the pool is got-or-created again, and the scaler
+// mints for the new one.
+func TestDeletedScaleSetIsRecreated(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	old := h.actions.ScaleSet(alphaSet).ID
+	h.actions.RemoveScaleSet(alphaSet)
+	h.eventually("a new scale set", func() bool { ss := h.actions.ScaleSet(alphaSet); return ss != nil && ss.ID != old })
+	h.eventually("alpha healthy again", func() bool { return h.healthy(alphaRepo) && h.actions.SessionOpen(alphaSet) })
+	h.actions.Assign(alphaSet, 1)
+	img := h.imageOf("alpha")
+	h.eventually("a runner on the new scale set", func() bool { return len(h.docker.runners(img)) == 1 })
+}
+
+// The reconcile spares a runner whose container is still being created: one
+// held as Starting before the listing, and one reserved during the listing.
+func TestReconcileSparesStartingRunners(t *testing.T) {
+	t.Run("starting before the listing", func(t *testing.T) {
+		h := newHarness(t, 2, 1000, "alpha")
+		h.start()
+		h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+		release := h.docker.gateCreates(false)
+		defer release()
+		h.actions.Assign(alphaSet, 1)
+		h.eventually("the JIT minted", func() bool { return h.actions.Count("JIT "+alphaSet) == 1 })
+		time.Sleep(200 * time.Millisecond) // about six reconciles
+		if n := h.sup.Snapshot().InUse; n != 1 {
+			t.Fatalf("in use %d while the runner's container is being created, want 1", n)
+		}
+		release()
+		img := h.imageOf("alpha")
+		h.eventually("the runner runs", func() bool { return len(h.docker.runners(img)) == 1 })
+		time.Sleep(100 * time.Millisecond)
+		if n := h.sup.Snapshot().InUse; n != 1 || len(h.docker.runners(img)) != 1 {
+			t.Fatalf("in use %d, running %v; want the started runner kept", n, h.docker.runners(img))
+		}
+	})
+	t.Run("reserved during the listing", func(t *testing.T) {
+		h := newHarness(t, 2, 1000, "alpha")
+		h.start()
+		h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+		img := h.imageOf("alpha")
+		release := h.docker.gateCreates(true)
+		defer release()
+		hooked := make(chan struct{})
+		h.docker.onNextList(func() {
+			defer close(hooked)
+			h.actions.Assign(alphaSet, 1)
+			deadline := time.Now().Add(defaultWait)
+			for len(h.docker.created(img)) == 0 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+		})
+		<-hooked
+		time.Sleep(100 * time.Millisecond)
+		created := h.docker.created(img)
+		if len(created) != 1 {
+			t.Fatalf("containers %v; want the one being created kept", created)
+		}
+		release()
+		h.eventually("the runner runs", func() bool { return len(h.docker.runners(img)) == 1 })
+	})
+}
+
+// At the drain bound the runners still held are removed and, best effort,
+// unregistered.
+func TestDrainBoundRemovesAndUnregistersLeftRunners(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.cfg.Drain = time.Minute
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.actions.Assign(alphaSet, 1)
+	img := h.imageOf("alpha")
+	h.eventually("a runner", func() bool { return len(h.docker.runners(img)) == 1 })
+	r := h.docker.runners(img)[0]
+	h.actions.Started(alphaSet, r)
+	h.delivered(alphaSet)
+	h.cancel()
+	if err := h.wait(defaultWait); err != nil {
+		t.Fatal(err)
+	}
+	if h.docker.has(r) {
+		t.Fatal("the runner left at the bound still has its container")
+	}
+	if h.actions.Count("DELETE runner "+r) == 0 {
+		t.Fatal("the runner left at the bound was not unregistered")
 	}
 }

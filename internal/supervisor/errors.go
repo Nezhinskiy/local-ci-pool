@@ -7,6 +7,7 @@ import (
 
 	"github.com/actions/scaleset"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/ghauth"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
 )
 
@@ -27,6 +28,21 @@ func terminal(format string, args ...any) error {
 	return &terminalError{msg: fmt.Sprintf(format, args...)}
 }
 
+// loginRejected returns the terminal error for a GitHub REST failure that
+// means the login is gone, or nil. The GitHub client has already dropped the
+// cached token and read it again once before it returns ErrUnauthorized, so
+// that error is the second refusal; and a token that cannot be read means gh
+// is logged out. Neither fixes itself, so launchd must not respawn into it.
+func loginRejected(err error) error {
+	switch {
+	case errors.Is(err, ghauth.ErrNoToken):
+		return terminal("gh logged out: %v; run gh auth login", err)
+	case errors.Is(err, github.ErrUnauthorized):
+		return terminal("gh login rejected: GitHub refused the token after reading it again; run gh auth login")
+	}
+	return nil
+}
+
 // isUnauthorized reports whether err is an authentication failure: the GitHub
 // client's ErrUnauthorized, or a scale set API error whose response was a 401.
 // actions/scaleset v0.4.0 has no typed status error; it writes the status into
@@ -41,6 +57,13 @@ func isUnauthorized(err error) bool {
 		return true
 	}
 	return strings.Contains(err.Error(), `status="401 `)
+}
+
+// isNotFound reports whether a scale set API call answered 404: the scale set
+// was deleted under the pool. The status is matched in the message for the
+// same reason as in isUnauthorized.
+func isNotFound(err error) bool {
+	return err != nil && strings.Contains(err.Error(), `status="404 `)
 }
 
 // isSessionConflict reports whether a session create was refused because the

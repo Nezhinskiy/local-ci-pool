@@ -20,6 +20,10 @@ const (
 	maxSlots   = 8
 )
 
+// ErrHostName is wrapped when the host name cannot give a machine name; it is a
+// configuration error that waiting does not fix.
+var ErrHostName = errors.New("the host name has no letters or digits")
+
 // Fingerprint identifies the Docker VM. The pool compares it with its start
 // value on every watchdog ping and exits when it changes.
 type Fingerprint struct {
@@ -49,7 +53,7 @@ func Name(localHostName string) (string, error) {
 		}
 	}
 	if b.Len() == 0 {
-		return "", fmt.Errorf("the host name %q has no letters or digits", localHostName)
+		return "", fmt.Errorf("%w: %q", ErrHostName, localHostName)
 	}
 	return b.String(), nil
 }

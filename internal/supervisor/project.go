@@ -12,6 +12,7 @@ import (
 	"github.com/actions/scaleset/listener"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
+	"github.com/Nezhinskiy/local-ci-pool/internal/github"
 	"github.com/Nezhinskiy/local-ci-pool/internal/machine"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runner"
 )
@@ -47,7 +48,15 @@ type project struct {
 	// process holds a session on is ever deleted: the service deletes a
 	// scale set even while another process holds its session.
 	session Session
+	// opened: this process opened a session on the scale set at least once;
+	// refused: a session create was answered 409 at least once. A drain that
+	// finds no open session reopens one to delete the scale set only when
+	// opened and never refused.
+	opened, refused bool
 }
+
+// errLeft stops a project's run when it asked for its own drain.
+var errLeft = errors.New("the repository is no longer served")
 
 func newProject(s *Supervisor, life context.Context, p discovery.Project) *project {
 	prefix := ""
@@ -95,6 +104,10 @@ func (pr *project) run() {
 	for pr.ctx.Err() == nil {
 		began := pr.s.deps.Clock.Now()
 		err := pr.serveOnce()
+		if errors.Is(err, errLeft) {
+			<-pr.ctx.Done() // the drain cancels it
+			return
+		}
 		if pr.ctx.Err() != nil {
 			return
 		}
@@ -232,12 +245,13 @@ func (pr *project) openSession() (Session, error) {
 	clock := pr.s.deps.Clock
 	began := clock.Now()
 	wait := conflictFirstWait
+	recreated := false
 	for {
 		c, gen := pr.currentClient()
-		sess, err := c.OpenSession(pr.ctx, pr.scaleSetID, pr.s.machine.Owner)
+		sess, err := c.OpenSession(pr.ctx, pr.currentID(), pr.s.machine.Owner)
 		if err == nil {
 			pr.mu.Lock()
-			pr.session = sess
+			pr.session, pr.opened = sess, true
 			pr.mu.Unlock()
 			return sess, nil
 		}
@@ -249,7 +263,24 @@ func (pr *project) openSession() (Session, error) {
 			if err := pr.reauth(gen); err != nil {
 				return nil, err
 			}
+		case isNotFound(err) && !recreated:
+			// The scale set was deleted under the pool: get or create it
+			// again, and point the scaler at it.
+			recreated = true
+			pr.log.Warn("the scale set is gone; getting or creating it again")
+			id, err := pr.ensureScaleSet()
+			if err != nil {
+				return nil, err
+			}
+			pr.mu.Lock()
+			pr.scaleSetID, pr.opened, pr.refused = id, false, false
+			sc := pr.scaler
+			pr.mu.Unlock()
+			sc.SetScaleSetID(id)
 		case isSessionConflict(err):
+			pr.mu.Lock()
+			pr.refused = true
+			pr.mu.Unlock()
 			waited := clock.Now().Sub(began)
 			if waited >= conflictWindow {
 				return nil, terminal("scale set %s has an active session elsewhere: another pool, or a Mac with the same name", pr.name)
@@ -267,6 +298,9 @@ func (pr *project) openSession() (Session, error) {
 
 // serveOnce opens a session and runs a listener on it until it returns.
 func (pr *project) serveOnce() error {
+	if err := pr.recheck(); err != nil {
+		return err
+	}
 	sess, err := pr.openSession()
 	if err != nil {
 		return fmt.Errorf("opening the session: %w", err)
@@ -291,6 +325,32 @@ func (pr *project) serveOnce() error {
 	pr.listener = nil
 	pr.mu.Unlock()
 	return fmt.Errorf("the listener stopped: %w", err)
+}
+
+// recheck asks GitHub again, before a session opens, whether the repository
+// is still there and private. One that is not is drained; the run returns
+// errLeft.
+func (pr *project) recheck() error {
+	r, err := pr.s.deps.GitHub.Repo(pr.ctx, pr.repo)
+	switch {
+	case errors.Is(err, github.ErrNotFound), err == nil && !r.Private:
+		pr.log.Warn("the repository is gone or no longer private; draining")
+		pr.setDown("the repository is gone or no longer private")
+		pr.s.requestDrain(pr)
+		return errLeft
+	case err != nil:
+		if t := loginRejected(err); t != nil {
+			return t
+		}
+		return fmt.Errorf("re-checking the repository's visibility: %w", err)
+	}
+	return nil
+}
+
+func (pr *project) currentID() int {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	return pr.scaleSetID
 }
 
 // start is the scaler's Start: one runner container in the current image with
@@ -396,11 +456,41 @@ func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	pr.cancel()
 	<-pr.done
 	pr.removeLeft()
-	if !pr.closeSession() {
+	held := pr.closeSession()
+	if !held && pr.mayReopen() {
+		held = pr.reopenToDelete()
+	}
+	if !held {
 		pr.log.Info("no session held; leaving the scale set")
 		return true
 	}
 	pr.deleteScaleSet(life, deadline)
+	return true
+}
+
+// mayReopen reports whether this process opened a session on the scale set
+// and was never refused one: then a session closed by a listener restart can
+// be opened again to prove the scale set is still this process's to delete.
+func (pr *project) mayReopen() bool {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	return pr.opened && !pr.refused && pr.client != nil
+}
+
+// reopenToDelete opens and closes one session, once, and reports whether it
+// opened: only then may the scale set be deleted.
+func (pr *project) reopenToDelete() bool {
+	c, _ := pr.currentClient()
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	sess, err := c.OpenSession(ctx, pr.currentID(), pr.s.machine.Owner)
+	if err != nil {
+		pr.log.Info("could not open a session to delete the scale set; leaving it", "error", err.Error())
+		return false
+	}
+	if err := sess.Close(ctx); err != nil {
+		pr.log.Warn("closing the session", "error", err.Error())
+	}
 	return true
 }
 
@@ -416,9 +506,26 @@ func (pr *project) removeLeft() {
 		if err := runner.RemoveContainer(ctx, pr.s.deps.Docker, r.Name); err != nil {
 			pr.log.Warn("removing a runner left after the drain", "runner", r.Name, "error", err.Error())
 		}
+		// Best effort: GitHub refuses it while it still counts the job as
+		// running, and the scale set delete then leaves the set for the
+		// next start.
+		if err := pr.unregister(ctx, r.Name); err != nil {
+			pr.log.Info("unregistering a runner left after the drain", "runner", r.Name, "error", err.Error())
+		}
 		cancel()
 		sc.Exited(r.Name)
 	}
+}
+
+func (pr *project) unregister(ctx context.Context, name string) error {
+	if c, _ := pr.currentClient(); c == nil {
+		return nil
+	}
+	ref, err := clientRef{pr}.GetRunnerByName(ctx, name)
+	if err != nil || ref == nil {
+		return err
+	}
+	return clientRef{pr}.RemoveRunner(ctx, int64(ref.ID))
 }
 
 func (pr *project) deleteScaleSet(life context.Context, deadline time.Time) {
@@ -426,7 +533,7 @@ func (pr *project) deleteScaleSet(life context.Context, deadline time.Time) {
 	for {
 		c, _ := pr.currentClient()
 		ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
-		err := c.DeleteRunnerScaleSet(ctx, pr.scaleSetID)
+		err := c.DeleteRunnerScaleSet(ctx, pr.currentID())
 		cancel()
 		if err == nil {
 			pr.log.Info("scale set deleted")

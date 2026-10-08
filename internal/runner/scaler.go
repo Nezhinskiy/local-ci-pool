@@ -222,7 +222,10 @@ var errDrained = errors.New("the scaler is draining")
 // startRunner reports whether the JIT configuration was minted, which
 // registers the runner on GitHub, and any error.
 func (s *Scaler) startRunner(ctx context.Context, name string) (minted bool, err error) {
-	cfg, err := s.jit.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, s.scaleSetID)
+	s.mu.Lock()
+	id := s.scaleSetID
+	s.mu.Unlock()
+	cfg, err := s.jit.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, id)
 	if err != nil {
 		return false, fmt.Errorf("minting the JIT configuration: %w", err)
 	}
@@ -406,6 +409,15 @@ func (s *Scaler) Drain() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.draining = true
+}
+
+// SetScaleSetID points the scaler at a scale set recreated under a new ID;
+// later starts mint their JIT configuration for it. Held runners keep their
+// slots.
+func (s *Scaler) SetScaleSetID(id int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scaleSetID = id
 }
 
 // Idle is the number of runners started, or starting, that have not reported

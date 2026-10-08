@@ -387,3 +387,13 @@ func TestHeldListsEveryRunnerHoldingASlot(t *testing.T) {
 		t.Fatalf("Held after both exits = %+v, want none", got)
 	}
 }
+
+func TestSetScaleSetIDRetargetsLaterStarts(t *testing.T) {
+	h := newHarness(NewSlots(3))
+	desired(t, h.scaler, 1)
+	h.scaler.SetScaleSetID(9)
+	desired(t, h.scaler, 2)
+	if !slices.Equal(h.jit.ids, []int{7, 9}) {
+		t.Fatalf("JIT minted for scale sets %v, want 7 then 9", h.jit.ids)
+	}
+}

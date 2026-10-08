@@ -63,7 +63,7 @@ func TestName(t *testing.T) {
 		}
 	}
 	for _, in := range []string{"!!!", "", "---", "\n"} {
-		if got, err := Name(in); err == nil {
+		if got, err := Name(in); !errors.Is(err, ErrHostName) {
 			t.Errorf("Name(%q) = %q, want an error", in, got)
 		}
 	}

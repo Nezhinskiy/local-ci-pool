@@ -156,6 +156,10 @@ func (s *Supervisor) releases(ctx context.Context, arch string) {
 		case <-s.deps.Clock.After(releaseEvery):
 		}
 		m, err := s.deps.Mount(ctx, arch)
+		if t := loginRejected(err); t != nil {
+			s.fail(t)
+			return
+		}
 		if err != nil {
 			if ctx.Err() == nil {
 				s.log.Warn("checking for a new runner release", "error", err.Error())
