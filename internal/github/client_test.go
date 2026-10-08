@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 const testToken = "ghp_TESTTOKENVALUE"
@@ -394,5 +395,57 @@ func TestDownloadSendsNoToken(t *testing.T) {
 	b, _ := io.ReadAll(rc)
 	if string(b) != "tarball-bytes" {
 		t.Fatalf("body = %q", b)
+	}
+}
+
+func TestDownloadStallIsCut(t *testing.T) {
+	release := make(chan struct{})
+	c, _, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "first-bytes")
+		w.(http.Flusher).Flush()
+		select { // then the server goes silent
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	t.Cleanup(func() { close(release) })
+	c.downloadIdle = 150 * time.Millisecond
+	rc, err := c.Download(context.Background(), c.base+"/asset.tgz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Close() }()
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.ReadAll(rc)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "stalled") {
+			t.Fatalf("want a stall error, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a stalled download held the reader for 10 s")
+	}
+}
+
+func TestDownloadSlowButSteadyIsNotCut(t *testing.T) {
+	c, _, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		for i := 0; i < 6; i++ {
+			_, _ = io.WriteString(w, "chunk")
+			w.(http.Flusher).Flush()
+			time.Sleep(60 * time.Millisecond)
+		}
+	})
+	c.downloadIdle = 250 * time.Millisecond // shorter than the whole body, longer than a gap
+	rc, err := c.Download(context.Background(), c.base+"/asset.tgz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Close() }()
+	b, err := io.ReadAll(rc)
+	if err != nil || len(b) != 30 {
+		t.Fatalf("read %d bytes, %v", len(b), err)
 	}
 }

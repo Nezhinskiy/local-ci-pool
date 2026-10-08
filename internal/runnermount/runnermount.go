@@ -17,6 +17,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
@@ -38,6 +39,10 @@ const (
 	dockerfileBody     = "FROM scratch\nCOPY . /\n"
 	dockerignoreBody   = dockerfileName + "\n.dockerignore\n"
 )
+
+// downloadTimeout bounds the whole tarball download (about 190 MB); a variable so
+// tests can shorten it.
+var downloadTimeout = 20 * time.Minute
 
 // Docker is the part of the Docker API this package uses. *client.Client
 // satisfies it.
@@ -123,6 +128,10 @@ func current(ctx context.Context, d Docker, ref, runnerSHA, entrypoint string) b
 // fetch downloads the tarball to a temporary file and returns its path and
 // SHA-256. The caller removes the file.
 func fetch(ctx context.Context, gh ReleaseSource, url string) (string, string, error) {
+	// The release client cuts a download that goes silent; this bounds one that
+	// keeps trickling.
+	ctx, cancel := context.WithTimeout(ctx, downloadTimeout)
+	defer cancel()
 	rc, err := gh.Download(ctx, url)
 	if err != nil {
 		return "", "", fmt.Errorf("downloading the runner tarball: %w", err)
@@ -276,8 +285,16 @@ func cleanName(name string) (string, error) {
 
 // Prune removes the local-ci/runner images other than keep that no container
 // uses. keep is a version ("2.338.0") or a full reference. Images of other
-// repositories, and untagged ones, are never touched. A failure on one image
-// does not stop the others; the errors are joined.
+// repositories are never touched. A failure on one image does not stop the
+// others; the errors are joined.
+//
+// Rebuilding a version (a new entrypoint, say) moves its tag to the new image
+// and leaves the old one untagged but still carrying the pool's labels, so those
+// are removed too. An image mount names the tag it was created with, not the
+// image, so once the tag has moved no container can be tied to an untagged image
+// by name; and Docker removes a mounted image by ID without complaint. The
+// untagged ones are therefore removed only when no container mounts any
+// local-ci/runner image at all.
 func Prune(ctx context.Context, d Docker, keep string) error {
 	keepRef := keep
 	if !strings.Contains(keep, ":") {
@@ -304,7 +321,27 @@ func Prune(ctx context.Context, d Docker, keep string) error {
 			}
 		}
 	}
+	runnerMounted := false
+	for _, c := range containers {
+		for _, m := range c.Mounts {
+			if m.Type == mount.TypeImage && strings.HasPrefix(m.Name, Repository+":") {
+				runnerMounted = true
+			}
+		}
+	}
 	var errs []error
+	untagged, err := d.ImageList(ctx, client.ImageListOptions{Filters: make(client.Filters).Add("dangling", "true").Add("label", labelRunnerSHA)})
+	if err != nil {
+		return fmt.Errorf("listing untagged runner images: %w", err)
+	}
+	for _, img := range untagged.Items {
+		if len(img.RepoTags) > 0 || img.Labels[labelRunnerSHA] == "" || inUse[img.ID] || runnerMounted {
+			continue
+		}
+		if _, err := d.ImageRemove(ctx, img.ID, client.ImageRemoveOptions{}); err != nil {
+			errs = append(errs, fmt.Errorf("removing untagged %s: %w", img.ID, err))
+		}
+	}
 	for _, img := range images {
 		for _, tag := range img.RepoTags {
 			if !strings.HasPrefix(tag, Repository+":") || tag == keepRef {

@@ -90,12 +90,14 @@ func ParseMarker(b []byte) (Marker, error) {
 
 // CleanRepoPath accepts a relative path inside the repository and returns it
 // cleaned. Absolute paths, ".." segments, empty paths, pathspec magic (":")
-// and option-like names ("-") are refused: the value ends up in git arguments.
+// and option-like names ("-") are refused, and so are the glob characters * ?
+// and [, because git would read them as wildcards in a pathspec: the value ends
+// up in git arguments.
 func CleanRepoPath(p string) (string, error) {
 	if p == "" {
 		return "", errors.New("path is empty")
 	}
-	if strings.ContainsAny(p, "\x00\\") || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "-") || strings.HasPrefix(p, ":") {
+	if strings.ContainsAny(p, "\x00\\*?[") || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "-") || strings.HasPrefix(p, ":") {
 		return "", errors.New("must be a plain relative path")
 	}
 	for _, seg := range strings.Split(p, "/") {
@@ -141,10 +143,10 @@ type Options struct {
 }
 
 // Discover lists the private repositories the account owns and returns the
-// ones with a valid marker. Every skip is logged with its reason. If the
-// listing, or any call that is not a plain "not found", fails, Discover returns
-// nil and the error, so the caller keeps its current set instead of dropping
-// projects on a transient failure.
+// ones with a valid marker. Every skip is logged with its reason, and a failure
+// on one repository (a 403 on its marker, a failed re-check) skips only that
+// repository. If the listing itself fails, Discover returns nil and the error,
+// so the caller keeps its current set.
 func Discover(ctx context.Context, src Source, opt Options, log *slog.Logger) ([]Project, error) {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -174,7 +176,9 @@ func Discover(ctx context.Context, src Source, opt Options, log *slog.Logger) ([
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("re-checking %s: %w", r.FullName, err)
+			// One repository's failure never costs the others their place.
+			log.Warn("skipping repository: the visibility re-check failed", "repo", r.FullName, "reason", err.Error())
+			continue
 		}
 		if !cur.Private {
 			log.Info("skipping repository: no longer private", "repo", r.FullName)
@@ -194,7 +198,8 @@ func Discover(ctx context.Context, src Source, opt Options, log *slog.Logger) ([
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("reading the marker of %s: %w", r.FullName, err)
+			log.Warn("skipping repository: the marker could not be read", "repo", r.FullName, "ref", ref, "reason", err.Error())
+			continue
 		}
 		marker, err := ParseMarker(raw)
 		if err != nil {

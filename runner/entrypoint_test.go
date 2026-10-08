@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -14,19 +15,47 @@ import (
 
 const jitSecret = "JITSECRET-0123456789abcdef"
 
-// stubRun is the fake run.sh: it records its argument vector and its
-// environment, installs a TERM trap, reports that it is ready, and waits.
-const stubRun = `#!/bin/sh
+// stubRun is the fake run.sh. It records its argument vector and environment,
+// then follows the two paths of the real run.sh (v2.338.0), keyed on
+// RUNNER_MANUALLY_TRAP_SIG:
+//   - unset: run() runs the helper in the foreground with no trap and then
+//     exits 0 whatever the listener returned;
+//   - set: runWithManualTrap() uses job control, sends INT to the helper's
+//     process group on INT or TERM, and exits with the status of its wait.
+//
+// The "helper" is the nested listener below, which records the signal it gets.
+const stubRun = `#!/bin/bash
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 printf '%s\n' "$@" > "$OUT/argv"
 env > "$OUT/env"
-if ! touch "${0%/*}/_diag"; then echo unwritable > "$OUT/root_not_writable"; fi
+if ! touch "$DIR/_diag"; then echo unwritable > "$OUT/root_not_writable"; fi
 if [ -n "${STUB_EXIT_NOW:-}" ]; then exit "$STUB_EXIT_NOW"; fi
-trap 'echo TERM > "$OUT/signal"; exit 7' TERM
-: > "$OUT/ready"
-while :; do sleep 0.05; done
+if [ -z "${RUNNER_MANUALLY_TRAP_SIG:-}" ]; then
+	"$DIR/bin/Runner.Listener" run "$@"
+	exit 0
+fi
+set -m
+trap 'kill -INT -$PID' INT TERM
+"$DIR/bin/Runner.Listener" run "$@" &
+PID=$!
+wait $PID
+returnCode=$?
+trap - INT TERM
+wait $PID
+exit $returnCode
 `
 
-const stubListener = `#!/bin/sh
+// stubListener is the fake Runner.Listener: "run" waits for a signal and records
+// it; anything else (the preflight's --version) prints a version.
+const stubListener = `#!/bin/bash
+if [ "${1:-}" = run ]; then
+	echo $$ > "$OUT/listener.pid"
+	trap 'echo INT > "$OUT/listener.signal"; exit 9' INT
+	trap 'echo TERM > "$OUT/listener.signal"; exit 9' TERM
+	if [ -n "${STUB_LISTENER_EXIT:-}" ]; then exit "$STUB_LISTENER_EXIT"; fi
+	: > "$OUT/ready"
+	while :; do sleep 0.05; done
+fi
 echo "2.338.0"
 `
 
@@ -51,6 +80,15 @@ func newRig(t *testing.T) *rig {
 	r.write(filepath.Join(r.mount, "run.sh"), stubRun, 0o755)
 	r.write(filepath.Join(r.mount, "bin", "Runner.Listener"), stubListener, 0o755)
 	r.ldconfig(false)
+	// A broken entrypoint must not leave the stub listener running.
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(filepath.Join(r.out, "listener.pid")); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+				_ = syscall.Kill(-pid, syscall.SIGKILL)
+			}
+		}
+	})
 	return r
 }
 
@@ -83,6 +121,7 @@ func (r *rig) cmd(stdin string, args ...string) *exec.Cmd {
 	cmd.Env = []string{
 		"PATH=" + r.bin + ":/usr/bin:/bin",
 		"HOME=" + r.dir,
+		"LOCAL_CI_TEST_HOOKS=1",
 		"LOCAL_CI_MOUNT=" + r.mount,
 		"LOCAL_CI_ROOT=" + r.root,
 		"OUT=" + r.out,
@@ -149,15 +188,21 @@ func TestEntrypointForwardsTermAndNeverExports(t *testing.T) {
 	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
-		if code := exitCode(t, err); code != 7 {
-			t.Fatalf("entrypoint exited with %d, want the stub's 7; stderr: %s", code, stderr.String())
+		// run.sh exits with the status of its interrupted wait: 128 + TERM.
+		if code := exitCode(t, err); code != 143 {
+			t.Fatalf("entrypoint exited with %d, want run.sh's 143; stderr: %s", code, stderr.String())
 		}
 	case <-time.After(10 * time.Second):
 		_ = cmd.Process.Kill()
 		t.Fatal("the entrypoint did not exit after TERM")
 	}
-	if got := strings.TrimSpace(r.read("signal")); got != "TERM" {
-		t.Errorf("the stub's signal record = %q, want TERM", got)
+	// The listener (not run.sh) must get the signal: run.sh forwards it as INT
+	// to the helper's group, which only happens with RUNNER_MANUALLY_TRAP_SIG.
+	if got := strings.TrimSpace(r.read("listener.signal")); got != "INT" {
+		t.Errorf("the listener's signal record = %q, want INT", got)
+	}
+	if !strings.Contains(r.read("env"), "RUNNER_MANUALLY_TRAP_SIG=1") {
+		t.Error("run.sh was not started with RUNNER_MANUALLY_TRAP_SIG=1")
 	}
 	env := r.read("env")
 	if env == "" {
@@ -189,15 +234,15 @@ func TestEntrypointForwardsIntAsTerm(t *testing.T) {
 	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
-		if code := exitCode(t, err); code != 7 {
-			t.Fatalf("exit %d, want the stub's 7", code)
+		if code := exitCode(t, err); code != 143 {
+			t.Fatalf("exit %d, want run.sh's 143", code)
 		}
 	case <-time.After(10 * time.Second):
 		_ = cmd.Process.Kill()
 		t.Fatal("the entrypoint did not exit after INT")
 	}
-	if got := strings.TrimSpace(r.read("signal")); got != "TERM" {
-		t.Errorf("signal record = %q, want TERM", got)
+	if got := strings.TrimSpace(r.read("listener.signal")); got != "INT" {
+		t.Errorf("the listener's signal record = %q, want INT", got)
 	}
 }
 
@@ -212,6 +257,17 @@ func TestEntrypointReturnsTheChildStatus(t *testing.T) {
 	cmd.Env = append(cmd.Env, "STUB_EXIT_NOW=42")
 	if code := exitCode(t, cmd.Run()); code != 42 {
 		t.Fatalf("exit %d, want 42", code)
+	}
+}
+
+// Through the real run.sh dispatch, the listener's status comes back only on the
+// RUNNER_MANUALLY_TRAP_SIG path; the plain path would report 0.
+func TestEntrypointReturnsTheListenersStatus(t *testing.T) {
+	r := newRig(t)
+	cmd := r.cmd(jitSecret + "\n")
+	cmd.Env = append(cmd.Env, "STUB_LISTENER_EXIT=5")
+	if code := exitCode(t, cmd.Run()); code != 5 {
+		t.Fatalf("exit %d, want the listener's 5", code)
 	}
 }
 
@@ -413,5 +469,32 @@ func TestEntrypointRejectsUnknownArguments(t *testing.T) {
 	}
 	if r.read("argv") != "" {
 		t.Error("the runner started")
+	}
+}
+
+func TestEntrypointIgnoresTestHooksWithoutTheSentinel(t *testing.T) {
+	r := newRig(t)
+	cmd := r.cmd(jitSecret + "\n")
+	// An image can set any ENV: without the sentinel the hooks are not read, so
+	// the defaults (/opt/local-ci, which does not exist here) apply.
+	var env []string
+	for _, e := range cmd.Env {
+		if e != "LOCAL_CI_TEST_HOOKS=1" {
+			env = append(env, e)
+		}
+	}
+	// If the hooks were wrongly honoured the stub would run and exit at once.
+	cmd.Env = append(env, "STUB_EXIT_NOW=0")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	code := exitCode(t, cmd.Run())
+	if code == 0 || !strings.Contains(stderr.String(), "/opt/local-ci") {
+		t.Fatalf("exit %d, stderr %q: want a failure about /opt/local-ci", code, stderr.String())
+	}
+	if _, err := os.Stat(r.root); err == nil {
+		t.Error("the LOCAL_CI_ROOT hook was honoured without the sentinel")
+	}
+	if r.read("argv") != "" {
+		t.Error("the runner started from a hooked mount")
 	}
 }

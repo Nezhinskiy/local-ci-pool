@@ -222,3 +222,111 @@ func TestRealMount(t *testing.T) {
 		t.Errorf("Prune removed the current image %s", m.Spec.Source)
 	}
 }
+
+// termScript prepares a copy of the real runner tree whose Runner.Listener is a
+// stub that reports the signal it gets, then execs the pool's real entrypoint.
+// run.sh and run-helper.sh are the real ones from the release.
+const termScript = `set -e
+mkdir -p /tmp/m && cp -a /opt/local-ci/. /tmp/m/
+cat > /tmp/m/bin/Runner.Listener <<'X'
+#!/bin/bash
+trap 'echo LISTENER-GOT-INT; exit 9' INT
+trap 'echo LISTENER-GOT-TERM; exit 9' TERM
+echo LISTENER-READY
+while :; do sleep 0.05; done
+X
+chmod +x /tmp/m/bin/Runner.Listener
+export LOCAL_CI_TEST_HOOKS=1 LOCAL_CI_MOUNT=/tmp/m LOCAL_CI_ROOT=/tmp/root
+exec /opt/local-ci/entrypoint.sh <<< JIT-VALUE
+`
+
+func containerLogs(ctx context.Context, cli *client.Client, id string) string {
+	rc, err := cli.ContainerLogs(ctx, id, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = rc.Close() }()
+	var out bytes.Buffer
+	_, _ = stdcopy.StdCopy(&out, &out, rc)
+	return out.String()
+}
+
+// TestRealEntrypointForwardsTerm sends SIGTERM to a container whose PID 1 init
+// starts the real entrypoint, which runs the release's real run.sh and
+// run-helper.sh around a stub listener. The listener must see the signal and its
+// status must come back through the helper.
+func TestRealEntrypointForwardsTerm(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	cli, err := client.New(client.FromEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cli.Close() }()
+	infoRes, err := cli.Info(ctx, client.InfoOptions{})
+	if err != nil {
+		t.Skipf("Docker is not available: %v", err)
+	}
+	arch, err := machine.RunnerArch(infoRes.Info.Architecture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := runnermount.Ensure(ctx, cli, github.New(ghauth.NewSource(nil), ""), arch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !haveImage(ctx, cli, bareUbuntu) {
+		t.Skipf("%s is not available locally", bareUbuntu)
+	}
+	init := true
+	created, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config: &container.Config{
+			Image: bareUbuntu, User: "1001", Cmd: []string{"bash", "-c", termScript},
+		},
+		HostConfig: &container.HostConfig{
+			Init:   &init,
+			Mounts: []mount.Mount{m.Spec},
+			Tmpfs:  map[string]string{"/tmp": "rw,exec,mode=1777"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = cli.ContainerRemove(context.WithoutCancel(ctx), created.ID, client.ContainerRemoveOptions{Force: true})
+	}()
+	if _, err := cli.ContainerStart(ctx, created.ID, client.ContainerStartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for !strings.Contains(containerLogs(ctx, cli, created.ID), "LISTENER-READY") {
+		if time.Now().After(deadline) {
+			t.Fatalf("the listener never started:\n%s", containerLogs(ctx, cli, created.ID))
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if _, err := cli.ContainerKill(ctx, created.ID, client.ContainerKillOptions{Signal: "TERM"}); err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, waitCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer waitCancel()
+	waiting := cli.ContainerWait(waitCtx, created.ID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
+	var code int64
+	select {
+	case w := <-waiting.Result:
+		code = w.StatusCode
+	case err := <-waiting.Error:
+		t.Fatalf("the container did not stop within 30 s of TERM: %v\n%s", err, containerLogs(ctx, cli, created.ID))
+	}
+	logs := containerLogs(ctx, cli, created.ID)
+	t.Logf("exit %d, output:\n%s", code, logs)
+	if !strings.Contains(logs, "LISTENER-GOT-INT") {
+		t.Errorf("the listener did not receive the forwarded signal")
+	}
+	if !strings.Contains(logs, "unknown error code: 9") {
+		t.Errorf("the listener's status did not reach run-helper")
+	}
+	if code != 143 {
+		t.Errorf("exit code %d, want 143 (run.sh reports the interrupted wait)", code)
+	}
+}

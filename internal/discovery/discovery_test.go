@@ -67,6 +67,10 @@ func TestParseMarkerForms(t *testing.T) {
 		"parent inside an input":         {`{"dockerfile":"d/Dockerfile","inputs":["d/../../x"]}`, ".."},
 		"parent in dockerfile":           {`{"dockerfile":"d/../../Dockerfile","inputs":["d"]}`, ".."},
 		"absolute input":                 {`{"dockerfile":"d/Dockerfile","inputs":["/d"]}`, "relative"},
+		"glob star in input":             {`{"dockerfile":"d/Dockerfile","inputs":["d/*"]}`, "relative"},
+		"glob question in input":         {`{"dockerfile":"d/Dockerfile","inputs":["d?"]}`, "relative"},
+		"glob bracket in input":          {`{"dockerfile":"d/Dockerfile","inputs":["d[0-9]"]}`, "relative"},
+		"glob in dockerfile":             {`{"dockerfile":"d/Docker*","inputs":["d"]}`, "relative"},
 		"absolute dockerfile":            {`{"dockerfile":"/d/Dockerfile","inputs":["d"]}`, "relative"},
 		"empty input":                    {`{"dockerfile":"d/Dockerfile","inputs":[""]}`, "empty"},
 		"pathspec magic input":           {`{"dockerfile":"d/Dockerfile","inputs":[":(glob)d"]}`, "relative"},
@@ -251,23 +255,33 @@ func TestDiscoverListingErrorReturnsNil(t *testing.T) {
 	}
 }
 
-func TestDiscoverTransientErrorsAbortInsteadOfDroppingProjects(t *testing.T) {
+func TestDiscoverOneRepositoryFailingNeverAbortsTheOthers(t *testing.T) {
+	forbidden := errors.New("403 Forbidden")
 	for name, src := range map[string]*fakeSource{
-		"re-check fails": {
-			listing: []github.Repo{priv("alpha")},
-			repoErr: map[string]error{"o/alpha": errors.New("timeout")},
+		"marker read returns 403": {
+			listing: []github.Repo{priv("broken"), priv("alpha")},
+			repos:   map[string]github.Repo{"o/broken": priv("broken"), "o/alpha": priv("alpha")},
+			fileErr: map[string]error{"o/broken@main": forbidden},
+			files:   map[string]string{"o/alpha@main": goodMarker},
 		},
-		"read fails": {
-			listing: []github.Repo{priv("alpha")},
+		"re-check returns 403": {
+			listing: []github.Repo{priv("broken"), priv("alpha")},
 			repos:   map[string]github.Repo{"o/alpha": priv("alpha")},
-			fileErr: map[string]error{"o/alpha@main": errors.New("timeout")},
+			repoErr: map[string]error{"o/broken": forbidden},
+			files:   map[string]string{"o/alpha@main": goodMarker},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			log, _ := testLog()
+			log, buf := testLog()
 			got, err := Discover(context.Background(), src, Options{}, log)
-			if err == nil || got != nil {
-				t.Fatalf("got %+v, %v; want nil and an error", got, err)
+			if err != nil {
+				t.Fatalf("a per-repository failure aborted discovery: %v", err)
+			}
+			if len(got) != 1 || got[0].Repo != "o/alpha" {
+				t.Fatalf("projects = %+v, want only o/alpha", got)
+			}
+			if !strings.Contains(buf.String(), "o/broken") || !strings.Contains(buf.String(), "403") {
+				t.Errorf("the skip and its reason are not logged:\n%s", buf.String())
 			}
 		})
 	}

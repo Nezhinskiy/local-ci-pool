@@ -11,6 +11,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
 	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
@@ -82,6 +83,7 @@ type fakeGH struct {
 	rel       github.RunnerRelease
 	relErr    error
 	tarball   []byte
+	trickle   bool
 	downloads int
 }
 
@@ -92,10 +94,29 @@ func (f *fakeGH) LatestRunnerRelease(_ context.Context, arch string) (github.Run
 	return f.rel, f.relErr
 }
 
-func (f *fakeGH) Download(context.Context, string) (io.ReadCloser, error) {
+func (f *fakeGH) Download(ctx context.Context, _ string) (io.ReadCloser, error) {
 	f.downloads++
+	if f.trickle {
+		return &trickleReader{ctx: ctx}, nil
+	}
 	return io.NopCloser(bytes.NewReader(f.tarball)), nil
 }
+
+// trickleReader delivers a byte now and then and never finishes; it ends only
+// when the context does.
+type trickleReader struct{ ctx context.Context }
+
+func (t *trickleReader) Read(p []byte) (int, error) {
+	select {
+	case <-t.ctx.Done():
+		return 0, t.ctx.Err()
+	case <-time.After(5 * time.Millisecond):
+		p[0] = 'x'
+		return 1, nil
+	}
+}
+
+func (t *trickleReader) Close() error { return nil }
 
 type builtContext struct {
 	files map[string]*tar.Header
@@ -159,8 +180,17 @@ func (f *fakeDocker) ImageBuild(_ context.Context, r io.Reader, o client.ImageBu
 	return client.ImageBuildResult{Body: io.NopCloser(strings.NewReader(body))}, nil
 }
 
-func (f *fakeDocker) ImageList(context.Context, client.ImageListOptions) (client.ImageListResult, error) {
-	return client.ImageListResult{Items: f.list}, nil
+// ImageList answers the two queries Prune makes: untagged images (filter
+// "dangling") and tagged ones (filter "reference").
+func (f *fakeDocker) ImageList(_ context.Context, o client.ImageListOptions) (client.ImageListResult, error) {
+	_, dangling := o.Filters["dangling"]
+	var items []image.Summary
+	for _, img := range f.list {
+		if (len(img.RepoTags) == 0) == dangling {
+			items = append(items, img)
+		}
+	}
+	return client.ImageListResult{Items: items}, nil
 }
 
 func (f *fakeDocker) ImageRemove(_ context.Context, ref string, _ client.ImageRemoveOptions) (client.ImageRemoveResult, error) {
@@ -439,5 +469,57 @@ func TestPruneAcceptsAFullReferenceAndJoinsErrors(t *testing.T) {
 	}
 	if strings.Join(d.removed, ",") != "local-ci/runner:2.337.0,local-ci/runner:2.336.0" {
 		t.Fatalf("removed %v: a failure must not stop the others", d.removed)
+	}
+}
+
+func TestEnsureBoundsTheWholeDownload(t *testing.T) {
+	old := downloadTimeout
+	downloadTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { downloadTimeout = old })
+	d := &fakeDocker{}
+	start := time.Now()
+	_, err := Ensure(context.Background(), d, &fakeGH{rel: release(strings.Repeat("a", 64)), trickle: true}, "arm64")
+	if err == nil || !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("want a deadline error, got %v", err)
+	}
+	if time.Since(start) > 10*time.Second || d.builds != 0 {
+		t.Fatalf("took %s, builds %d", time.Since(start), d.builds)
+	}
+}
+
+func labelled(id string) image.Summary {
+	return image.Summary{ID: id, Labels: map[string]string{labelRunnerSHA: strings.Repeat("a", 64)}}
+}
+
+func TestPruneRemovesUntaggedRebuiltRunnerImages(t *testing.T) {
+	d := &fakeDocker{list: []image.Summary{
+		summary("sha256:cur", "local-ci/runner:2.338.0"),
+		labelled("sha256:rebuilt-old"),
+		summary("sha256:foreign-dangling"), // untagged but not ours: no labels
+	}}
+	if err := Prune(context.Background(), d, "2.338.0"); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.removed) != 1 || d.removed[0] != "sha256:rebuilt-old" {
+		t.Fatalf("removed %v, want only the labelled untagged image", d.removed)
+	}
+}
+
+func TestPruneKeepsUntaggedImagesWhileAContainerMountsARunnerImage(t *testing.T) {
+	d := &fakeDocker{
+		list: []image.Summary{labelled("sha256:rebuilt-old")},
+		containers: []container.Summary{
+			{ImageID: "sha256:job", Mounts: []container.MountPoint{{Type: mount.TypeImage, Name: "local-ci/runner:2.338.0"}}},
+		},
+	}
+	if err := Prune(context.Background(), d, "2.338.0"); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.removed) != 0 {
+		t.Fatalf("removed %v: a job may still mount the old image under its moved tag", d.removed)
+	}
+	d.containers = []container.Summary{{ImageID: "sha256:rebuilt-old"}}
+	if err := Prune(context.Background(), d, "2.338.0"); err != nil || len(d.removed) != 0 {
+		t.Fatalf("an image a container runs from was removed: %v, %v", d.removed, err)
 	}
 }

@@ -202,6 +202,9 @@ func TestFetchAndArchiveUseTheGhCredentialHelperAndWriteNoCredential(t *testing.
 	if _, err := m.Fetch(ctx, "o/alpha", "main"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := m.InputsDigest(ctx, m.Dir("o/alpha"), commit, []string{"ci"}); err != nil {
+		t.Fatal(err)
+	}
 	rc, err := m.Archive(ctx, m.Dir("o/alpha"), commit, []string{"ci"})
 	if err != nil {
 		t.Fatal(err)
@@ -215,14 +218,20 @@ func TestFetchAndArchiveUseTheGhCredentialHelperAndWriteNoCredential(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	var fetch, archive bool
+	var fetch, archive, lsTree bool
 	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
 		fields := strings.Split(line, "|")
 		joined := strings.Join(fields, " ")
 		isFetch := strings.Contains(joined, " fetch ")
 		isArchive := strings.Contains(joined, " archive ")
-		if !isFetch && !isArchive {
+		if strings.Contains(joined, " ls-tree ") {
+			lsTree = true
+		}
+		if !isFetch && !isArchive && !strings.Contains(joined, " ls-tree ") {
 			continue
+		}
+		if !strings.Contains(joined, " --literal-pathspecs ") {
+			t.Errorf("git call without --literal-pathspecs: %s", joined)
 		}
 		const helper = "-c credential.helper= -c credential.helper=!gh auth git-credential"
 		if !strings.HasPrefix(strings.TrimSpace(joined), helper) {
@@ -238,8 +247,8 @@ func TestFetchAndArchiveUseTheGhCredentialHelperAndWriteNoCredential(t *testing.
 			archive = true
 		}
 	}
-	if !fetch || !archive {
-		t.Fatalf("fetch=%v archive=%v in the git log:\n%s", fetch, archive, b)
+	if !fetch || !archive || !lsTree {
+		t.Fatalf("fetch=%v archive=%v ls-tree=%v in the git log:\n%s", fetch, archive, lsTree, b)
 	}
 
 	cfg, err := os.ReadFile(filepath.Join(m.Dir("o/alpha"), "config"))
@@ -400,7 +409,7 @@ func TestInputsDigestRefusesEmptyAndUnsafeInputs(t *testing.T) {
 	if _, err := m.InputsDigest(ctx, dir, commit, []string{"no/such/path"}); err == nil || !strings.Contains(err.Error(), "match nothing") {
 		t.Errorf("inputs that match nothing: %v", err)
 	}
-	for _, in := range [][]string{nil, {"--output=x"}, {":(top)a.txt"}, {"../x"}, {"/abs"}, {""}} {
+	for _, in := range [][]string{nil, {"*"}, {"a.*"}, {"a.tx?"}, {"[ab].txt"}, {"--output=x"}, {":(top)a.txt"}, {"../x"}, {"/abs"}, {""}} {
 		if _, err := m.InputsDigest(ctx, dir, commit, in); err == nil {
 			t.Errorf("InputsDigest(%q): want an error", in)
 		}

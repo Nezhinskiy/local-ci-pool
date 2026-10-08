@@ -97,7 +97,10 @@ func lock(dir string) func() {
 }
 
 func gitCmd(ctx context.Context, dir string, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "git", append(append([]string{}, credentialArgs...), args...)...)
+	// --literal-pathspecs: an input is a path, never a glob or pathspec magic,
+	// for ls-tree and archive alike.
+	global := append(append([]string{}, credentialArgs...), "--literal-pathspecs")
+	cmd := exec.CommandContext(ctx, "git", append(global, args...)...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=", "LC_ALL=C")
 	return cmd

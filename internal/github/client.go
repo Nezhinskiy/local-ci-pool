@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,6 +25,7 @@ const (
 	requestTimeout = 30 * time.Second
 	maxBody        = 8 << 20 // an API response or a repository file
 	maxPages       = 100
+	downloadIdle   = 30 * time.Second
 	errSnippet     = 200
 )
 
@@ -89,6 +91,8 @@ type Client struct {
 	base     string
 	http     *http.Client
 	download *http.Client
+	// downloadIdle is how long a download may deliver no bytes before it is cut.
+	downloadIdle time.Duration
 }
 
 // New returns a Client. An empty baseURL means https://api.github.com.
@@ -106,6 +110,8 @@ func New(tok TokenSource, baseURL string) *Client {
 		base:     strings.TrimRight(baseURL, "/"),
 		http:     &http.Client{Timeout: requestTimeout},
 		download: &http.Client{Transport: tr},
+
+		downloadIdle: downloadIdle,
 	}
 }
 
@@ -375,22 +381,62 @@ func (c *Client) LatestRunnerRelease(ctx context.Context, arch string) (RunnerRe
 }
 
 // Download streams a public release asset. The request carries no credential:
-// the asset is public, and the token must not travel to a download host.
+// the asset is public, and the token must not travel to a download host. The
+// body has no overall limit, because a runner tarball is large, but a read that
+// delivers nothing for downloadIdle (30 s) fails and cancels the request, so a
+// stalled server cannot hold the caller forever. The caller may also bound the
+// whole download with ctx.
 func (c *Client) Download(ctx context.Context, rawURL string) (io.ReadCloser, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("github: download: %w", err)
 	}
 	req.Header.Set("User-Agent", "local-ci-pool")
 	resp, err := c.download.Do(req)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("github: download: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		_ = resp.Body.Close()
+		cancel()
 		return nil, fmt.Errorf("github: download: status %d", resp.StatusCode)
 	}
-	return resp.Body, nil
+	r := &idleReader{body: resp.Body, cancel: cancel, idle: c.downloadIdle}
+	r.timer = time.AfterFunc(r.idle, func() {
+		r.stalled.Store(true)
+		cancel()
+	})
+	return r, nil
+}
+
+// idleReader fails a read when no data has arrived for the idle period.
+type idleReader struct {
+	body    io.ReadCloser
+	cancel  context.CancelFunc
+	timer   *time.Timer
+	idle    time.Duration
+	stalled atomic.Bool
+}
+
+func (r *idleReader) Read(p []byte) (int, error) {
+	n, err := r.body.Read(p)
+	if r.stalled.Load() {
+		return n, fmt.Errorf("github: download stalled: no data for %s", r.idle)
+	}
+	if n > 0 {
+		r.timer.Reset(r.idle)
+	}
+	return n, err
+}
+
+func (r *idleReader) Close() error {
+	r.timer.Stop()
+	err := r.body.Close()
+	r.cancel()
+	return err
 }
 
 var varNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)

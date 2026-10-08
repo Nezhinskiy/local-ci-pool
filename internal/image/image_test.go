@@ -289,7 +289,12 @@ func (f *fakeMirror) InputsDigest(_ context.Context, dir, commit string, inputs 
 	return f.digest, nil
 }
 
-func (f *fakeMirror) Archive(_ context.Context, _, _ string, inputs []string) (io.ReadCloser, error) {
+func (f *fakeMirror) Archive(_ context.Context, dir, commit string, inputs []string) (io.ReadCloser, error) {
+	// The archive must be taken in the project's mirror, at the commit Fetch
+	// returned, not at a ref that may have moved since.
+	if dir != "/mirror/o/alpha" || commit != f.commit {
+		return nil, fmt.Errorf("Archive called with dir %q commit %q, want /mirror/o/alpha at %q", dir, commit, f.commit)
+	}
 	f.archives = append(f.archives, inputs)
 	if f.archiveErr != nil {
 		return nil, f.archiveErr

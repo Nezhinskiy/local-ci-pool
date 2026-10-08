@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # The pool's entrypoint for a job container.
 #
 #   entrypoint.sh              read one JIT configuration line from stdin, run
@@ -14,13 +14,21 @@
 # runner as an argument only. It is never exported, so no process environment
 # carries it.
 #
-# LOCAL_CI_MOUNT, LOCAL_CI_ROOT and LOCAL_CI_CA_PATHS exist for the tests.
+# LOCAL_CI_MOUNT, LOCAL_CI_ROOT and LOCAL_CI_CA_PATHS exist for the tests and
+# are honoured only when LOCAL_CI_TEST_HOOKS=1 is also set. A job image can set
+# any ENV it likes, so without that sentinel an image-controlled variable could
+# redirect the runner root or fake a CA bundle.
 
 set -eu
 
-mount_dir=${LOCAL_CI_MOUNT:-/opt/local-ci}
-root_dir=${LOCAL_CI_ROOT:-/tmp/runner}
-ca_paths=${LOCAL_CI_CA_PATHS:-/etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt}
+mount_dir=/opt/local-ci
+root_dir=/tmp/runner
+ca_paths="/etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt"
+if [ "${LOCAL_CI_TEST_HOOKS:-}" = 1 ]; then
+	mount_dir=${LOCAL_CI_MOUNT:-$mount_dir}
+	root_dir=${LOCAL_CI_ROOT:-$root_dir}
+	ca_paths=${LOCAL_CI_CA_PATHS:-$ca_paths}
+fi
 
 mode=job
 case "${1:-}" in
@@ -49,6 +57,10 @@ fi
 # 2. A writable runner root. cp -a keeps modes and symlinks; failing to keep
 # the owner is not an error for a non-root user. The root's own mode is copied
 # too, so make it writable for the owner again.
+if [ ! -d "$mount_dir" ]; then
+	echo "local-ci: runner tree $mount_dir not found" >&2
+	exit 2
+fi
 mkdir -p "$root_dir"
 cp -a "$mount_dir"/. "$root_dir"/
 chmod u+w "$root_dir"
@@ -89,18 +101,31 @@ if [ "$mode" = preflight ]; then
 	exec env DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 "$root_dir/bin/Runner.Listener" --version
 fi
 
-# 4. The runner runs as a child, so TERM and INT can be forwarded and the exit
-# status returned. A shell starts a background command with SIGINT ignored, and
-# an ignored signal cannot be trapped, so an INT sent to the child would be lost
-# and this script would wait forever. INT is therefore forwarded as TERM, which
-# the runner treats the same way: it stops the job and exits.
+# 4. The runner runs as a child, so TERM can be forwarded and the exit status
+# returned. Measured against the real run.sh (v2.338.0): unless
+# RUNNER_MANUALLY_TRAP_SIG is set it runs run-helper.sh in the foreground with no
+# trap, so a TERM sent to run.sh kills its bash, orphans run-helper.sh and
+# Runner.Listener, and run.sh reports 0 for almost every listener status. With
+# the variable set (for the child only, like the invariant flag) run.sh puts the
+# helper in its own process group, sends INT to that group on TERM or INT, waits,
+# and returns the helper's status, so the listener gets the signal and its status
+# comes back. INT is forwarded to run.sh as TERM, which it handles the same way.
+#
+# set -m matters: without job control a shell starts a background command with
+# SIGINT ignored, an ignored signal cannot be trapped, and that disposition is
+# inherited by run.sh's children. (This is why the script is bash, not POSIX sh:
+# dash refuses `set -m` without a tty. The runner's own run.sh needs bash too.) The INT that run.sh sends to the helper's group
+# would then be dropped by the listener and the container would hang until
+# SIGKILL (measured). With job control the child starts with default signals.
+# The runner never reads stdin, so it gets /dev/null.
 child=
+set -m
 trap 'if [ -n "$child" ]; then kill -s TERM "$child" 2>/dev/null || true; fi' TERM INT
 
 if [ "$icu" = 1 ]; then
-	"$root_dir/run.sh" --jitconfig "$local_ci_jit" &
+	env RUNNER_MANUALLY_TRAP_SIG=1 "$root_dir/run.sh" --jitconfig "$local_ci_jit" </dev/null &
 else
-	env DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 "$root_dir/run.sh" --jitconfig "$local_ci_jit" &
+	env RUNNER_MANUALLY_TRAP_SIG=1 DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 "$root_dir/run.sh" --jitconfig "$local_ci_jit" </dev/null &
 fi
 child=$!
 
