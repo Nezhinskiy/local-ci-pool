@@ -45,14 +45,17 @@ Run `./install.sh --dry-run` first if you want to see what it would do. The inst
 3. stages the new binary as `pool.new` beside the old one, and renders the agent to
    `com.local-ci-pool.pool.plist.new` (logs go to `~/Library/Logs/local-ci-pool/pool.log`), checking it
    with `plutil -lint`. Everything that can fail does so here, while the running pool is untouched;
-4. runs `launchctl bootout gui/$UID/com.local-ci-pool.pool` and then polls `launchctl print` until
-   launchd no longer lists the agent. The pool finishes its running jobs first (up to 40 minutes,
-   then at most 3 more to clean up, inside the plist's 45-minute `ExitTimeOut`), and the installer
-   prints a line every minute while it waits. It does not trust `bootout` to block: if the agent is
-   still there after 46 minutes it stops, and no installed file has been changed;
-5. waits, with the same bound and progress lines, until nothing answers on the health address any
-   more. launchd can stop listing an agent whose process is still draining, and a new pool started
-   then could not bind the address;
+4. stops a running pool itself: it reads the pool's pid from
+   `launchctl print gui/$UID/com.local-ci-pool.pool`, sends it `SIGTERM`, and waits until that
+   process has exited. The pool finishes its running jobs first (up to 40 minutes, then at most 3
+   more to clean up), and the installer prints a line every minute while it waits. If the pool is
+   still draining after 46 minutes the installer stops there: nothing has been replaced, and the pool
+   exits on its own once its drain ends. The installer does not leave the stop to launchd, which
+   would kill a draining pool after a minute (see [launchd's 60-second limit](#launchds-60-second-limit));
+5. runs `launchctl bootout gui/$UID/com.local-ci-pool.pool`, which is quick now that the process is
+   gone, and polls `launchctl print` until launchd no longer lists the agent; then waits, with the
+   same bound and progress lines, until nothing answers on the health address any more, so that the
+   new pool can bind it;
 6. renames the staged files into place (`~/Library/Application Support/local-ci-pool/bin/pool` and
    `~/Library/LaunchAgents/com.local-ci-pool.pool.plist`);
 7. runs `launchctl bootstrap` (retried a few times) and waits until `/healthz` reports the version it
@@ -73,11 +76,13 @@ installer again (or `launchctl kickstart gui/$UID/com.local-ci-pool.pool`).
 
 ## Upgrade
 
-Run `./install.sh` again (or with `--version`). It stages the new files, stops the old pool, waits
-until its jobs have finished and launchd has let go of it (up to 46 minutes), then renames the staged
-files into place and starts the new pool. If anything fails after the old pool was stopped, or the
-installer is interrupted then, it says `the old pool is stopped and the new one is not running`; run
-it again.
+Run `./install.sh` again (or with `--version`). It stages the new files, sends the old pool
+`SIGTERM`, waits until its jobs have finished and its process has exited (up to 46 minutes), unloads
+the agent, then renames the staged files into place and starts the new pool. If the old pool is still
+draining at the bound, the installer stops without replacing anything and says so; the pool exits once
+its drain ends and is not restarted, so run the installer again then. If anything fails after the old
+pool was stopped, or the installer is interrupted then, it says
+`the old pool is stopped and the new one is not running`; run it again.
 
 The drain is bounded at 40 minutes, which is not above every job timeout a served repository may
 set. A job still running at the bound is stopped (its container is removed) on an upgrade or an
@@ -87,14 +92,38 @@ for its previous session to expire: a `409` on opening the session is retried fo
 `409` beyond that means another pool, or another Mac with the same machine name, holds the scale set,
 and the pool exits (terminal).
 
+### launchd's 60-second limit
+
+Measured on macOS 27.0.1 (build 26A434): launchd clamps a LaunchAgent's exit timeout to 60 seconds.
+The plist asks for an `ExitTimeOut` of 2700, but `launchctl print gui/$UID/com.local-ci-pool.pool`
+reports `exit timeout = 60`, and a `launchctl bootout` during an upgrade killed the pool (`SIGKILL`)
+about 62 seconds into its drain, with a job still running. So every stop that comes from launchd gives
+the pool at most 60 seconds: a logout, a shutdown or a reboot, and `launchctl bootout` or
+`launchctl stop` by hand. A job still running then is not lost with the pool as long as Docker keeps
+running: the next pool to start leaves its container running, holds a slot for it until it exits, and
+removes only the containers that had already stopped (v0.1.0's start-up sweep removed the running ones
+too, so the job was lost). A reboot or a shutdown stops Docker as well, and its jobs are lost anyway.
+
+A `SIGTERM` sent from outside launchd has no such limit. Measured on the same Mac: the pool drained for
+as long as its running job needed, the job finished green, the pool deleted its scale set and exited 0
+after 462 seconds, and launchd did not restart it (`state = not running`, `last exit code = 0`). The
+installer stops the pool this way. To stop it by hand without losing a job, do the same:
+
+```sh
+pid="$(launchctl print gui/$(id -u)/com.local-ci-pool.pool | sed -n 's/^[[:space:]]*pid = //p' | head -n 1)"
+kill -TERM "$pid"                                          # drains, then exits 0
+launchctl kickstart gui/$(id -u)/com.local-ci-pool.pool    # start it again later
+```
+
 ## Uninstall
 
 ```sh
 ./install.sh --uninstall
 ```
 
-It stops the pool and waits until launchd has let go of it (the running jobs finish first), then runs
-`pool forget` (deletes `CI_POOL_HB_<MACHINE>` from every repository the pool serves; other Macs'
+It sends the pool `SIGTERM` and waits until its process has exited (the running jobs finish first, up
+to 46 minutes; if the pool is still draining then, nothing is removed and the installer says so), then
+unloads the agent and waits until launchd has let go of it, then runs `pool forget` (deletes `CI_POOL_HB_<MACHINE>` from every repository the pool serves; other Macs'
 variables are never touched), then removes the plist and the binary. The order matters: the heartbeat
 dies with the process, so a variable deleted before the pool is gone could be written again. Workflows
 fall back to hosted runners within five minutes, since a heartbeat is fresh for no longer than that.
@@ -139,8 +168,8 @@ moment are lost with the containers; a job assigned to the pool at that time is 
 - **Out:** remove the marker from the default branch. The pool drains the project (running jobs
   finish, no new ones start) and deletes its scale set. A repository that turns public, or moves to
   another owner, is drained the same way.
-- **Making a served repository public:** stop the pool first (`launchctl bootout
-  gui/$(id -u)/com.local-ci-pool.pool`). The pool notices the change on its next discovery pass,
+- **Making a served repository public:** stop the pool first (`./install.sh --uninstall`, or by hand
+  as in [launchd's 60-second limit](#launchds-60-second-limit)). The pool notices the change on its next discovery pass,
   up to 10 minutes later, and in that window a pull request from a fork could target
   `<identity>-local` directly and run on this Mac.
 - **Repository names:** the `route` action accepts identities of 1 to 40 characters. A repository
@@ -178,7 +207,7 @@ tail -f ~/Library/Logs/local-ci-pool/pool.log
 |---|---|
 | `version`, `commit` | the running build |
 | `machine` | the machine name |
-| `slots`, `in_use`, `busy` | the slot limit, slots held by runners, runners running a job |
+| `slots`, `in_use`, `busy` | the slot limit, slots held by runners (including runners a killed previous run left running), runners running a job |
 | `docker` | whether Docker answers |
 | `probe` | whether this is a probe run |
 | `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, and a `reason` when not healthy |
@@ -192,8 +221,10 @@ large.
 A job assigned to a Mac that then went to sleep or lost power, and not yet started there, is requeued
 by GitHub to another live Mac after about five minutes; with no other Mac, the run waits (see
 [stranded runs](#stranded-runs)). A job that had already started is never requeued: it fails with a
-lost runner and needs a re-run. The same holds after the pool is killed (`kill -9`, a crash): the
-restarted pool's sweep removes the job containers that survived.
+lost runner and needs a re-run. A pool killed while Docker keeps running (`kill -9`, a crash,
+[launchd's 60-second limit](#launchds-60-second-limit)) is different: a job that had started keeps
+running in its container, and the next pool leaves it running, counts it in `in_use` until it exits,
+and removes only this pool's containers that had already stopped.
 
 ## Probe mode
 
@@ -205,12 +236,12 @@ there). The installed binary is not on your PATH, so give its full path:
 "$HOME/Library/Application Support/local-ci-pool/bin/pool" run --probe --only-repo OWNER/NAME --marker-ref my-branch
 ```
 
-Stop the installed pool first (`launchctl bootout gui/$(id -u)/com.local-ci-pool.pool`, and
-`./install.sh` afterwards to load it again). A second pool beside the installed one would count the
+Stop the installed pool first (by hand as in [launchd's 60-second limit](#launchds-60-second-limit),
+and `launchctl kickstart gui/$(id -u)/com.local-ci-pool.pool` afterwards to start it again). A second pool beside the installed one would count the
 same Docker memory twice and oversubscribe it, and the default health address is the single-instance
 lock, so it would not start anyway. (`--health-addr` can move a probe's endpoint, but only to a
 loopback address, and only together with `--probe`: a second non-probe pool would skip the lock and
-its start-up sweep would remove the installed pool's containers.) `--marker-ref` is optional;
+its start-up sweep and its reconcile would remove the installed pool's containers.) `--marker-ref` is optional;
 without it the marker is read from the default branch.
 
 ## Stranded runs
