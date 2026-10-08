@@ -15,7 +15,9 @@ files in the same change that adds the file:
   - the pool program, adapted from examples/dockerscaleset
   - the test server, copied from internal/testserver
 
-Adapted files so far: none.
+Adapted files so far:
+
+  - internal/runner/adapter.go, adapted from examples/dockerscaleset/scaler.go
 
 actions/scaleset license
 ------------------------
