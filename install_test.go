@@ -88,6 +88,7 @@ bootout)
 	exit "${STUB_BOOTOUT_EXIT:-0}" ;;
 print)
 	echo "at-print binary=$b" >> "$STUB_LOG"
+	touch "$STUB_LOG.printed"
 	if [ ! -e "$STUB_LOG.out" ]; then
 		# Before a bootout the agent is loaded when STUB_POOL_PID names a
 		# process (or STUB_RUNNING_NO_PID is set), and launchd shows the pid
@@ -97,9 +98,19 @@ print)
 			exit 0
 		fi
 		[ -n "${STUB_POOL_PID:-}" ] || exit 113
+		# A nested block with its own "pid =" line comes before the
+		# service's, which is indented by one tab.
+		# After STUB_PID_PRINTS such calls launchd reports STUB_NEXT_PID
+		# instead (a restart, or the pid now names another process).
+		pid="$STUB_POOL_PID"
+		if [ -n "${STUB_PID_PRINTS:-}" ]; then
+			n=$(cat "$STUB_LOG.pidprints" 2>/dev/null || echo 0)
+			echo $((n + 1)) > "$STUB_LOG.pidprints"
+			[ "$n" -lt "$STUB_PID_PRINTS" ] || pid="${STUB_NEXT_PID:-}"
+		fi
 		printf 'gui/501/` + label + ` = {\n\tactive count = 1\n\tpath = /x.plist\n'
-		if kill -0 "$STUB_POOL_PID" 2>/dev/null; then
-			printf '\tstate = running\n\tprogram = /x/pool\n\tenvironment = {\n\t\tXPC_SERVICE_NAME => x\n\t}\n\truns = 1\n\tpid = %s\n\timmediate reason = speculative\n' "$STUB_POOL_PID"
+		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+			printf '\tstate = running\n\tprogram = /x/pool\n\tenvironment = {\n\t\tXPC_SERVICE_NAME => x\n\t}\n\tendpoints = {\n\t\t"x" = {\n\t\t\tpid = 99999999\n\t\t}\n\t}\n\truns = 1\n\tpid = %s\n\timmediate reason = speculative\n' "$pid"
 		else
 			printf '\tstate = not running\n\truns = 1\n\tlast exit code = 0\n'
 		fi
@@ -189,7 +200,7 @@ const stubPool = `#!/bin/sh
 echo "pool $*" >> "$STUB_LOG"
 case "$1" in
 version) echo "v0.1.0 abc1234" ;;
-print-defaults) echo "{\"drain_seconds\":2400,\"health_addr\":\"${STUB_HEALTH_ADDR:-127.0.0.1:8737}\"}" ;;
+print-defaults) echo "{\"drain_seconds\":2400,\"stop_seconds\":2580,\"health_addr\":\"${STUB_HEALTH_ADDR:-127.0.0.1:8737}\"}" ;;
 forget)
 	p=gone
 	[ -e "$HOME/Library/LaunchAgents/` + label + `.plist" ] && p=present
@@ -844,9 +855,9 @@ func TestPlistKeys(t *testing.T) {
 	if top["ExitTimeOut"] != 2700 {
 		t.Errorf("ExitTimeOut = %v, want 2700", top["ExitTimeOut"])
 	}
-	drain := poolDefaults(t).DrainSeconds
-	if wait := installerWaitLimit(t); wait <= drain || wait < 45*60 {
-		t.Errorf("the installer waits %d s for the pool to exit; it must exceed the drain default %d s and 45 minutes", wait, drain)
+	stop := poolDefaults(t).StopSeconds
+	if wait := installerWaitLimit(t); wait <= stop || wait < 45*60 {
+		t.Errorf("the installer waits %d s for the pool to exit; it must exceed the pool's longest stop %d s and 45 minutes", wait, stop)
 	}
 }
 
@@ -876,6 +887,7 @@ func hasPathEntry(path, dir string) bool {
 
 type defaultsJSON struct {
 	DrainSeconds int    `json:"drain_seconds"`
+	StopSeconds  int    `json:"stop_seconds"`
 	HealthAddr   string `json:"health_addr"`
 }
 
@@ -1456,15 +1468,21 @@ func (b *syncBuffer) String() string {
 
 // poolProcess is the script of startPool's stand-in for a running pool: it
 // logs the SIGTERM it gets, then exits DRAIN_TICKS ticks of 20 ms later (a
-// drain), or never when DRAIN_TICKS is negative.
+// drain), or never when DRAIN_TICKS is negative. With DRAINING=1 it drains
+// without a signal, as a pool that was already asked to stop, from the
+// installer's first launchctl print on (so that it is still there when the
+// installer looks). TAG names it in the log.
 const poolProcess = `term=0
-trap 'echo "pool-process TERM" >> "$STUB_LOG"; term=1' TERM
-: > "$STUB_LOG.ready"
+trap 'echo "pool-process$TAG TERM" >> "$STUB_LOG"; term=1' TERM
+: > "$STUB_LOG.ready$TAG"
 n=0
 while :; do
+	if [ "${DRAINING:-0}" = 1 ] && [ -e "$STUB_LOG.printed" ]; then
+		term=1
+	fi
 	if [ "$term" = 1 ] && [ "$DRAIN_TICKS" -ge 0 ]; then
 		if [ "$n" -ge "$DRAIN_TICKS" ]; then
-			echo "pool-process exit" >> "$STUB_LOG"
+			echo "pool-process$TAG exit" >> "$STUB_LOG"
 			exit 0
 		fi
 		n=$((n + 1))
@@ -1479,8 +1497,20 @@ done
 // killed when the test ends.
 func (e *env) startPool(drainTicks int) {
 	e.t.Helper()
+	e.vars["STUB_POOL_PID"] = strconv.Itoa(e.startStandIn("", drainTicks, false))
+}
+
+// startStandIn starts a stand-in pool process tagged tag and returns its pid.
+func (e *env) startStandIn(tag string, drainTicks int, draining bool) int {
+	e.t.Helper()
+	ready := e.log + ".ready" + tag
+	_ = os.Remove(ready)
 	cmd := exec.Command("/bin/sh", "-c", poolProcess)
-	cmd.Env = []string{"PATH=/usr/bin:/bin", "STUB_LOG=" + e.log, "DRAIN_TICKS=" + strconv.Itoa(drainTicks)}
+	d := "0"
+	if draining {
+		d = "1"
+	}
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "STUB_LOG=" + e.log, "DRAIN_TICKS=" + strconv.Itoa(drainTicks), "DRAINING=" + d, "TAG=" + tag}
 	if err := cmd.Start(); err != nil {
 		e.t.Fatal(err)
 	}
@@ -1494,13 +1524,13 @@ func (e *env) startPool(drainTicks int) {
 		<-done
 	})
 	deadline := time.Now().Add(10 * time.Second)
-	for !exists(e.log + ".ready") {
+	for !exists(ready) {
 		if time.Now().After(deadline) {
 			e.t.Fatal("the stand-in pool did not start")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	e.vars["STUB_POOL_PID"] = strconv.Itoa(cmd.Process.Pid)
+	return cmd.Process.Pid
 }
 
 // macOS clamps a LaunchAgent's exit timeout to 60 s, so a launchctl bootout
@@ -1610,5 +1640,116 @@ func TestStopWarnsWhenLaunchdShowsNoPid(t *testing.T) {
 	}
 	if index(e.calls(), "launchctl bootout") < 0 {
 		t.Error("the agent was not booted out")
+	}
+}
+
+// poolLog writes the pool's log, so that the installer can read whether the
+// running pool was already asked to stop.
+func (e *env) poolLog(lines ...string) {
+	write(e.t, filepath.Join(e.home, "Library", "Logs", "local-ci-pool", "pool.log"), strings.Join(lines, "\n")+"\n", 0o644)
+}
+
+func startLine(pid string) string {
+	attr := ""
+	if pid != "" {
+		attr = " pid=" + pid
+	}
+	return `time=2026-10-07T10:00:00.000+02:00 level=INFO msg="pool starting"` + attr + ` machine=examplemac slots=2 instance=main runner=2.338.0 probe=false`
+}
+
+const stoppingLine = `time=2026-10-07T10:05:00.000+02:00 level=INFO msg="stopping: draining every project"`
+
+// The pool restores the default SIGTERM action after the first one, so a
+// second SIGTERM kills it mid-drain. A pool already draining (asked to stop by
+// an earlier run of the installer, or by hand) is therefore only waited for.
+// Whether it drains is read from its log: a "stopping" line after the start
+// line of this very process (by pid; a start line without a pid is v0.1.0's).
+func TestStopNeverSignalsADrainingPoolTwice(t *testing.T) {
+	for name, tc := range map[string]struct {
+		lines    func(pid string) []string
+		draining bool // the stand-in drains without a signal
+		signal   bool
+	}{
+		"this pool is draining": {func(pid string) []string {
+			return []string{startLine("1"), stoppingLine, startLine(pid), stoppingLine}
+		}, true, false},
+		"a v0.1.0 pool is draining": {func(string) []string { return []string{startLine(""), stoppingLine} }, true, false},
+		"an earlier run drained": {func(pid string) []string {
+			return []string{startLine("1"), stoppingLine, startLine(pid)}
+		}, false, true},
+		"another process's lines": {func(string) []string { return []string{startLine("1"), stoppingLine} }, false, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.placeInstalled()
+			pid := strconv.Itoa(e.startStandIn("", 15, tc.draining))
+			e.vars["STUB_POOL_PID"] = pid
+			e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "20"
+			e.poolLog(tc.lines(pid)...)
+			out, err := e.install()
+			if err != nil {
+				t.Fatalf("install failed: %v\n%s", err, out)
+			}
+			calls := e.calls()
+			if got := index(calls, "pool-process TERM") >= 0; got != tc.signal {
+				t.Fatalf("SIGTERM sent = %v, want %v; calls: %v\n%s", got, tc.signal, calls, out)
+			}
+			if exited, bootout := index(calls, "pool-process exit"), index(calls, "launchctl bootout "); exited < 0 || bootout < exited {
+				t.Errorf("want the pool's exit before the bootout; calls: %v", calls)
+			}
+			if said := strings.Contains(out, "is already draining; waiting for it to exit without signalling it again"); said == tc.signal {
+				t.Errorf("the output does not say what was done:\n%s", out)
+			}
+		})
+	}
+}
+
+// launchd reporting another pid, or none, means the process it ran is gone:
+// a pid reused by an unrelated process is not waited for, and a pool that
+// launchd restarted after a non-zero exit mid-drain is not signalled but
+// booted out with the agent.
+func TestStopTreatsAChangedPidAsExited(t *testing.T) {
+	e := newEnv(t)
+	e.placeInstalled()
+	e.vars["STUB_POOL_PID"] = strconv.Itoa(e.startStandIn("", -1, false)) // never exits
+	e.vars["STUB_NEXT_PID"] = strconv.Itoa(e.startStandIn("-restarted", -1, false))
+	e.vars["STUB_PID_PRINTS"] = "4"
+	e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "10"
+	out, err := e.install()
+	if err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	calls := e.calls()
+	if index(calls, "pool-process TERM") < 0 || index(calls, "launchctl bootout ") < index(calls, "pool-process TERM") {
+		t.Errorf("want SIGTERM to the pool, then the bootout; calls: %v", calls)
+	}
+	if index(calls, "pool-process-restarted TERM") >= 0 {
+		t.Errorf("the installer signalled the restarted pool: %v", calls)
+	}
+	if !strings.Contains(out, "the pool has exited") {
+		t.Errorf("output:\n%s", out)
+	}
+}
+
+// The minutes the dry run announces for a stop are the pool's longest stop,
+// its drain plus the work after it, rounded up.
+func TestDryRunStatesThePoolsStopBound(t *testing.T) {
+	e := newEnv(t)
+	stop := poolDefaults(t).StopSeconds
+	if stop <= 0 {
+		t.Fatalf("print-defaults reports no stop_seconds")
+	}
+	want := fmt.Sprintf("it finishes its jobs first, up to %d minutes;", (stop+59)/60)
+	for _, args := range [][]string{{"--dry-run"}, {"--uninstall", "--dry-run"}} {
+		if args[0] == "--uninstall" {
+			e.placeInstalled()
+		}
+		out, err := e.install(args...)
+		if err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+		if !strings.Contains(out, want) {
+			t.Errorf("%v: the dry run lacks %q:\n%s", args, want, out)
+		}
 	}
 }

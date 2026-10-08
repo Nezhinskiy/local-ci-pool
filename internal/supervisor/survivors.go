@@ -16,7 +16,13 @@ import (
 // and holds one of the machine's slots for it until its container dies, so the
 // machine is not oversubscribed. No scaler knows its name (runner names are
 // never reused), so the supervisor keeps the survivors itself; the exit
-// watcher and the reconcile release each one exactly once.
+// watcher and the reconcile release each one exactly once, and only a
+// survivor a slot was held for gives one back.
+//
+// A survivor's job still counts in its scale set's assigned jobs, so the
+// listener's desired count includes it and the scaler may start one idle
+// runner per survivor, within the slots left. Such a runner takes no job,
+// holds its slot like any other, and is reaped when the count drops.
 
 // sweep removes the containers a previous run of this instance left that are
 // not running (created, exited or dead), and only those. A running one is kept

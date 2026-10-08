@@ -105,15 +105,18 @@ func usageError(stderr io.Writer, msg string) int {
 }
 
 // defaults are the built-in settings the installer depends on: its wait for a
-// stopping pool must exceed the drain, and it probes the health address.
+// stopping pool must exceed the longest stop (the drain plus the work after
+// it), and it probes the health address.
 type defaults struct {
 	DrainSeconds int    `json:"drain_seconds"`
+	StopSeconds  int    `json:"stop_seconds"`
 	HealthAddr   string `json:"health_addr"`
 }
 
 func cmdPrintDefaults(stdout, stderr io.Writer) int {
 	b, err := json.Marshal(defaults{
 		DrainSeconds: int(supervisor.DefaultDrain.Seconds()),
+		StopSeconds:  int((supervisor.DefaultDrain + supervisor.DefaultAfterBound).Seconds()),
 		HealthAddr:   supervisor.DefaultHealthAddr,
 	})
 	if err != nil {

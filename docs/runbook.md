@@ -80,7 +80,9 @@ Run `./install.sh` again (or with `--version`). It stages the new files, sends t
 `SIGTERM`, waits until its jobs have finished and its process has exited (up to 46 minutes), unloads
 the agent, then renames the staged files into place and starts the new pool. If the old pool is still
 draining at the bound, the installer stops without replacing anything and says so; the pool exits once
-its drain ends and is not restarted, so run the installer again then. If anything fails after the old
+its drain ends and is not restarted, so run the installer again after it has exited (`drained` in the
+log). A run started while the pool still drains only waits for it: it never signals a draining pool
+twice. If anything fails after the old
 pool was stopped, or the installer is interrupted then, it says
 `the old pool is stopped and the new one is not running`; run it again.
 
@@ -110,10 +112,16 @@ after 462 seconds, and launchd did not restart it (`state = not running`, `last 
 installer stops the pool this way. To stop it by hand without losing a job, do the same:
 
 ```sh
-pid="$(launchctl print gui/$(id -u)/com.local-ci-pool.pool | sed -n 's/^[[:space:]]*pid = //p' | head -n 1)"
-kill -TERM "$pid"                                          # drains, then exits 0
+pid="$(launchctl print gui/$(id -u)/com.local-ci-pool.pool | awk '/^\tpid = / { print $3; exit }')"
+kill -TERM "$pid"                                          # once: drains, then exits 0
 launchctl kickstart gui/$(id -u)/com.local-ci-pool.pool    # start it again later
 ```
+
+Send `SIGTERM` only once. After the first one the pool restores the default action, so a second
+`SIGTERM` (or a Ctrl-C to a pool in a terminal) kills it at once, mid-drain. The installer reads the
+pool's log first: if the running process already logged `stopping: draining every project` (after
+its own `pool starting` line, which names its pid), it does not signal it again and only waits, so
+running `./install.sh` again while the pool drains is safe.
 
 ## Uninstall
 
@@ -207,7 +215,7 @@ tail -f ~/Library/Logs/local-ci-pool/pool.log
 |---|---|
 | `version`, `commit` | the running build |
 | `machine` | the machine name |
-| `slots`, `in_use`, `busy` | the slot limit, slots held by runners (including runners a killed previous run left running), runners running a job |
+| `slots`, `in_use`, `busy` | the slot limit; slots held by runners, including runners a killed previous run left running; runners known to be running a job, which excludes those left running |
 | `docker` | whether Docker answers |
 | `probe` | whether this is a probe run |
 | `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, and a `reason` when not healthy |

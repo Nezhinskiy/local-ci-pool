@@ -846,6 +846,9 @@ func TestDefaultsAreWhatCmdAndPlistAssume(t *testing.T) {
 	// installer's wait for the stopping pool (install_test.go checks that the
 	// wait is at least that long). launchd's ExitTimeOut does not count: macOS
 	// clamps it to 60 s.
+	if afterBound != DefaultAfterBound {
+		t.Errorf("afterBound = %v, want DefaultAfterBound %v", afterBound, DefaultAfterBound)
+	}
 	if DefaultDrain+afterBound >= 45*time.Minute {
 		t.Errorf("drain %v plus the budget after it %v reach 45m", DefaultDrain, afterBound)
 	}

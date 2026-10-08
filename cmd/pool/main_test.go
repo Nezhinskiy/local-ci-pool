@@ -192,7 +192,7 @@ func TestVersionAndCommitFlowIntoTheConfig(t *testing.T) {
 
 func TestPrintDefaults(t *testing.T) {
 	code, stdout, _ := do(t, services{}, "print-defaults")
-	want := `{"drain_seconds":2400,"health_addr":"127.0.0.1:8737"}` + "\n"
+	want := `{"drain_seconds":2400,"stop_seconds":2580,"health_addr":"127.0.0.1:8737"}` + "\n"
 	if code != 0 || stdout != want {
 		t.Fatalf("exit %d, stdout %q, want %q", code, stdout, want)
 	}

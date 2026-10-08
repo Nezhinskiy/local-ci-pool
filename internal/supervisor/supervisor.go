@@ -52,6 +52,10 @@ const (
 	// a minute later, and the next start keeps the jobs it left running
 	// (survivors.go).
 	DefaultDrain = 40 * time.Minute
+	// DefaultAfterBound is afterBound's value: the budget, as a whole, of the
+	// work after a drain. DefaultDrain plus DefaultAfterBound is the longest
+	// a stop takes, which the installer's wait and its messages assume.
+	DefaultAfterBound = 3 * time.Minute
 	// DefaultHealthAddr is where the health endpoint listens, and so the
 	// address whose binding is the single-instance lock.
 	DefaultHealthAddr = "127.0.0.1:8737"
@@ -87,7 +91,7 @@ const (
 // runners left, closing the session and deleting the scale set. Every project
 // drains at once, so the drain bound plus afterBound is the longest a stop
 // takes. A variable so tests can shorten it.
-var afterBound = 3 * time.Minute
+var afterBound = DefaultAfterBound
 
 // Config configures a Supervisor. Zero durations take their defaults.
 type Config struct {
@@ -398,7 +402,11 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	s.slots = runner.NewSlots(m.Slots)
 	s.dockerOK = true
 	s.mu.Unlock()
-	s.log.Info("pool starting", "machine", m.Name, "slots", m.Slots, "instance", instance, "runner", mount.Version, "probe", s.cfg.Probe)
+	// The pid lets the installer tell this process's lines in the shared log
+	// from an earlier run's: it must not send a second SIGTERM to a pool that
+	// is already draining (cmd/pool restores the default action after the
+	// first, so a second one kills it).
+	s.log.Info("pool starting", "pid", os.Getpid(), "machine", m.Name, "slots", m.Slots, "instance", instance, "runner", mount.Version, "probe", s.cfg.Probe)
 	s.prune(ctx)
 	if err := s.sweep(ctx); err != nil {
 		return err
@@ -666,7 +674,7 @@ func (s *Supervisor) projectList() []*project {
 // unique, so only the survivor entry or the scaler holding it releases.
 func (s *Supervisor) exited(name string) {
 	if s.releaseSurvivor(name) {
-		s.log.Info("a runner left from the previous run exited; its slot is free", "runner", name)
+		s.log.Info("a runner left from the previous run exited", "runner", name)
 		return
 	}
 	for _, sc := range s.scalers() {

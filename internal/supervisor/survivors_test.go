@@ -1,7 +1,11 @@
 package supervisor
 
 import (
+	"os"
+	"regexp"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,4 +109,60 @@ func TestMoreSurvivorsThanSlotsAreAllKept(t *testing.T) {
 	h.docker.exit(survivorA)
 	h.docker.exit(survivorB)
 	h.eventually("both survivors released", func() bool { return h.sup.Snapshot().InUse == 0 })
+}
+
+// slotless returns the survivor the pool logged as running without a slot.
+func (h *harness) slotless(names ...string) string {
+	h.t.Helper()
+	for _, line := range strings.Split(h.logs.String(), "\n") {
+		if !strings.Contains(line, "every slot is held") {
+			continue
+		}
+		for _, n := range names {
+			if strings.Contains(line, "runner="+n) {
+				return n
+			}
+		}
+	}
+	h.t.Fatalf("no survivor was logged as running without a slot")
+	return ""
+}
+
+// A survivor kept without a slot gives none back when it exits: the slot
+// held for the other survivor stays held until that one exits.
+func TestSlotlessSurvivorReleasesNothing(t *testing.T) {
+	h := newHarness(t, 1, 1, "alpha")
+	h.docker.add(survivorA, instanceLabels("main", survivorA))
+	h.docker.add(survivorB, instanceLabels("main", survivorB))
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	without := h.slotless(survivorA, survivorB)
+	with := survivorA
+	if without == survivorA {
+		with = survivorB
+	}
+	if got := h.sup.Snapshot().InUse; got != 1 {
+		t.Fatalf("in use %d, want 1", got)
+	}
+	h.docker.exit(without)
+	h.eventually("the slotless survivor's exit handled", func() bool {
+		return h.logged(`msg="a runner left from the previous run exited" runner=` + without)
+	})
+	if got := h.sup.Snapshot().InUse; got != 1 {
+		t.Fatalf("in use %d after the slotless survivor exited, want 1: it gave back a slot it never held", got)
+	}
+	h.docker.exit(with)
+	h.eventually("the slotted survivor's slot released", func() bool { return h.sup.Snapshot().InUse == 0 })
+}
+
+// The start line carries the pid, which the installer matches to tell this
+// process's "stopping" line from an earlier run's.
+func TestStartLogCarriesThePid(t *testing.T) {
+	h := newHarness(t, 1, 1000, "alpha")
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	want := regexp.MustCompile(`msg="pool starting" pid=` + strconv.Itoa(os.Getpid()) + ` `)
+	if !want.MatchString(h.logs.String()) {
+		t.Fatalf("no start line with this process's pid:\n%s", h.logs.String())
+	}
 }

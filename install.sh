@@ -33,6 +33,9 @@ DOMAIN="gui/$(id -u)"
 # "exit timeout = 60" by launchctl print on macOS 27.0.1), and SIGKILLs the
 # pool then. The knobs below exist so that the tests do not wait for real.
 WAIT_LIMIT="${LOCAL_CI_INSTALL_WAIT_LIMIT:-2760}"
+# STOP_MINUTES is the longest stop of the pool, its drain plus the work after
+# it (stop_seconds in "pool print-defaults"), rounded up; messages only.
+STOP_MINUTES=43
 WAIT_POLL="${LOCAL_CI_INSTALL_POLL:-2}"
 WAIT_PROGRESS="${LOCAL_CI_INSTALL_PROGRESS:-60}"
 HEALTH_POLL="${LOCAL_CI_INSTALL_HEALTH_POLL:-2}"
@@ -276,43 +279,100 @@ stage_plist() {
   fi
 }
 
-# agent_pid prints the pid launchd reports for the agent ("pid = N" in
-# launchctl print), or nothing when the agent is not loaded or not running. It
-# never fails: a print of an agent that is not loaded exits non-zero.
-agent_pid() {
-  launchctl print "$DOMAIN/$LABEL" 2> /dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1 || true
+# agent_print prints what launchctl print says about the agent, or nothing
+# when it is not loaded. It never fails.
+agent_print() {
+  launchctl print "$DOMAIN/$LABEL" 2> /dev/null || true
 }
 
-# stop_pool sends the running pool SIGTERM and waits until its process has
-# exited, for at most WAIT_LIMIT seconds, saying so every WAIT_PROGRESS
-# seconds. The pool then finishes its running jobs (up to 40 minutes, plus 3 to
-# clean up), deletes its scale sets and exits 0, which launchd does not restart
-# (KeepAlive SuccessfulExit=false). The signal comes from here and not from
-# launchctl bootout: launchd clamps a LaunchAgent's exit timeout to 60 s and
-# SIGKILLs a pool still draining after that, losing its running jobs.
+# pid_in prints the pid in launchctl print output $1: the service's own
+# "pid = N" line, indented by exactly one tab (nested blocks are indented
+# further). It prints nothing when there is none.
+pid_in() {
+  local tab line n
+  tab="$(printf '\t')"
+  while IFS= read -r line; do
+    case "$line" in
+      "${tab}pid = "*)
+        n="${line#"${tab}pid = "}"
+        case "$n" in
+          '' | *[!0-9]*) ;;
+          *)
+            printf '%s' "$n"
+            return 0
+            ;;
+        esac
+        ;;
+    esac
+  done <<< "$1"
+}
+
+# agent_pid prints the pid launchd reports for the agent, or nothing when the
+# agent is not loaded or not running.
+agent_pid() {
+  pid_in "$(agent_print)"
+}
+
+# already_stopping PID reports whether the pool process PID was already asked
+# to stop (by an earlier run of this script, or by hand): its log has the
+# "stopping: draining every project" line after its own "pool starting" line,
+# which names its pid. A start line without a pid (v0.1.0) counts as its own.
+# The pool restores the default action of SIGTERM after the first one, so a
+# second SIGTERM would kill it mid-drain.
+already_stopping() {
+  [ -f "$LOG_DIR/pool.log" ] || return 1
+  awk -v pid="$1" '
+    index($0, "msg=\"pool starting\"") {
+      ours = ($0 !~ / pid=[0-9]/) || ($0 ~ (" pid=" pid "( |$)"))
+      stopping = 0
+      next
+    }
+    index($0, "msg=\"stopping: draining every project\"") { stopping = 1 }
+    END { exit !(ours && stopping) }
+  ' "$LOG_DIR/pool.log"
+}
+
+# stop_pool sends the running pool SIGTERM, unless it is already draining, and
+# waits until its process has exited, for at most WAIT_LIMIT seconds, saying so
+# every WAIT_PROGRESS seconds. The pool then finishes its running jobs (up to
+# STOP_MINUTES), deletes its scale sets and exits 0, which launchd does not
+# restart (KeepAlive SuccessfulExit=false). The signal comes from here and not
+# from launchctl bootout: launchd clamps a LaunchAgent's exit timeout to 60 s
+# and SIGKILLs a pool still draining after that, losing its running jobs.
+#
+# The process counts as exited once launchd reports another pid or none, as
+# well as when it is gone: a pid reused by another process is not waited for.
+# A pool that exits non-zero mid-drain (a fatal error) is restarted by launchd
+# at once; the new process is then booted out by the next step, and the jobs
+# the old one left running are kept by the pool that starts after the install.
 stop_pool() {
-  local pid began next waited
-  pid="$(agent_pid)"
+  local out pid began next waited
+  out="$(agent_print)"
+  pid="$(pid_in "$out")"
   if [ -z "$pid" ]; then
-    if launchctl print "$DOMAIN/$LABEL" 2> /dev/null | grep -q 'state = running'; then
-      warn "launchd reports the pool running but no pid; unloading it with launchctl bootout, which gives it at most 60 s to finish its jobs"
-    else
-      say "no pool is running"
-    fi
+    case "$out" in
+      *"state = running"*) warn "launchd reports the pool running but no pid; unloading it with launchctl bootout, which gives it at most 60 s to finish its jobs" ;;
+      *) say "no pool is running" ;;
+    esac
     return 0
   fi
-  say "sending the pool (pid $pid) SIGTERM; it finishes its running jobs, then exits"
-  if ! kill -TERM "$pid" 2> /dev/null; then
-    kill -0 "$pid" 2> /dev/null || return 0 # it exited meanwhile
-    die "cannot signal the pool (pid $pid); nothing was changed"
+  if already_stopping "$pid"; then
+    say "the pool (pid $pid) is already draining; waiting for it to exit without signalling it again (a second SIGTERM would kill it)"
+  else
+    say "sending the pool (pid $pid) SIGTERM; it finishes its running jobs, then exits"
+    if ! kill -TERM "$pid" 2> /dev/null; then
+      kill -0 "$pid" 2> /dev/null || return 0 # it exited meanwhile
+      STOPPED=0 # it was not signalled, so it still runs
+      die "cannot signal the pool (pid $pid); nothing was changed"
+    fi
   fi
   began="$SECONDS"
   next="$WAIT_PROGRESS"
-  while kill -0 "$pid" 2> /dev/null; do
+  while kill -0 "$pid" 2> /dev/null && [ "$(agent_pid)" = "$pid" ]; do
     waited=$((SECONDS - began))
     if [ "$waited" -ge "$WAIT_LIMIT" ]; then
       STOPPED=0 # the pool is still running, so the "stopped" line would be false
-      die "the pool (pid $pid) is still finishing its jobs ${waited}s after it was asked to stop. Nothing was replaced or removed. It exits once its drain ends, and launchd does not restart it then (workflows fall back to hosted runners). Do not unload it with launchctl bootout, which kills it within 60 s; check $LOG_DIR/pool.log, then run this script again"
+      die "the pool (pid $pid) is still finishing its jobs ${waited}s after it was asked to stop. Nothing was replaced or removed. It exits once its drain ends, and launchd does not restart it then (workflows fall back to hosted runners). Do not signal it again or unload it with launchctl bootout: either kills it before its jobs finish. Run this script again after it has exited ('drained' in $LOG_DIR/pool.log)"
     fi
     if [ "$waited" -ge "$next" ]; then
       say "still waiting for the pool to finish its jobs and exit (${waited}s)"
@@ -472,7 +532,7 @@ install_pool() {
   if [ "$DRY" != 1 ]; then
     STOPPED=1
   fi
-  act "stop a running pool, if any: kill -TERM <the pid launchctl print reports>, then wait until it has exited (it finishes its jobs first, up to 43 minutes; gives up after $WAIT_LIMIT s and changes nothing)" stop_pool
+  act "stop a running pool, if any: kill -TERM <the pid launchctl print reports>, then wait until it has exited (it finishes its jobs first, up to $STOP_MINUTES minutes; gives up after $WAIT_LIMIT s and changes nothing)" stop_pool
   act "unload the agent: launchctl bootout $DOMAIN/$LABEL" bootout_agent
   act "wait until launchd no longer lists it (gives up after $WAIT_LIMIT s)" wait_gone
   act "wait until nothing answers on $addr (gives up after $WAIT_LIMIT s)" wait_port_free "$addr"
@@ -503,7 +563,7 @@ remove_files() {
 # and launchd has let go of it: the heartbeat dies with the process, so only
 # then does deleting the variables stick.
 uninstall_pool() {
-  act "stop the pool, if it runs: kill -TERM <the pid launchctl print reports>, then wait until it has exited (it finishes its jobs first, up to 43 minutes; gives up after $WAIT_LIMIT s and changes nothing)" stop_pool
+  act "stop the pool, if it runs: kill -TERM <the pid launchctl print reports>, then wait until it has exited (it finishes its jobs first, up to $STOP_MINUTES minutes; gives up after $WAIT_LIMIT s and changes nothing)" stop_pool
   act "unload the agent: launchctl bootout $DOMAIN/$LABEL" bootout_agent
   act "wait until launchd no longer lists it (gives up after $WAIT_LIMIT s)" wait_gone
   if [ -x "$BIN" ]; then
