@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/actions/scaleset"
 )
@@ -15,9 +16,21 @@ import (
 // namePrefix starts every runner name and container name the pool creates.
 const namePrefix = "local-ci-"
 
+// forgetTimeout bounds the best-effort unregistration of a runner that never
+// started.
+const forgetTimeout = 30 * time.Second
+
 // JITSource mints a runner's JIT configuration. *scaleset.Client satisfies it.
 type JITSource interface {
 	GenerateJitRunnerConfig(ctx context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, scaleSetID int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
+}
+
+// Registry is the part of the scale set API a Scaler uses to unregister
+// runners. *scaleset.Client satisfies it. GetRunnerByName returns nil and no
+// error when no runner has the name.
+type Registry interface {
+	GetRunnerByName(ctx context.Context, runnerName string) (*scaleset.RunnerReference, error)
+	RemoveRunner(ctx context.Context, runnerID int64) error
 }
 
 // ScalerConfig configures one scale set's Scaler.
@@ -30,6 +43,9 @@ type ScalerConfig struct {
 	// project's image, user and the runner mount.
 	Start func(ctx context.Context, name, jit string) error
 	JIT   JITSource
+	// Registry unregisters runners before they are reaped, and runners whose
+	// start failed after their JIT configuration was minted.
+	Registry Registry
 	// Docker removes reaped runners.
 	Docker ContainerRemover
 	Log    *slog.Logger
@@ -45,7 +61,7 @@ const (
 	stateIdle
 	// stateBusy: the runner reported a job.
 	stateBusy
-	// stateReaping: an idle runner whose container is being removed.
+	// stateReaping: an idle runner being unregistered and removed.
 	stateReaping
 	// stateDone: the job completed; the container is on its way out.
 	stateDone
@@ -58,6 +74,7 @@ type Scaler struct {
 	slots      *Slots
 	start      func(ctx context.Context, name, jit string) error
 	jit        JITSource
+	registry   Registry
 	docker     ContainerRemover
 	log        *slog.Logger
 
@@ -77,6 +94,7 @@ func NewScaler(cfg ScalerConfig) *Scaler {
 		slots:      cfg.Slots,
 		start:      cfg.Start,
 		jit:        cfg.JIT,
+		registry:   cfg.Registry,
 		docker:     cfg.Docker,
 		log:        log.With(slog.Int("scaleSetID", cfg.ScaleSetID)),
 		runners:    map[string]runnerState{},
@@ -153,11 +171,15 @@ func (s *Scaler) reserve(ctx context.Context, count int) (string, bool) {
 }
 
 // launch mints the runner's JIT configuration and starts its container. On
-// failure it releases the runner's slot through Exited.
+// failure it unregisters the runner if its configuration was minted, then
+// releases its slot through Exited.
 func (s *Scaler) launch(ctx context.Context, name string) bool {
-	err := s.startRunner(ctx, name)
+	minted, err := s.startRunner(ctx, name)
 	if err != nil {
 		s.log.Error("starting a runner", slog.String("runner", name), slog.String("error", err.Error()))
+		if minted {
+			s.forget(ctx, name)
+		}
 		s.Exited(name)
 		return false
 	}
@@ -171,20 +193,56 @@ func (s *Scaler) launch(ctx context.Context, name string) bool {
 	return true
 }
 
-func (s *Scaler) startRunner(ctx context.Context, name string) error {
+// startRunner reports whether the JIT configuration was minted, which
+// registers the runner on GitHub, and any error.
+func (s *Scaler) startRunner(ctx context.Context, name string) (minted bool, err error) {
 	cfg, err := s.jit.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, s.scaleSetID)
 	if err != nil {
-		return fmt.Errorf("minting the JIT configuration: %w", err)
+		return false, fmt.Errorf("minting the JIT configuration: %w", err)
 	}
 	if cfg == nil || cfg.EncodedJITConfig == "" {
-		return errors.New("minting the JIT configuration: the response is empty")
+		return true, errors.New("minting the JIT configuration: the response is empty")
 	}
-	return s.start(ctx, name, cfg.EncodedJITConfig)
+	return true, s.start(ctx, name, cfg.EncodedJITConfig)
 }
 
-// reap removes idle runners beyond count. A removed container is gone, so its
-// slot is released at once; its die event then finds nothing to release. A
-// remove that fails leaves the runner idle for the next call.
+// forget unregisters a runner that never started, so no unused registration
+// is left behind. It is best effort: a failure is logged.
+func (s *Scaler) forget(ctx context.Context, name string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), forgetTimeout)
+	defer cancel()
+	if err := s.unregister(ctx, name); err != nil {
+		s.log.Warn("unregistering a runner that did not start", slog.String("runner", name), slog.String("error", err.Error()))
+	}
+}
+
+// unregister removes the runner's registration on GitHub. A runner GitHub does
+// not know counts as unregistered. A runner that is running a job is refused
+// with an error matching scaleset.JobStillRunningError.
+func (s *Scaler) unregister(ctx context.Context, name string) error {
+	if s.registry == nil {
+		return errors.New("no runner registry is configured")
+	}
+	ref, err := s.registry.GetRunnerByName(ctx, name)
+	if err != nil {
+		return fmt.Errorf("looking up the runner: %w", err)
+	}
+	if ref == nil {
+		return nil
+	}
+	if err := s.registry.RemoveRunner(ctx, int64(ref.ID)); err != nil && !errors.Is(err, scaleset.RunnerNotFoundError) {
+		return fmt.Errorf("unregistering runner %d: %w", ref.ID, err)
+	}
+	return nil
+}
+
+// reap removes idle runners beyond count. An idle runner may already be running
+// a job, because JobStarted reaches the listener late, so each one is
+// unregistered on GitHub first: GitHub refuses that for a runner with a job,
+// and the runner is then kept and marked busy. Only an unregistered runner's
+// container is removed. A removed container is gone, so its slot is released
+// at once; its die event then finds nothing to release. Any other failure
+// leaves the runner idle for the next call.
 func (s *Scaler) reap(ctx context.Context, count int) {
 	s.mu.Lock()
 	excess := min(s.countLocked(stateStarting, stateIdle), s.activeLocked()-count)
@@ -201,17 +259,38 @@ func (s *Scaler) reap(ctx context.Context, count int) {
 	s.mu.Unlock()
 
 	for _, name := range victims {
-		if err := RemoveRunner(ctx, s.docker, name); err != nil {
-			s.log.Warn("removing an idle runner", slog.String("runner", name), slog.String("error", err.Error()))
+		err := s.unregister(ctx, name)
+		switch {
+		case errors.Is(err, scaleset.JobStillRunningError):
+			s.log.Info("idle runner is running a job; keeping it", slog.String("runner", name))
 			s.mu.Lock()
 			if st, ok := s.runners[name]; ok && st == stateReaping {
-				s.runners[name] = stateIdle
+				s.runners[name] = stateBusy
+				s.slots.SetBusy(1)
 			}
 			s.mu.Unlock()
+			continue
+		case err != nil:
+			s.log.Warn("unregistering an idle runner", slog.String("runner", name), slog.String("error", err.Error()))
+			s.keepIdle(name)
+			continue
+		}
+		if err := RemoveRunner(ctx, s.docker, name); err != nil {
+			s.log.Warn("removing an idle runner", slog.String("runner", name), slog.String("error", err.Error()))
+			s.keepIdle(name)
 			continue
 		}
 		s.log.Info("idle runner removed", slog.String("runner", name))
 		s.Exited(name)
+	}
+}
+
+// keepIdle returns a runner whose reaping failed to idle, for the next call.
+func (s *Scaler) keepIdle(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, ok := s.runners[name]; ok && st == stateReaping {
+		s.runners[name] = stateIdle
 	}
 }
 
@@ -299,4 +378,7 @@ func newName() (string, error) {
 	return namePrefix + hex.EncodeToString(b), nil
 }
 
-var _ JITSource = (*scaleset.Client)(nil)
+var (
+	_ JITSource = (*scaleset.Client)(nil)
+	_ Registry  = (*scaleset.Client)(nil)
+)

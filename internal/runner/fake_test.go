@@ -158,6 +158,73 @@ func (j *fakeJIT) GenerateJitRunnerConfig(_ context.Context, s *scaleset.RunnerS
 	return &scaleset.RunnerScaleSetJitRunnerConfig{EncodedJITConfig: "jit-for-" + s.Name}, nil
 }
 
+// fakeRegistry stands in for the scale set's runner registrations. Every
+// name is registered unless listed in missing. Lookups and removals are
+// recorded in the fake Docker's call log, so their order against container
+// removals is visible.
+type fakeRegistry struct {
+	mu        sync.Mutex
+	docker    *fakeDocker
+	ids       map[string]int
+	missing   map[string]bool
+	lookupErr error
+	removeErr func(id int64) error
+	lookups   []string
+	removed   []int64
+}
+
+func (r *fakeRegistry) GetRunnerByName(_ context.Context, name string) (*scaleset.RunnerReference, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lookups = append(r.lookups, name)
+	r.docker.record("lookup")
+	if r.lookupErr != nil {
+		return nil, r.lookupErr
+	}
+	if r.missing[name] {
+		return nil, nil
+	}
+	if r.ids == nil {
+		r.ids = map[string]int{}
+	}
+	id, ok := r.ids[name]
+	if !ok {
+		id = 100 + len(r.ids)
+		r.ids[name] = id
+	}
+	return &scaleset.RunnerReference{ID: id, Name: name}, nil
+}
+
+func (r *fakeRegistry) RemoveRunner(_ context.Context, id int64) error {
+	r.mu.Lock()
+	hook := r.removeErr
+	r.removed = append(r.removed, id)
+	r.mu.Unlock()
+	r.docker.record("unregister")
+	if hook != nil {
+		return hook(id)
+	}
+	return nil
+}
+
+func (r *fakeRegistry) idOf(name string) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return int64(r.ids[name])
+}
+
+func (r *fakeRegistry) unregistered() []int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]int64(nil), r.removed...)
+}
+
+func (r *fakeRegistry) lookedUp() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.lookups...)
+}
+
 // fakeStarter records the runners a scaler starts.
 type fakeStarter struct {
 	mu      sync.Mutex
@@ -217,20 +284,23 @@ func (l *logBuffer) logger() *slog.Logger {
 }
 
 type harness struct {
-	scaler  *Scaler
-	docker  *fakeDocker
-	jit     *fakeJIT
-	starter *fakeStarter
-	logs    *logBuffer
+	scaler   *Scaler
+	docker   *fakeDocker
+	registry *fakeRegistry
+	jit      *fakeJIT
+	starter  *fakeStarter
+	logs     *logBuffer
 }
 
 func newHarness(slots *Slots) *harness {
 	h := &harness{docker: newFakeDocker(), jit: &fakeJIT{}, starter: &fakeStarter{}, logs: &logBuffer{}}
+	h.registry = &fakeRegistry{docker: h.docker}
 	h.scaler = NewScaler(ScalerConfig{
 		ScaleSetID: 7,
 		Slots:      slots,
 		Start:      h.starter.start,
 		JIT:        h.jit,
+		Registry:   h.registry,
 		Docker:     h.docker,
 		Log:        h.logs.logger(),
 	})
