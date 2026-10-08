@@ -1,0 +1,47 @@
+name: local-ci-pool route
+description: >-
+  Choose between the local-ci-pool runners and a GitHub-hosted label from the
+  machine heartbeats stored in the repository variables.
+
+inputs:
+  vars-json:
+    description: The repository variables, serialised with toJSON(vars).
+    required: true
+  identity:
+    description: The repository identity (its name reduced to [a-z0-9-]); the local label is <identity>-local.
+    required: true
+  hosted-label:
+    description: The label to use when no machine has a fresh heartbeat.
+    required: true
+  hosted-shards:
+    description: The shard count to use when no machine has a fresh heartbeat.
+    required: true
+  mode:
+    description: "auto, or hosted to force the hosted label."
+    required: false
+    default: auto
+
+outputs:
+  label:
+    description: The label to put in runs-on, as is.
+    value: ${{ steps.route.outputs.label }}
+  shards:
+    description: How many parallel shards to run.
+    value: ${{ steps.route.outputs.shards }}
+  local:
+    description: "true when a local machine was selected, false otherwise."
+    value: ${{ steps.route.outputs.local }}
+
+runs:
+  using: composite
+  steps:
+    - id: route
+      shell: bash
+      env:
+        VARS_JSON: ${{ inputs.vars-json }}
+        IDENTITY: ${{ inputs.identity }}
+        HOSTED_LABEL: ${{ inputs.hosted-label }}
+        HOSTED_SHARDS: ${{ inputs.hosted-shards }}
+        MODE: ${{ inputs.mode }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: bash "$ACTION_PATH/route.sh"
