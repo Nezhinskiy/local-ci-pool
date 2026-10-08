@@ -254,9 +254,22 @@ func (f *fakeDocker) vanish(id string) {
 }
 
 func (f *fakeDocker) add(id string, labels map[string]string) {
+	f.addIn(id, labels, container.StateRunning)
+}
+
+// addIn adds a container in the given state.
+func (f *fakeDocker) addIn(id string, labels map[string]string, state container.ContainerState) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.containers[id] = &fakeContainer{labels: labels, state: container.StateRunning}
+	f.containers[id] = &fakeContainer{labels: labels, state: state}
+}
+
+// dieAgain sends a die event for a container once more, as Docker's replay of
+// recent events does after a resubscription.
+func (f *fakeDocker) dieAgain(id string, labels map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dieLocked(id, &fakeContainer{labels: labels})
 }
 
 // runners lists the running containers started in the image, sorted.

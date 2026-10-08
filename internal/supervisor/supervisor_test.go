@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/system"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/ghauth"
@@ -145,14 +146,14 @@ func TestDeleteLeavesTheScaleSetAtTheDrainBound(t *testing.T) {
 }
 
 // After a kill -9 the old session is stale for a while: the fake answers the
-// measured 409 twice, then opens. Only this instance's containers are swept,
-// and the stale JobStarted/JobCompleted of the previous process (one with no
-// runner name) are ignored.
+// measured 409 twice, then opens. Only this instance's finished containers are
+// swept, and the stale JobStarted/JobCompleted of the previous process (one
+// with no runner name) are ignored.
 func TestRestartAfterKillReopensSession(t *testing.T) {
 	h := newHarness(t, 2, 1000, "alpha")
 	id := h.actions.AddScaleSet(alphaSet, alphaSet, "alpha-local")
-	h.docker.add("local-ci-aaaaaaaaaaaa", instanceLabels("main", "local-ci-aaaaaaaaaaaa"))
-	h.docker.add("local-ci-bbbbbbbbbbbb", instanceLabels(probeInst, "local-ci-bbbbbbbbbbbb"))
+	h.docker.addIn("local-ci-aaaaaaaaaaaa", instanceLabels("main", "local-ci-aaaaaaaaaaaa"), container.StateExited)
+	h.docker.addIn("local-ci-bbbbbbbbbbbb", instanceLabels(probeInst, "local-ci-bbbbbbbbbbbb"), container.StateExited)
 	h.docker.add("unrelated", map[string]string{"other": "x"})
 	h.actions.SessionConflicts(2)
 	h.actions.StaleOnOpen()
@@ -443,8 +444,8 @@ func TestUnauthorizedOnceRebuildsTheClient(t *testing.T) {
 func TestProbeModeIsolation(t *testing.T) {
 	h := newHarness(t, 2, 1000, "alpha", "beta")
 	h.cfg.Probe, h.cfg.OnlyRepo, h.cfg.MarkerRef = true, alphaRepo, "probe-branch"
-	h.docker.add("local-ci-aaaaaaaaaaaa", instanceLabels("main", "local-ci-aaaaaaaaaaaa"))
-	h.docker.add("local-ci-bbbbbbbbbbbb", instanceLabels(probeInst, "local-ci-bbbbbbbbbbbb"))
+	h.docker.addIn("local-ci-aaaaaaaaaaaa", instanceLabels("main", "local-ci-aaaaaaaaaaaa"), container.StateExited)
+	h.docker.addIn("local-ci-bbbbbbbbbbbb", instanceLabels(probeInst, "local-ci-bbbbbbbbbbbb"), container.StateExited)
 	h.start()
 	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
 	if !h.sup.Snapshot().Probe {
@@ -841,10 +842,12 @@ func TestDefaultsAreWhatCmdAndPlistAssume(t *testing.T) {
 	if s.cfg.Drain != 40*time.Minute || DefaultDrain != 40*time.Minute {
 		t.Errorf("drain = %v, want 40m", s.cfg.Drain)
 	}
-	// The drain and the work after it end before launchd's ExitTimeOut
-	// (2700 s) kills the pool.
+	// The drain and the work after it end within 45 minutes, inside the
+	// installer's wait for the stopping pool (install_test.go checks that the
+	// wait is at least that long). launchd's ExitTimeOut does not count: macOS
+	// clamps it to 60 s.
 	if DefaultDrain+afterBound >= 45*time.Minute {
-		t.Errorf("drain %v plus the budget after it %v reach the launchd ExitTimeOut of 45m", DefaultDrain, afterBound)
+		t.Errorf("drain %v plus the budget after it %v reach 45m", DefaultDrain, afterBound)
 	}
 	if s.cfg.HealthAddr != "127.0.0.1:8737" || DefaultHealthAddr != "127.0.0.1:8737" {
 		t.Errorf("health address = %q, want 127.0.0.1:8737", s.cfg.HealthAddr)

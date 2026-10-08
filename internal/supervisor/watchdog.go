@@ -75,12 +75,14 @@ func (s *Supervisor) setDocker(ok bool) {
 	s.mu.Unlock()
 }
 
-// reconcileOnce compares the runners the scalers hold with this instance's
-// containers. A held runner past its start whose container is gone is
-// released: its die event was lost (a Docker restart, a failed cleanup). A
-// container no scaler holds, before or after the listing, is removed.
+// reconcileOnce compares the runners the scalers hold, and the survivors of
+// the previous run, with this instance's containers. A held runner past its
+// start, or a survivor, whose container is gone is released: its die event was
+// lost (a Docker restart, a failed cleanup). A container that is neither a
+// survivor nor held by a scaler, before or after the listing, is removed.
 func (s *Supervisor) reconcileOnce(ctx context.Context) {
 	before := s.held()
+	survivors := s.survivorNames()
 	list, err := s.listContainers(ctx)
 	if err != nil {
 		s.log.Warn("listing runner containers to reconcile", "error", err.Error())
@@ -98,9 +100,17 @@ func (s *Supervisor) reconcileOnce(ctx context.Context) {
 			h.scaler.Exited(name)
 		}
 	}
+	for name := range survivors {
+		if !live[name] && s.releaseSurvivor(name) {
+			s.log.Warn("a runner left from the previous run is gone without an exit event; releasing its slot", "runner", name)
+		}
+	}
 	after := s.held()
 	for _, c := range list {
 		name := c.Labels[runner.LabelRunner]
+		if survivors[name] {
+			continue
+		}
 		if _, ok := before[name]; ok {
 			continue
 		}

@@ -44,8 +44,13 @@ const (
 	// DefaultDrain bounds how long a stopping pool waits for its running jobs.
 	// It is not above every served job's timeout: a job still running at the
 	// bound is stopped (its container removed) on an upgrade or an uninstall,
-	// and needs a re-run. With afterBound it stays below the launchd
-	// ExitTimeOut of 45 minutes.
+	// and needs a re-run. With afterBound it stays below 45 minutes, inside
+	// the installer's wait (2760 s): install.sh sends the SIGTERM itself and
+	// waits for the process. launchd does not give it that long: macOS clamps
+	// a LaunchAgent's exit timeout to 60 s, so a stop that comes from launchd
+	// (a bootout by hand, a logout, a shutdown) kills a pool still draining
+	// a minute later, and the next start keeps the jobs it left running
+	// (survivors.go).
 	DefaultDrain = 40 * time.Minute
 	// DefaultHealthAddr is where the health endpoint listens, and so the
 	// address whose binding is the single-instance lock.
@@ -264,8 +269,11 @@ type Supervisor struct {
 	mount    runnermount.Mount
 	dockerOK bool
 	projects map[string]*project // by owner/name
-	tokenGen int
-	lastAuth time.Time
+	// survivors are the runners of a previous run still running at start, by
+	// runner name; true when one of the slots is held for it (survivors.go).
+	survivors map[string]bool
+	tokenGen  int
+	lastAuth  time.Time
 }
 
 // New returns a Supervisor; Run starts it.
@@ -295,6 +303,7 @@ func New(cfg Config, deps Deps) *Supervisor {
 		fatal:     make(chan error, 1),
 		reconcile: make(chan struct{}, 1),
 		projects:  map[string]*project{},
+		survivors: map[string]bool{},
 	}
 	if s.deps.Detect == nil {
 		s.deps.Detect = s.detect
@@ -654,8 +663,12 @@ func (s *Supervisor) projectList() []*project {
 }
 
 // exited releases the slot of a runner whose container died. Runner names are
-// unique, so only the scaler holding it releases.
+// unique, so only the survivor entry or the scaler holding it releases.
 func (s *Supervisor) exited(name string) {
+	if s.releaseSurvivor(name) {
+		s.log.Info("a runner left from the previous run exited; its slot is free", "runner", name)
+		return
+	}
 	for _, sc := range s.scalers() {
 		sc.Exited(name)
 	}
@@ -740,29 +753,6 @@ func (s *Supervisor) Snapshot() Snapshot {
 		snap.Projects = append(snap.Projects, pr.health())
 	}
 	return snap
-}
-
-// sweep removes the containers a previous run of this instance left, and
-// only those.
-func (s *Supervisor) sweep(ctx context.Context) error {
-	list, err := s.listContainers(ctx)
-	if err != nil {
-		return fmt.Errorf("sweeping orphaned runner containers: %w", err)
-	}
-	for _, c := range list {
-		if c.Labels[runner.LabelInstance] != s.instance {
-			continue
-		}
-		rctx, cancel := context.WithTimeout(ctx, callTimeout)
-		err := runner.RemoveContainer(rctx, s.deps.Docker, c.ID)
-		cancel()
-		if err != nil {
-			s.log.Warn("removing an orphaned runner container", "container", c.ID, "error", err.Error())
-			continue
-		}
-		s.log.Info("removed an orphaned runner container", "runner", c.Labels[runner.LabelRunner])
-	}
-	return nil
 }
 
 // caffeinate keeps the Mac awake while any slot is in use. JobStarted reaches

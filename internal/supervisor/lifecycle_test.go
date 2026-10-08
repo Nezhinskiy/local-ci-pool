@@ -52,7 +52,9 @@ func TestAStaleTokenRefusalCountsOnce(t *testing.T) {
 
 // A die event lost while Docker's event stream was down is found by the
 // reconcile that the resubscription asks for, long before the watchdog's
-// next tick (30 s away at wall speed).
+// next tick (30 s away at wall speed). The assigned count drops before the
+// container vanishes, so the freed slot is not taken again at once by a
+// replacement runner (which made the in-use count flicker past zero).
 func TestEventsReconnectReconciles(t *testing.T) {
 	h := newHarness(t, 2, 1, "alpha")
 	h.start()
@@ -62,6 +64,7 @@ func TestEventsReconnectReconciles(t *testing.T) {
 	h.eventually("a runner", func() bool { return len(h.docker.runners(img)) == 1 })
 	r := h.docker.runners(img)[0]
 	h.actions.Started(alphaSet, r)
+	h.actions.Assign(alphaSet, -1)
 	h.delivered(alphaSet)
 	h.docker.vanish(r)
 	h.docker.breakEvents()
