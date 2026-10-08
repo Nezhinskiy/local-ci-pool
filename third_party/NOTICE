@@ -18,6 +18,7 @@ files in the same change that adds the file:
 Adapted files so far:
 
   - internal/runner/adapter.go, adapted from examples/dockerscaleset/scaler.go
+  - internal/fakeactions/server.go, copied from internal/testserver/server.go
 
 actions/scaleset license
 ------------------------

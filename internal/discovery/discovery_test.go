@@ -195,12 +195,16 @@ func TestDiscoverSkips(t *testing.T) {
 		},
 	}
 	log, buf := testLog()
-	got, err := Discover(context.Background(), src, Options{}, log)
+	res, err := Discover(context.Background(), src, Options{}, log)
+	got := res.Projects
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 1 {
 		t.Fatalf("projects = %+v", got)
+	}
+	if len(res.Errored) != 0 {
+		t.Fatalf("errored = %v; gone, public, unmarked and invalid repositories are known skips, not errors", res.Errored)
 	}
 	p := got[0]
 	if p.Identity != "alpha" || p.Repo != "o/alpha" || p.Ref != "main" || p.Marker.Image != "x@"+digest {
@@ -240,7 +244,8 @@ func TestDiscoverReadsAtTheRecheckedDefaultBranch(t *testing.T) {
 		files:   map[string]string{"o/alpha@trunk": goodMarker},
 	}
 	log, _ := testLog()
-	got, err := Discover(context.Background(), src, Options{}, log)
+	res, err := Discover(context.Background(), src, Options{}, log)
+	got := res.Projects
 	if err != nil || len(got) != 1 || got[0].Ref != "trunk" {
 		t.Fatalf("got %+v, %v", got, err)
 	}
@@ -250,8 +255,8 @@ func TestDiscoverListingErrorReturnsNil(t *testing.T) {
 	src := &fakeSource{listErr: errors.New("boom")}
 	log, _ := testLog()
 	got, err := Discover(context.Background(), src, Options{}, log)
-	if err == nil || got != nil {
-		t.Fatalf("got %+v, %v; want nil and an error", got, err)
+	if err == nil || got.Projects != nil || got.Errored != nil {
+		t.Fatalf("got %+v, %v; want an empty result and an error", got, err)
 	}
 }
 
@@ -273,12 +278,16 @@ func TestDiscoverOneRepositoryFailingNeverAbortsTheOthers(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			log, buf := testLog()
-			got, err := Discover(context.Background(), src, Options{}, log)
+			res, err := Discover(context.Background(), src, Options{}, log)
+			got := res.Projects
 			if err != nil {
 				t.Fatalf("a per-repository failure aborted discovery: %v", err)
 			}
 			if len(got) != 1 || got[0].Repo != "o/alpha" {
 				t.Fatalf("projects = %+v, want only o/alpha", got)
+			}
+			if strings.Join(res.Errored, ",") != "o/broken" {
+				t.Fatalf("errored = %v, want o/broken: its state is unknown, not absent", res.Errored)
 			}
 			if !strings.Contains(buf.String(), "o/broken") || !strings.Contains(buf.String(), "403") {
 				t.Errorf("the skip and its reason are not logged:\n%s", buf.String())
@@ -294,9 +303,13 @@ func TestDiscoverSkipsARepoDeletedBetweenListAndRecheck(t *testing.T) {
 		files:   map[string]string{"o/alpha@main": goodMarker},
 	}
 	log, buf := testLog()
-	got, err := Discover(context.Background(), src, Options{}, log)
+	res, err := Discover(context.Background(), src, Options{}, log)
+	got := res.Projects
 	if err != nil || len(got) != 1 || got[0].Repo != "o/alpha" {
 		t.Fatalf("got %+v, %v", got, err)
+	}
+	if len(res.Errored) != 0 {
+		t.Fatalf("errored = %v; a repository gone on re-check is absent, not errored", res.Errored)
 	}
 	if !strings.Contains(buf.String(), "o/gone") {
 		t.Errorf("the skip is not logged:\n%s", buf.String())
@@ -313,7 +326,8 @@ func TestDiscoverIdentityCollisionKeepsTheFirst(t *testing.T) {
 		files:   map[string]string{a.FullName + "@main": goodMarker, b.FullName + "@main": goodMarker, sym.FullName + "@main": goodMarker},
 	}
 	log, buf := testLog()
-	got, err := Discover(context.Background(), src, Options{}, log)
+	res, err := Discover(context.Background(), src, Options{}, log)
+	got := res.Projects
 	if err != nil || len(got) != 1 || got[0].Repo != "o/Alpha_Site" {
 		t.Fatalf("got %+v, %v", got, err)
 	}
@@ -336,7 +350,8 @@ func TestProbeOptionsReadMarkerAtRef(t *testing.T) {
 		},
 	}
 	log, _ := testLog()
-	got, err := Discover(context.Background(), src, Options{OnlyRepo: "o/probe", MarkerRef: "feature/probe"}, log)
+	res, err := Discover(context.Background(), src, Options{OnlyRepo: "o/probe", MarkerRef: "feature/probe"}, log)
+	got := res.Projects
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +374,8 @@ func TestProbeOptionsStillRecheckVisibility(t *testing.T) {
 		files:   map[string]string{"o/probe@feature/probe": goodMarker},
 	}
 	log, _ := testLog()
-	got, err := Discover(context.Background(), src, Options{OnlyRepo: "o/probe", MarkerRef: "feature/probe"}, log)
+	res, err := Discover(context.Background(), src, Options{OnlyRepo: "o/probe", MarkerRef: "feature/probe"}, log)
+	got := res.Projects
 	if err != nil || len(got) != 0 {
 		t.Fatalf("got %+v, %v; a repository that turned public must not be served", got, err)
 	}
@@ -375,7 +391,8 @@ func TestProbeOnlyRepoMustBeAListedPrivateOwnedRepo(t *testing.T) {
 		files:   map[string]string{"o/elsewhere@main": goodMarker},
 	}
 	log, buf := testLog()
-	got, err := Discover(context.Background(), src, Options{OnlyRepo: "o/elsewhere"}, log)
+	res, err := Discover(context.Background(), src, Options{OnlyRepo: "o/elsewhere"}, log)
+	got := res.Projects
 	if err != nil || len(got) != 0 {
 		t.Fatalf("got %+v, %v", got, err)
 	}
@@ -390,7 +407,7 @@ func TestDiscoverNilLogger(t *testing.T) {
 		repos:   map[string]github.Repo{"o/alpha": priv("alpha")},
 		files:   map[string]string{"o/alpha@main": fmt.Sprint(goodMarker)},
 	}
-	if got, err := Discover(context.Background(), src, Options{}, nil); err != nil || len(got) != 1 {
-		t.Fatalf("got %+v, %v", got, err)
+	if res, err := Discover(context.Background(), src, Options{}, nil); err != nil || len(res.Projects) != 1 {
+		t.Fatalf("got %+v, %v", res, err)
 	}
 }

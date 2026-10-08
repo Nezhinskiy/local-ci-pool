@@ -356,3 +356,34 @@ func TestExitDuringStartIsNotResurrected(t *testing.T) {
 		t.Fatalf("in use %d idle %d, want 0 0: the runner exited while starting", slots.InUse(), h.scaler.Idle())
 	}
 }
+
+func TestHeldListsEveryRunnerHoldingASlot(t *testing.T) {
+	h := newHarness(NewSlots(3))
+	var during []HeldRunner
+	h.starter.onStart = func(string) {
+		if during == nil {
+			during = h.scaler.Held()
+		}
+	}
+	desired(t, h.scaler, 2)
+	names := h.starter.started()
+	if len(during) != 1 || !during[0].Starting {
+		t.Fatalf("Held during the first start = %+v, want that one runner marked Starting", during)
+	}
+	h.scaler.Started(names[0])
+	h.scaler.Completed(names[0])
+	got := h.scaler.Held()
+	if len(got) != 2 || got[0].Starting || got[1].Starting {
+		t.Fatalf("Held = %+v, want two runners, none starting (one done, one idle)", got)
+	}
+	want := slices.Clone(names)
+	slices.Sort(want)
+	if got[0].Name != want[0] || got[1].Name != want[1] {
+		t.Fatalf("Held = %+v, want %v", got, want)
+	}
+	h.scaler.Exited(names[0])
+	h.scaler.Exited(names[1])
+	if got := h.scaler.Held(); len(got) != 0 {
+		t.Fatalf("Held after both exits = %+v, want none", got)
+	}
+}

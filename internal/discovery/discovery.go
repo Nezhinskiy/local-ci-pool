@@ -142,20 +142,32 @@ type Options struct {
 	MarkerRef string // read the marker at this ref instead of the default branch
 }
 
+// Result is one discovery pass. Projects are the repositories to serve.
+// Errored are the repositories (owner/name) that were skipped only because a
+// call about them failed (the visibility re-check or the marker read); whether
+// they still qualify is unknown, so a caller keeps whatever it does with them
+// unchanged. A repository skipped for a known reason (gone, public, no marker,
+// an invalid marker) is in neither list.
+type Result struct {
+	Projects []Project
+	Errored  []string
+}
+
 // Discover lists the private repositories the account owns and returns the
 // ones with a valid marker. Every skip is logged with its reason, and a failure
 // on one repository (a 403 on its marker, a failed re-check) skips only that
-// repository. If the listing itself fails, Discover returns nil and the error,
-// so the caller keeps its current set.
-func Discover(ctx context.Context, src Source, opt Options, log *slog.Logger) ([]Project, error) {
+// repository and is reported in Result.Errored. If the listing itself fails,
+// Discover returns an empty Result and the error, so the caller keeps its
+// current set.
+func Discover(ctx context.Context, src Source, opt Options, log *slog.Logger) (Result, error) {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	listed, err := src.ListPrivateOwnedRepos(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("listing private repositories: %w", err)
+		return Result{}, fmt.Errorf("listing private repositories: %w", err)
 	}
-	var out []Project
+	var res Result
 	seen := map[string]string{} // identity -> repo
 	only := false
 	for _, r := range listed {
@@ -178,6 +190,7 @@ func Discover(ctx context.Context, src Source, opt Options, log *slog.Logger) ([
 		if err != nil {
 			// One repository's failure never costs the others their place.
 			log.Warn("skipping repository: the visibility re-check failed", "repo", r.FullName, "reason", err.Error())
+			res.Errored = append(res.Errored, r.FullName)
 			continue
 		}
 		if !cur.Private {
@@ -199,6 +212,7 @@ func Discover(ctx context.Context, src Source, opt Options, log *slog.Logger) ([
 		}
 		if err != nil {
 			log.Warn("skipping repository: the marker could not be read", "repo", r.FullName, "ref", ref, "reason", err.Error())
+			res.Errored = append(res.Errored, r.FullName)
 			continue
 		}
 		marker, err := ParseMarker(raw)
@@ -216,10 +230,10 @@ func Discover(ctx context.Context, src Source, opt Options, log *slog.Logger) ([
 			continue
 		}
 		seen[id] = r.FullName
-		out = append(out, Project{Identity: id, Repo: r.FullName, Ref: ref, Marker: marker})
+		res.Projects = append(res.Projects, Project{Identity: id, Repo: r.FullName, Ref: ref, Marker: marker})
 	}
 	if opt.OnlyRepo != "" && !only {
 		log.Warn("skipping repository: not among the private repositories this account owns", "repo", opt.OnlyRepo)
 	}
-	return out, nil
+	return res, nil
 }

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -412,6 +414,27 @@ func (s *Scaler) Idle() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.countLocked(stateStarting, stateIdle)
+}
+
+// HeldRunner is one runner a Scaler holds a slot for. Starting is true while
+// its container may not exist yet.
+type HeldRunner struct {
+	Name     string
+	Starting bool
+}
+
+// Held lists every runner holding a slot, in any state, sorted by name. A
+// drain waits for it to be empty; the supervisor's reconcile releases a held
+// runner that is not Starting and whose container is gone.
+func (s *Scaler) Held() []HeldRunner {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]HeldRunner, 0, len(s.runners))
+	for name, st := range s.runners {
+		out = append(out, HeldRunner{Name: name, Starting: st == stateStarting})
+	}
+	slices.SortFunc(out, func(a, b HeldRunner) int { return strings.Compare(a.Name, b.Name) })
+	return out
 }
 
 // BusyCount is the number of this scale set's runners running a job.
