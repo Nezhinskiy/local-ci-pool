@@ -3,6 +3,11 @@ name: ci
 on:
   push:
   pull_request:
+  # release.yml runs these checks on the tagged commit before it builds.
+  workflow_call:
+    secrets:
+      DENYLIST:
+        required: true
 
 permissions: {}
 
@@ -39,7 +44,7 @@ jobs:
       - name: govulncheck
         run: govulncheck ./...
       - name: shellcheck
-        run: shellcheck install.sh route/route.sh runner/entrypoint.sh
+        run: shellcheck install.sh route/route.sh runner/entrypoint.sh scripts/deny-list.sh
       - name: go test
         run: go test -race ./...
       - name: actionlint
@@ -63,86 +68,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Scan tree, file names and commit messages
+      - name: Scan tree, file names, commits (message, author, committer) and tags
         env:
           DENYLIST: ${{ secrets.DENYLIST }}
           RANGE_FROM: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           RANGE_TO: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          set -euo pipefail
-          scratch="$(mktemp -d)"
-          trap 'rm -rf "$scratch"' EXIT
-          patterns="$scratch/patterns"
-          # One fixed string per line; blank lines would match everything.
-          printf '%s\n' "$DENYLIST" | tr -d '\r' | { grep -v '^[[:space:]]*$' || [ $? -eq 1 ]; } > "$patterns"
-          if [ ! -s "$patterns" ]; then
-            echo "::error::the DENYLIST secret is empty or not available; the scan cannot run"
-            exit 1
-          fi
-
-          # Fail closed: grep exits 0 (match) or 1 (no match); any other status is
-          # a tool error and fails the job. Files are passed as arguments, so an
-          # unreadable one is grep's own exit 2 rather than a skipped redirect.
-          # Never call it in a pipeline: the exit must take the whole script down.
-          matches() {
-            local rc=0
-            grep -aFi -f "$patterns" -- "$@" > /dev/null || rc=$?
-            case "$rc" in
-              0) return 0 ;;
-              1) return 1 ;;
-              *)
-                echo "::error::grep failed with exit status $rc; the scan is not trustworthy"
-                exit 2
-                ;;
-            esac
-          }
-
-          # Matched text is never printed: the log of a public repository is public.
-          bad=0
-
-          # NUL-separated, so non-ASCII names are not octal-quoted.
-          git ls-files -z > "$scratch/files"
-          name_hits=0
-          content_hits=()
-          while IFS= read -r -d '' f; do
-            if matches <<< "$f"; then
-              name_hits=$((name_hits + 1))
-              continue
-            fi
-            if [ -L "$f" ] || [ ! -f "$f" ]; then
-              continue
-            fi
-            if matches "$f"; then
-              content_hits+=("$f")
-            fi
-          done < "$scratch/files"
-          if [ "$name_hits" -gt 0 ]; then
-            echo "::error::$name_hits tracked file name(s) match the deny-list"
-            bad=1
-          fi
-          if [ "${#content_hits[@]}" -gt 0 ]; then
-            echo "::error::file contents match the deny-list in:"
-            printf '%s\n' "${content_hits[@]}"
-            bad=1
-          fi
-
-          if [ -z "$RANGE_FROM" ] || [[ "$RANGE_FROM" =~ ^0+$ ]] || ! git cat-file -e "${RANGE_FROM}^{commit}" 2> /dev/null; then
-            range="$RANGE_TO"
-          else
-            range="$RANGE_FROM..$RANGE_TO"
-          fi
-          git rev-list "$range" > "$scratch/commits"
-          commit_hits=()
-          while read -r c; do
-            git log -1 --format=%B "$c" > "$scratch/msg"
-            if matches "$scratch/msg"; then
-              commit_hits+=("$c")
-            fi
-          done < "$scratch/commits"
-          if [ "${#commit_hits[@]}" -gt 0 ]; then
-            echo "::error::commit messages match the deny-list in:"
-            printf '%s\n' "${commit_hits[@]}"
-            bad=1
-          fi
-
-          exit "$bad"
+        run: bash scripts/deny-list.sh

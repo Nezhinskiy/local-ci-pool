@@ -8,7 +8,17 @@ on:
 permissions: {}
 
 jobs:
+  # The release is built only from a commit that passes every check a push
+  # gets: the tests, the analysis tools and the deny-list scan.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+    secrets:
+      DENYLIST: ${{ secrets.DENYLIST }}
+
   release:
+    needs: ci
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:

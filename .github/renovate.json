@@ -1,17 +1,35 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["helpers:pinGitHubActionDigests"],
-  "enabledManagers": ["gomod", "github-actions"],
+  "enabledManagers": ["gomod", "github-actions", "custom.regex"],
   "minimumReleaseAge": "3 days",
   "internalChecksFilter": "strict",
   "automerge": false,
   "dependencyDashboard": true,
+  "customManagers": [
+    {
+      "description": "The analysis tools CI installs with go install <module>/cmd/<tool>@<version>.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["go install (?<depName>[^@\\s]+?)/cmd/[^@\\s]+@(?<currentValue>v[0-9][^\\s]*)"],
+      "datasourceTemplate": "go",
+      "versioningTemplate": "semver"
+    },
+    {
+      "description": "The GoReleaser version the goreleaser-action steps run.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["distribution: goreleaser\\s+version: (?<currentValue>v[0-9][^\\s]*)"],
+      "depNameTemplate": "goreleaser/goreleaser",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    }
+  ],
   "packageRules": [
     {
       "matchManagers": ["gomod"],
       "matchPackageNames": ["github.com/actions/scaleset"],
-      "rangeStrategy": "pin",
-      "groupName": null
+      "rangeStrategy": "pin"
     },
     {
       "matchManagers": ["gomod"],
