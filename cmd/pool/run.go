@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"sort"
+	"strconv"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
+	"github.com/Nezhinskiy/local-ci-pool/internal/health"
 	"github.com/Nezhinskiy/local-ci-pool/internal/heartbeat"
 	"github.com/Nezhinskiy/local-ci-pool/internal/supervisor"
 )
@@ -121,6 +124,22 @@ func cmdPrintDefaults(stdout, stderr io.Writer) int {
 	return exitOK
 }
 
+// checkHealthAddr accepts a loopback host and a port from 1 to 65535. The
+// endpoint shows what the pool is doing and must not face the network.
+func checkHealthAddr(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("--health-addr %q is not host:port: %v", addr, err)
+	}
+	if !health.LoopbackHost(host) {
+		return fmt.Errorf("--health-addr %q: the host must be localhost or a loopback address", addr)
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("--health-addr %q: the port must be a number from 1 to 65535", addr)
+	}
+	return nil
+}
+
 func newLogger(w io.Writer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo}))
 }
@@ -142,6 +161,9 @@ func cmdRun(ctx context.Context, args []string, stderr io.Writer, svc services) 
 		return usageError(stderr, "--probe needs --only-repo")
 	case !*probe && (*onlyRepo != "" || *markerRef != ""):
 		return usageError(stderr, "--only-repo and --marker-ref belong to --probe")
+	}
+	if err := checkHealthAddr(*healthAddr); err != nil {
+		return usageError(stderr, err.Error())
 	}
 
 	log := newLogger(stderr)

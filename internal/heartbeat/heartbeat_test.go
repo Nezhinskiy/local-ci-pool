@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -18,12 +20,32 @@ import (
 	"github.com/Nezhinskiy/local-ci-pool/internal/supervisor"
 )
 
-// The routing action accepts exactly these shapes (route/route.sh); the
-// heartbeat is tested against the same expressions.
-var (
-	routeKey   = regexp.MustCompile(`^CI_POOL_HB_[A-Z0-9]{1,12}$`)
-	routeValue = regexp.MustCompile(`^[0-9]{1,12} [1-8]$`)
-)
+// The routing action accepts exactly the shapes in route/route.sh; the tests
+// take the expressions from that file, so a change there reaches this package.
+var routeKey, routeValue = routeRegexps()
+
+// routeRegexps extracts the two jq test() expressions of route.sh (written as
+// \\A...\\z inside a jq string) and returns them as anchored Go expressions.
+func routeRegexps() (key, value *regexp.Regexp) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "route", "route.sh"))
+	if err != nil {
+		panic(err)
+	}
+	re := regexp.MustCompile(`test\("\\\\A(.+?)\\\\z"\)`)
+	for _, m := range re.FindAllStringSubmatch(string(b), -1) {
+		x := regexp.MustCompile("^" + m[1] + "$")
+		switch {
+		case strings.HasPrefix(m[1], "CI_POOL_HB_"):
+			key = x
+		case strings.HasPrefix(m[1], "[0-9]"):
+			value = x
+		}
+	}
+	if key == nil || value == nil {
+		panic("route/route.sh: the heartbeat key and value expressions were not found")
+	}
+	return key, value
+}
 
 type write struct{ repo, name, value string }
 

@@ -35,15 +35,21 @@ docker info
 
 Run `./install.sh --dry-run` first if you want to see what it would do. The installer:
 
-1. checks `gh auth status`, `docker info` and the slot count, and picks the archive for this Mac
-   (`arm64` or `x86_64`);
-2. downloads the release archive with `gh release download` and runs `gh attestation verify` on it.
-   If the verification fails, nothing is installed;
-3. places the binary at `~/Library/Application Support/local-ci-pool/bin/pool`;
-4. renders `~/Library/LaunchAgents/com.local-ci-pool.pool.plist` (logs go to
-   `~/Library/Logs/local-ci-pool/pool.log`);
-5. runs `launchctl bootout gui/$UID/com.local-ci-pool.pool`, which waits for a running pool to finish
-   its jobs (up to 45 minutes), and then `launchctl bootstrap`.
+1. refuses to run as root, checks `gh auth status`, `docker info` and the slot count, and picks the
+   archive for this Mac: `arm64` on any Apple Silicon Mac (even from a shell under Rosetta), `amd64`
+   on an Intel Mac;
+2. downloads the release archive with `gh release download` and runs `gh attestation verify` on it,
+   requiring that it was signed by this repository's `release.yml` workflow for the very tag it
+   downloaded. If the verification fails, nothing is installed;
+3. runs `launchctl bootout gui/$UID/com.local-ci-pool.pool` and then polls `launchctl print` until
+   launchd no longer lists the agent. The pool finishes its running jobs first (up to 45 minutes,
+   the plist's `ExitTimeOut`), and the installer prints a line every minute while it waits. It does
+   not trust `bootout` to block: if the agent is still there after 46 minutes it stops and changes
+   nothing;
+4. places the binary at `~/Library/Application Support/local-ci-pool/bin/pool`;
+5. renders `~/Library/LaunchAgents/com.local-ci-pool.pool.plist`, checks it with `plutil -lint`
+   before moving it into place (logs go to `~/Library/Logs/local-ci-pool/pool.log`);
+6. runs `launchctl bootstrap` (retried a few times) and waits for `/healthz`.
 
 It writes no configuration. The pool keeps derived state only: its git mirrors under
 `~/Library/Caches/local-ci-pool`, and the Docker images `local-ci/runner:<version>` and
@@ -56,8 +62,9 @@ installer again (or `launchctl kickstart gui/$UID/com.local-ci-pool.pool`).
 
 ## Upgrade
 
-Run `./install.sh` again (or with `--version`). It replaces the binary and the plist, stops the old
-pool after its jobs have finished, and starts the new one. A restarted pool may wait 21 to 39 seconds
+Run `./install.sh` again (or with `--version`). It stops the old pool, waits until its jobs have
+finished and launchd has let go of it (up to 46 minutes), then replaces the binary and the plist and
+starts the new one. A restarted pool may wait 21 to 39 seconds
 for its previous session to expire: a `409` on opening the session is retried for up to 3 minutes. A
 `409` beyond that means another pool, or another Mac with the same machine name, holds the scale set,
 and the pool exits (terminal).
@@ -68,8 +75,10 @@ and the pool exits (terminal).
 ./install.sh --uninstall
 ```
 
-It runs `pool forget` (deletes `CI_POOL_HB_<MACHINE>` from every repository the pool serves; other
-Macs' variables are never touched), stops the pool, and removes the plist and the binary. Workflows
+It stops the pool and waits until launchd has let go of it (the running jobs finish first), then runs
+`pool forget` (deletes `CI_POOL_HB_<MACHINE>` from every repository the pool serves; other Macs'
+variables are never touched), then removes the plist and the binary. The order matters: the heartbeat
+dies with the process, so a variable deleted before the pool is gone could be written again. Workflows
 fall back to hosted runners within five minutes, since a heartbeat is fresh for no longer than that.
 Logs, the cache and the Docker images stay; delete them by hand if you want the space back.
 
@@ -123,7 +132,7 @@ tail -f ~/Library/Logs/local-ci-pool/pool.log
 | `probe` | whether this is a probe run |
 | `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, and a `reason` when not healthy |
 
-The endpoint binds `127.0.0.1:8737`. Binding it is also the single-instance lock: a second pool on the
+The endpoint binds `127.0.0.1:8737` and answers only requests whose `Host` is a loopback name. Binding it is also the single-instance lock: a second pool on the
 same Mac exits with `terminal: already running`. The log is not rotated; stop the pool and delete the
 file when it grows large.
 
@@ -134,15 +143,17 @@ after about five minutes. With no other Mac, the run waits; see [stranded runs](
 
 Probe mode serves one repository under `probe-` names, writes no heartbeat, and so cannot attract the
 real workflows. Use it to try a project before opting it in (commit the marker on a branch and read it
-there):
+there). The installed binary is not on your PATH, so give its full path:
 
 ```sh
-pool run --probe --only-repo OWNER/NAME --marker-ref my-branch
+"$HOME/Library/Application Support/local-ci-pool/bin/pool" run --probe --only-repo OWNER/NAME --marker-ref my-branch
 ```
 
-Stop the installed pool first, or add `--health-addr 127.0.0.1:8738` to run alongside it: the default
-address is the single-instance lock. `--marker-ref` is optional; without it the marker is read from
-the default branch.
+Stop the installed pool first (`launchctl bootout gui/$(id -u)/com.local-ci-pool.pool`, and
+`./install.sh` afterwards to load it again). A second pool beside the installed one would count the
+same Docker memory twice and oversubscribe it, and the default health address is the single-instance
+lock, so it would not start anyway. (`--health-addr` can move the endpoint, but only to a loopback
+address.) `--marker-ref` is optional; without it the marker is read from the default branch.
 
 ## Stranded runs
 

@@ -12,6 +12,9 @@
 # macOS ships bash 3.2, so this script avoids newer bash features.
 set -euo pipefail
 
+# sysctl lives in /usr/sbin, which a plain user PATH may lack.
+PATH="$PATH:/usr/sbin:/sbin"
+
 REPO="Nezhinskiy/local-ci-pool"
 LABEL="com.local-ci-pool.pool"
 
@@ -21,6 +24,13 @@ BIN="$BIN_DIR/pool"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/local-ci-pool"
 DOMAIN="gui/$(id -u)"
+
+# The launchd ExitTimeOut of the agent is 2700 s; after a bootout the installer
+# waits that long plus a margin for launchd to report the agent gone. The
+# three knobs below exist so that the tests do not wait for real.
+WAIT_LIMIT="${LOCAL_CI_INSTALL_WAIT_LIMIT:-2760}"
+WAIT_POLL="${LOCAL_CI_INSTALL_POLL:-2}"
+WAIT_PROGRESS="${LOCAL_CI_INSTALL_PROGRESS:-60}"
 
 DRY=0
 UNINSTALL=0
@@ -94,6 +104,9 @@ parse_args() {
   if [ "$UNINSTALL" = 1 ] && [ -n "$VERSION" ]; then
     die "--version does not apply to --uninstall"
   fi
+  if [ "$(id -u)" = 0 ]; then
+    die "do not run this as root: the pool is a per-user launchd agent (gui/<uid>) and uses your gh login"
+  fi
 }
 
 # machine_name prints the name the pool derives from LocalHostName: lower case,
@@ -145,24 +158,33 @@ check_prerequisites() {
   fi
   say "machine: $MACHINE ($SLOTS slots; heartbeat variable CI_POOL_HB_$(printf '%s' "$MACHINE" | tr '[:lower:]' '[:upper:]'))"
 
-  case "$(uname -m)" in
-    arm64) ARCH=arm64 ;;
-    x86_64) ARCH=amd64 ;;
-    *) die "unsupported architecture '$(uname -m)'; releases exist for arm64 and x86_64" ;;
-  esac
+  # uname -m says x86_64 in a shell running under Rosetta on Apple Silicon;
+  # hw.optional.arm64 is 1 on every Apple Silicon Mac, whatever the shell.
+  if [ "$(sysctl -n hw.optional.arm64 2> /dev/null || true)" = 1 ]; then
+    ARCH=arm64
+  else
+    case "$(uname -m)" in
+      arm64) ARCH=arm64 ;;
+      x86_64) ARCH=amd64 ;;
+      *) die "unsupported architecture '$(uname -m)'; releases exist for arm64 and x86_64" ;;
+    esac
+  fi
 }
 
 # fetch downloads the release archive for this architecture, verifies its
 # provenance and unpacks it into $TMP/x. Nothing outside $TMP is touched.
 fetch() {
   TMP="$(mktemp -d)"
-  local what="${VERSION:-the latest release}"
-  say "downloading $what for darwin_$ARCH"
-  if [ -n "$VERSION" ]; then
-    gh release download "$VERSION" --repo "$REPO" --pattern "*darwin_${ARCH}*" --dir "$TMP/dl"
-  else
-    gh release download --repo "$REPO" --pattern "*darwin_${ARCH}*" --dir "$TMP/dl"
+  if [ -z "$VERSION" ]; then
+    # Name the release once, so that the download and the provenance check
+    # below are about the same tag.
+    VERSION="$(gh release view --repo "$REPO" --json tagName --jq .tagName)" || die "cannot find the latest release of $REPO"
+    if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+      die "the latest release is called '$VERSION', which is not a version tag"
+    fi
   fi
+  say "downloading $VERSION for darwin_$ARCH"
+  gh release download "$VERSION" --repo "$REPO" --pattern "*darwin_${ARCH}*" --dir "$TMP/dl"
   set -- "$TMP"/dl/*darwin_"${ARCH}"*
   if [ $# -ne 1 ] || [ ! -f "$1" ]; then
     die "expected exactly one darwin_$ARCH archive in the release"
@@ -170,7 +192,11 @@ fetch() {
   local archive="$1"
 
   say "verifying the build provenance of $(basename "$archive")"
-  if ! gh attestation verify "$archive" --repo "$REPO"; then
+  # The archive must come from this repository's release workflow, run for
+  # this very tag.
+  if ! gh attestation verify "$archive" --repo "$REPO" \
+    --signer-workflow "$REPO/.github/workflows/release.yml" \
+    --source-ref "refs/tags/$VERSION"; then
     die "the attestation of $(basename "$archive") did not verify; nothing was installed"
   fi
 
@@ -200,16 +226,48 @@ render_plist() {
     -e "s|@LOG_DIR@|$(xml_sed_escape "$LOG_DIR")|g" \
     "$TMP/x/launchd/$LABEL.plist.tmpl" > "$PLIST.new"
   chmod 0644 "$PLIST.new"
+  if command -v plutil > /dev/null 2>&1 && ! plutil -lint "$PLIST.new" > /dev/null; then
+    rm -f "$PLIST.new"
+    die "the rendered agent is not a valid property list; $PLIST was not changed"
+  fi
   mv -f "$PLIST.new" "$PLIST"
-  if command -v plutil > /dev/null 2>&1; then
-    plutil -lint "$PLIST" > /dev/null || die "the rendered $PLIST is not a valid property list"
+}
+
+# bootout_agent asks launchd to unload the agent. It does not rely on the call
+# to wait for the pool's drain: launchd may answer at once ("Operation now in
+# progress", "Input/output error") while the pool is still finishing jobs, so
+# wait_gone is what decides. "Not loaded" is the normal case on a first install.
+bootout_agent() {
+  local err
+  if ! err="$(launchctl bootout "$DOMAIN/$LABEL" 2>&1)"; then
+    case "$err" in
+      *"No such process"* | *"Could not find"*) ;;
+      *) warn "launchctl bootout: $err" ;;
+    esac
   fi
 }
 
-# restart_agent stops a running pool (bootout waits for its drain, which can
-# take up to the plist's ExitTimeOut) and loads the agent again.
-restart_agent() {
-  launchctl bootout "$DOMAIN/$LABEL" 2> /dev/null || true
+# wait_gone polls launchd until it no longer knows the agent, for at most
+# WAIT_LIMIT seconds (the plist's ExitTimeOut plus a margin), and says so every
+# WAIT_PROGRESS seconds. A pool draining its jobs takes up to 40 minutes.
+wait_gone() {
+  local began="$SECONDS" next="$WAIT_PROGRESS" waited
+  while launchctl print "$DOMAIN/$LABEL" > /dev/null 2>&1; do
+    waited=$((SECONDS - began))
+    if [ "$waited" -ge "$WAIT_LIMIT" ]; then
+      die "launchd still has $DOMAIN/$LABEL after ${waited}s; nothing else was changed. Check 'launchctl print $DOMAIN/$LABEL' and $LOG_DIR/pool.log, then run this again"
+    fi
+    if [ "$waited" -ge "$next" ]; then
+      say "still waiting for the pool to finish its jobs and exit (${waited}s)"
+      next=$((next + WAIT_PROGRESS))
+    fi
+    sleep "$WAIT_POLL"
+  done
+}
+
+# bootstrap_agent loads the agent. A short retry covers launchd still tearing
+# the old job down after it stopped being visible.
+bootstrap_agent() {
   local attempt=0
   until launchctl bootstrap "$DOMAIN" "$PLIST"; do
     attempt=$((attempt + 1))
@@ -222,10 +280,17 @@ restart_agent() {
 
 # wait_healthy reports whether the pool answers. A first start downloads the
 # runner and builds images, so a slow answer is not a failure.
-wait_healthy() {
+# health_addr prints the address the pool serves /healthz on, as the given
+# pool binary reports it.
+health_addr() {
   local addr
-  addr="$("$BIN" print-defaults 2> /dev/null | sed -n 's/.*"health_addr":"\([^"]*\)".*/\1/p')"
-  addr="${addr:-127.0.0.1:8737}"
+  addr="$("$1" print-defaults 2> /dev/null | sed -n 's/.*"health_addr":"\([^"]*\)".*/\1/p')"
+  [ -n "$addr" ] || die "cannot read the health address from '$1 print-defaults'"
+  printf '%s' "$addr"
+}
+
+wait_healthy() {
+  local addr="$1"
   for _ in $(seq 1 30); do
     if curl -fsS --max-time 2 "http://$addr/healthz" > /dev/null 2>&1; then
       say "the pool answers on http://$addr/healthz"
@@ -239,13 +304,20 @@ wait_healthy() {
 install_pool() {
   check_prerequisites
   fetch
+  # Stop the old pool first and let it finish: nothing is replaced under a
+  # pool that is still draining, and a pool that never leaves is reported
+  # with the old install untouched.
+  act "unload a running pool, if any: launchctl bootout $DOMAIN/$LABEL" bootout_agent
+  act "wait until launchd no longer lists it (the pool finishes its jobs first, up to 45 minutes; gives up after $WAIT_LIMIT s)" wait_gone
   act "place the binary at $BIN" place_binary
   act "render the launchd agent at $PLIST (logs in $LOG_DIR)" render_plist
-  act "stop a running pool, if any (waits for its jobs, up to 45 minutes), then load $DOMAIN/$LABEL" restart_agent
+  act "load the agent: launchctl bootstrap $DOMAIN $PLIST" bootstrap_agent
+  local addr
+  addr="$(health_addr "$TMP/x/pool")"
   if [ "$DRY" = 1 ]; then
-    say "would: wait for http://127.0.0.1:8737/healthz"
+    say "would: wait for http://$addr/healthz"
   else
-    wait_healthy
+    wait_healthy "$addr"
   fi
 }
 
@@ -255,22 +327,22 @@ forget_heartbeats() {
   fi
 }
 
-stop_agent() {
-  launchctl bootout "$DOMAIN/$LABEL" 2> /dev/null || true
-}
-
 remove_files() {
   rm -f "$PLIST" "$BIN" "$BIN.new"
   rmdir "$BIN_DIR" "$SUPPORT_DIR" 2> /dev/null || true
 }
 
+# uninstall_pool stops the pool first and waits until launchd has let go of
+# it: the heartbeat dies with the process, so only then does deleting the
+# variables stick.
 uninstall_pool() {
+  act "unload the pool: launchctl bootout $DOMAIN/$LABEL" bootout_agent
+  act "wait until launchd no longer lists it (the pool finishes its jobs first, up to 45 minutes; gives up after $WAIT_LIMIT s)" wait_gone
   if [ -x "$BIN" ]; then
     act "delete this Mac's heartbeat variables ($BIN forget)" forget_heartbeats
   else
     warn "no binary at $BIN; skipping the heartbeat cleanup (the variables go stale within five minutes)"
   fi
-  act "stop the pool (waits for its jobs, up to 45 minutes) and unload $DOMAIN/$LABEL" stop_agent
   act "remove $PLIST and $BIN" remove_files
   say "left in place: logs in $LOG_DIR and the cache in $HOME/Library/Caches/local-ci-pool"
 }

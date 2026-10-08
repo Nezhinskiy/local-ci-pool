@@ -29,7 +29,7 @@ func sample() supervisor.Snapshot {
 func get(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+	h.ServeHTTP(rec, httptest.NewRequest(method, "http://127.0.0.1:8737"+path, nil))
 	return rec
 }
 
@@ -139,5 +139,46 @@ func TestServeAnswersOnTheListenerAndStopsWithContext(t *testing.T) {
 	}
 	if _, err := http.Get(url); err == nil {
 		t.Fatal("the endpoint still answers after Serve returned")
+	}
+}
+
+func TestHealthzRefusesANonLoopbackHost(t *testing.T) {
+	h := Handler(func() supervisor.Snapshot { return sample() })
+	for host, want := range map[string]int{
+		"127.0.0.1:8737":              http.StatusOK,
+		"127.0.0.1":                   http.StatusOK,
+		"localhost:8737":              http.StatusOK,
+		"LOCALHOST:8737":              http.StatusOK,
+		"[::1]:8737":                  http.StatusOK,
+		"[::1]":                       http.StatusOK,
+		"127.1.2.3:8737":              http.StatusOK,
+		"rebind.example":              http.StatusForbidden,
+		"rebind.example:80":           http.StatusForbidden,
+		"192.168.1.20:8737":           http.StatusForbidden,
+		"0.0.0.0:8737":                http.StatusForbidden,
+		"localhost.evil.example:8737": http.StatusForbidden,
+		"":                            http.StatusForbidden,
+	} {
+		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8737/healthz", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Errorf("Host %q = %d, want %d", host, rec.Code, want)
+		}
+		if want == http.StatusForbidden && strings.Contains(rec.Body.String(), "examplemac") {
+			t.Errorf("Host %q was refused but the body still leaked the snapshot", host)
+		}
+	}
+}
+
+func TestLoopbackHost(t *testing.T) {
+	for host, want := range map[string]bool{
+		"localhost": true, "127.0.0.1": true, "::1": true, "127.5.5.5": true,
+		"0.0.0.0": false, "": false, "example.com": false, "10.0.0.1": false, "::": false,
+	} {
+		if got := LoopbackHost(host); got != want {
+			t.Errorf("LoopbackHost(%q) = %v, want %v", host, got, want)
+		}
 	}
 }

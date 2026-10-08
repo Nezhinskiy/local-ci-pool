@@ -249,3 +249,34 @@ func TestRealWiringSecondInstanceExitsZero(t *testing.T) {
 		t.Fatalf("exit %d, stderr %q; want 0 and terminal: already running", code, stderr)
 	}
 }
+
+func TestHealthAddrMustBeLoopback(t *testing.T) {
+	for _, addr := range []string{
+		"0.0.0.0:8737", ":8737", "192.168.1.20:8737", "example.com:8737", "[::]:8737",
+		"127.0.0.1", "127.0.0.1:0", "127.0.0.1:99999", "127.0.0.1:http", "localhost.evil.example:80",
+	} {
+		t.Run("refuses "+addr, func(t *testing.T) {
+			p := newFakePool()
+			p.runErr = terminalErr("stop")
+			code, _, stderr := do(t, poolServices(p, &recVars{}), "run", "--health-addr", addr)
+			if code != 2 || !strings.Contains(stderr, "--health-addr") {
+				t.Fatalf("exit %d, stderr %q; want a usage error naming --health-addr", code, stderr)
+			}
+			if p.cfg.HealthAddr != "" {
+				t.Fatalf("the pool was built with %q", p.cfg.HealthAddr)
+			}
+		})
+	}
+	for _, addr := range []string{"127.0.0.1:8738", "localhost:8738", "[::1]:8738", "127.0.0.2:1"} {
+		t.Run("accepts "+addr, func(t *testing.T) {
+			p := newFakePool()
+			p.runErr = terminalErr("stop")
+			if code, _, stderr := do(t, poolServices(p, &recVars{}), "run", "--health-addr", addr); code != 0 {
+				t.Fatalf("exit %d, stderr %q", code, stderr)
+			}
+			if p.cfg.HealthAddr != addr {
+				t.Fatalf("health address = %q, want %q", p.cfg.HealthAddr, addr)
+			}
+		})
+	}
+}

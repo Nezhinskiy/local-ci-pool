@@ -20,6 +20,9 @@ import (
 // directory, so nothing is written under the real ~/Library, and no test
 // reaches the real launchctl.
 
+// stubUID is what the stub id prints: not 0, whoever runs the tests.
+const stubUID = "501"
+
 const (
 	label        = "com.local-ci-pool.pool"
 	templateName = label + ".plist.tmpl"
@@ -32,6 +35,7 @@ var stubScripts = map[string]string{
 echo "gh $*" >> "$STUB_LOG"
 case "$1 $2" in
 "auth status") exit "${STUB_GH_AUTH_EXIT:-0}" ;;
+"release view") echo "${STUB_LATEST:-v0.1.0}"; exit 0 ;;
 "release download")
 	dir=""; pattern=""
 	while [ $# -gt 0 ]; do
@@ -61,12 +65,25 @@ echo "${STUB_DOCKER_INFO:-19327352832 10}"
 `,
 	"launchctl": `#!/bin/sh
 echo "launchctl $*" >> "$STUB_LOG"
-if [ "$1" = bootout ]; then
-	b=gone; p=gone
-	[ -e "$HOME/Library/Application Support/local-ci-pool/bin/pool" ] && b=present
-	[ -e "$HOME/Library/LaunchAgents/` + label + `.plist" ] && p=present
+b=gone; p=gone
+[ -e "$HOME/Library/Application Support/local-ci-pool/bin/pool" ] && b=present
+[ -e "$HOME/Library/LaunchAgents/` + label + `.plist" ] && p=present
+case "$1" in
+bootout)
 	echo "at-bootout binary=$b plist=$p" >> "$STUB_LOG"
-fi
+	[ -z "$STUB_BOOTOUT_MSG" ] || echo "$STUB_BOOTOUT_MSG" >&2
+	exit "${STUB_BOOTOUT_EXIT:-0}" ;;
+print)
+	# The agent stays visible for STUB_PRINT_SUCCESSES calls, then is gone.
+	echo "at-print binary=$b" >> "$STUB_LOG"
+	f="$STUB_LOG.print"
+	n=$(cat "$f" 2>/dev/null || echo "${STUB_PRINT_SUCCESSES:-0}")
+	if [ "$n" -gt 0 ]; then echo $((n - 1)) > "$f"; exit 0; fi
+	echo 0 > "$f"
+	exit 113 ;;
+bootstrap)
+	echo "at-bootstrap binary=$b plist=$p" >> "$STUB_LOG" ;;
+esac
 exit 0
 `,
 	"curl": `#!/bin/sh
@@ -76,6 +93,20 @@ echo '{"slots":4,"projects":[]}'
 	"scutil": `#!/bin/sh
 echo "scutil $*" >> "$STUB_LOG"
 echo "${STUB_HOST:-Example-MacBook}"
+`,
+	"plutil": `#!/bin/sh
+echo "plutil $*" >> "$STUB_LOG"
+exit "${STUB_PLUTIL_EXIT:-0}"
+`,
+	"sysctl": `#!/bin/sh
+echo "sysctl $*" >> "$STUB_LOG"
+echo "${STUB_ARM64:-0}"
+`,
+	"id": `#!/bin/sh
+case "$1" in
+-u) echo "${STUB_UID:-501}" ;;
+*) /usr/bin/id "$@" ;;
+esac
 `,
 	"uname": `#!/bin/sh
 case "$1" in
@@ -91,8 +122,12 @@ const stubPool = `#!/bin/sh
 echo "pool $*" >> "$STUB_LOG"
 case "$1" in
 version) echo "v0.1.0 abc1234" ;;
-print-defaults) echo '{"drain_seconds":2400,"health_addr":"127.0.0.1:8737"}' ;;
-forget) exit "${STUB_FORGET_EXIT:-0}" ;;
+print-defaults) echo "{\"drain_seconds\":2400,\"health_addr\":\"${STUB_HEALTH_ADDR:-127.0.0.1:8737}\"}" ;;
+forget)
+	p=gone
+	[ -e "$HOME/Library/LaunchAgents/` + label + `.plist" ] && p=present
+	echo "at-forget plist=$p" >> "$STUB_LOG"
+	exit "${STUB_FORGET_EXIT:-0}" ;;
 esac
 `
 
@@ -166,6 +201,7 @@ func (e *env) install(args ...string) (string, error) {
 		"PATH=" + e.stubs + ":/usr/bin:/bin",
 		"STUB_LOG=" + e.log,
 		"STUB_ARCHIVE_SRC=" + e.archive,
+		"LOCAL_CI_INSTALL_POLL=0.05",
 		"TMPDIR=" + e.t.TempDir(),
 	}
 	for k, v := range e.vars {
@@ -219,6 +255,15 @@ func TestInstallDryRunVerifiesAttestation(t *testing.T) {
 	if !strings.Contains(strings.Join(calls, "\n"), "--repo Nezhinskiy/local-ci-pool") {
 		t.Errorf("verify is not pinned to this repository: %v", calls)
 	}
+	verify := calls[index(calls, "gh attestation verify ")]
+	for _, want := range []string{
+		"--signer-workflow Nezhinskiy/local-ci-pool/.github/workflows/release.yml",
+		"--source-ref refs/tags/v0.1.0",
+	} {
+		if !strings.Contains(verify, want) {
+			t.Errorf("the provenance check lacks %q: %s", want, verify)
+		}
+	}
 	if index(calls, "gh release download ") > index(calls, "gh attestation verify ") {
 		t.Errorf("the release was verified before it was downloaded: %v", calls)
 	}
@@ -233,7 +278,11 @@ func TestInstallDryRunVerifiesAttestation(t *testing.T) {
 	if exists(filepath.Join(e.home, "Library")) {
 		t.Errorf("a dry run placed files under %s/Library", e.home)
 	}
-	for _, want := range []string{"would: place the binary", "would: render the launchd agent", "would: stop a running pool"} {
+	for _, want := range []string{
+		"would: unload a running pool", "would: wait until launchd no longer lists it",
+		"would: place the binary", "would: render the launchd agent", "would: load the agent",
+		"would: wait for http://127.0.0.1:8737/healthz",
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the dry run does not announce %q:\n%s", want, out)
 		}
@@ -279,7 +328,7 @@ func TestInstallVerifiesBeforePlacingAndLoadsTheAgent(t *testing.T) {
 	if !strings.Contains(strings.Join(calls, "\n"), "gh release download v0.1.0 --repo Nezhinskiy/local-ci-pool") {
 		t.Errorf("the requested version was not downloaded: %v", calls)
 	}
-	uid := strconv.Itoa(os.Getuid())
+	uid := stubUID
 	bootout := index(calls, "launchctl bootout gui/"+uid+"/"+label)
 	bootstrap := index(calls, "launchctl bootstrap gui/"+uid+" "+e.plistPath())
 	if bootout < 0 || bootstrap < bootout {
@@ -456,22 +505,35 @@ func (e *env) placeInstalled() {
 	write(e.t, e.plistPath(), "<plist/>\n", 0o644)
 }
 
-func TestUninstallForgetsThenBootsOut(t *testing.T) {
+func TestUninstallBootsOutWaitsThenForgets(t *testing.T) {
 	e := newEnv(t)
 	e.placeInstalled()
+	e.vars["STUB_PRINT_SUCCESSES"] = "2"
 	out, err := e.install("--uninstall")
 	if err != nil {
 		t.Fatalf("uninstall failed: %v\n%s", err, out)
 	}
 	calls := e.calls()
+	bootout := index(calls, "launchctl bootout gui/"+stubUID+"/"+label)
 	forget := index(calls, "pool forget")
-	bootout := index(calls, "launchctl bootout gui/"+strconv.Itoa(os.Getuid())+"/"+label)
-	if forget < 0 || bootout < 0 || forget > bootout {
-		t.Fatalf("want pool forget, then bootout; calls: %v", calls)
+	if bootout < 0 || forget < 0 || bootout > forget {
+		t.Fatalf("want bootout, then pool forget; calls: %v", calls)
 	}
-	// At bootout the files are still there; the removals come after it.
-	if at := index(calls, "at-bootout "); at < 0 || calls[at] != "at-bootout binary=present plist=present" {
-		t.Errorf("the files were removed before the pool was stopped: %v", calls)
+	// The heartbeat dies with the process, so the variable is deleted only
+	// after launchd has let go of the pool: every print is before the forget,
+	// and there are 2 that still see the agent plus the one that does not.
+	prints := 0
+	for _, c := range calls[bootout:forget] {
+		if strings.HasPrefix(c, "launchctl print gui/"+stubUID+"/"+label) {
+			prints++
+		}
+	}
+	if prints != 3 {
+		t.Errorf("%d launchctl print calls between bootout and forget, want 3: %v", prints, calls)
+	}
+	// Nothing is removed before the forget has run.
+	if at := index(calls, "at-forget "); at < 0 || calls[at] != "at-forget plist=present" {
+		t.Errorf("the plist was removed before the forget: %v", calls)
 	}
 	if exists(e.binPath()) || exists(e.plistPath()) {
 		t.Errorf("binary %v, plist %v still exist", exists(e.binPath()), exists(e.plistPath()))
@@ -480,6 +542,21 @@ func TestUninstallForgetsThenBootsOut(t *testing.T) {
 		if strings.HasPrefix(c, "gh ") {
 			t.Errorf("uninstall called gh: %q", c)
 		}
+	}
+}
+
+// A pool that never leaves is reported; nothing is forgotten or removed under it.
+func TestUninstallGivesUpWhenThePoolNeverLeaves(t *testing.T) {
+	e := newEnv(t)
+	e.placeInstalled()
+	e.vars["STUB_PRINT_SUCCESSES"] = "1000000"
+	e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "1"
+	out, err := e.install("--uninstall")
+	if err == nil || !strings.Contains(out, "launchd still has") {
+		t.Fatalf("want a refusal, got %v\n%s", err, out)
+	}
+	if index(e.calls(), "pool forget") >= 0 || !exists(e.binPath()) || !exists(e.plistPath()) {
+		t.Errorf("the uninstall went on although the pool is still there: %v", e.calls())
 	}
 }
 
@@ -512,7 +589,7 @@ func TestUninstallDryRunChangesNothing(t *testing.T) {
 	if !exists(e.binPath()) || !exists(e.plistPath()) {
 		t.Error("a dry run removed files")
 	}
-	for _, want := range []string{"would: delete this Mac's heartbeat variables", "would: stop the pool", "would: remove"} {
+	for _, want := range []string{"would: unload the pool", "would: wait until launchd no longer lists it", "would: delete this Mac's heartbeat variables", "would: remove"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
 		}
@@ -759,5 +836,167 @@ func TestPlistRenderingEscapesPaths(t *testing.T) {
 	args, _ := top["ProgramArguments"].([]plistValue)
 	if len(args) != 2 || args[0] != e.binPath() {
 		t.Fatalf("ProgramArguments = %v, want %s first", args, e.binPath())
+	}
+}
+
+func TestInstallWaitsForTheDrainedAgentBeforeReplacingAndBootstrapping(t *testing.T) {
+	e := newEnv(t)
+	e.vars["STUB_PRINT_SUCCESSES"] = "3"
+	out, err := e.install()
+	if err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	calls := e.calls()
+	bootout := index(calls, "launchctl bootout ")
+	bootstrap := index(calls, "launchctl bootstrap ")
+	prints := 0
+	for _, c := range calls[bootout:bootstrap] {
+		if strings.HasPrefix(c, "launchctl print gui/"+stubUID+"/"+label) {
+			prints++
+		}
+		// The new binary is not put under a pool that is still draining.
+		if strings.HasPrefix(c, "at-print ") && c != "at-print binary=gone" {
+			t.Errorf("the binary was replaced while launchd still listed the pool: %v", calls)
+		}
+	}
+	if bootout < 0 || bootstrap < 0 || prints != 4 {
+		t.Fatalf("want bootout, 3 sightings plus 1 absence, then bootstrap (got %d prints); calls: %v", prints, calls)
+	}
+	if at := index(calls, "at-bootstrap "); calls[at] != "at-bootstrap binary=present plist=present" {
+		t.Errorf("bootstrap ran before the agent was placed: %v", calls)
+	}
+}
+
+func TestInstallGivesUpWhenLaunchdKeepsThePool(t *testing.T) {
+	e := newEnv(t)
+	e.vars["STUB_PRINT_SUCCESSES"] = "1000000"
+	e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "3"
+	e.vars["LOCAL_CI_INSTALL_PROGRESS"] = "1"
+	out, err := e.install()
+	if err == nil || !strings.Contains(out, "launchd still has") {
+		t.Fatalf("want a refusal, got %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "still waiting for the pool") {
+		t.Errorf("no progress line while waiting:\n%s", out)
+	}
+	if index(e.calls(), "launchctl bootstrap") >= 0 || exists(e.binPath()) || exists(e.plistPath()) {
+		t.Errorf("the install went on although the old pool is still there: %v", e.calls())
+	}
+}
+
+func TestInstallShowsBootoutErrorsExceptNotLoaded(t *testing.T) {
+	for name, tc := range map[string]struct {
+		msg  string
+		exit string
+		show bool
+	}{
+		"in progress": {"Boot-out failed: 36: Operation now in progress", "36", true},
+		"io error":    {"Boot-out failed: 5: Input/output error", "5", true},
+		"not loaded":  {"Boot-out failed: 3: No such process", "3", false},
+		"not found":   {"Could not find service in domain", "113", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.vars["STUB_BOOTOUT_MSG"] = tc.msg
+			e.vars["STUB_BOOTOUT_EXIT"] = tc.exit
+			out, err := e.install()
+			if err != nil {
+				t.Fatalf("install failed: %v\n%s", err, out)
+			}
+			if got := strings.Contains(out, tc.msg); got != tc.show {
+				t.Errorf("message shown = %v, want %v:\n%s", got, tc.show, out)
+			}
+			if index(e.calls(), "launchctl bootstrap") < 0 {
+				t.Error("the agent was not loaded")
+			}
+		})
+	}
+}
+
+func TestInstallResolvesTheLatestTagForTheProvenanceCheck(t *testing.T) {
+	e := newEnv(t)
+	e.vars["STUB_LATEST"] = "v0.2.3"
+	if out, err := e.install("--dry-run"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	calls := strings.Join(e.calls(), "\n")
+	for _, want := range []string{"gh release download v0.2.3 --repo", "--source-ref refs/tags/v0.2.3"} {
+		if !strings.Contains(calls, want) {
+			t.Errorf("calls lack %q:\n%s", want, calls)
+		}
+	}
+
+	e = newEnv(t)
+	e.vars["STUB_LATEST"] = "nightly; rm -rf /"
+	out, err := e.install("--dry-run")
+	if err == nil || !strings.Contains(out, "not a version tag") || index(e.calls(), "gh release download") >= 0 {
+		t.Fatalf("want a refusal before downloading, got %v\n%s", err, out)
+	}
+}
+
+func TestInstallLintsThePlistBeforePlacingIt(t *testing.T) {
+	e := newEnv(t)
+	if out, err := e.install(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if i := index(e.calls(), "plutil -lint "); i < 0 || e.calls()[i] != "plutil -lint "+e.plistPath()+".new" {
+		t.Fatalf("want a lint of the staged file, calls: %v", e.calls())
+	}
+
+	e = newEnv(t)
+	e.placeInstalled() // a good agent from before
+	old, _ := os.ReadFile(e.plistPath())
+	e.vars["STUB_PLUTIL_EXIT"] = "1"
+	out, err := e.install()
+	if err == nil || !strings.Contains(out, "not a valid property list") {
+		t.Fatalf("want a refusal, got %v\n%s", err, out)
+	}
+	now, _ := os.ReadFile(e.plistPath())
+	if !bytes.Equal(old, now) || exists(e.plistPath()+".new") {
+		t.Error("a bad plist replaced the old one, or a staged file was left")
+	}
+	if index(e.calls(), "launchctl bootstrap") >= 0 {
+		t.Error("the agent was loaded from a plist that did not lint")
+	}
+}
+
+func TestInstallDryRunReadsTheHealthAddressFromThePool(t *testing.T) {
+	e := newEnv(t)
+	e.vars["STUB_HEALTH_ADDR"] = "127.0.0.1:9999"
+	out, err := e.install("--dry-run")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if !strings.Contains(out, "would: wait for http://127.0.0.1:9999/healthz") {
+		t.Errorf("the dry run does not use the address the pool reports:\n%s", out)
+	}
+}
+
+func TestInstallUsesArm64OnRosetta(t *testing.T) {
+	e := newEnv(t)
+	e.vars["STUB_ARCH"] = "x86_64" // a shell under Rosetta
+	e.vars["STUB_ARM64"] = "1"     // on an Apple Silicon Mac
+	if out, err := e.install("--dry-run"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if i := index(e.calls(), "gh release download "); i < 0 || !strings.Contains(e.calls()[i], "*darwin_arm64*") {
+		t.Fatalf("want the arm64 archive, calls: %v", e.calls())
+	}
+}
+
+func TestInstallRefusesToRunAsRoot(t *testing.T) {
+	for _, args := range [][]string{nil, {"--dry-run"}, {"--uninstall"}} {
+		e := newEnv(t)
+		e.placeInstalled()
+		e.vars["STUB_UID"] = "0"
+		out, err := e.install(args...)
+		if err == nil || !strings.Contains(out, "do not run this as root") {
+			t.Fatalf("%v: want a refusal, got %v\n%s", args, err, out)
+		}
+		for _, c := range e.calls() {
+			if strings.HasPrefix(c, "gh ") || strings.HasPrefix(c, "launchctl ") || strings.HasPrefix(c, "pool ") {
+				t.Errorf("%v: %q ran as root", args, c)
+			}
+		}
 	}
 }
