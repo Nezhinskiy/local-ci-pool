@@ -70,13 +70,13 @@ func ParseMarker(b []byte) (Marker, error) {
 	}
 	inputs := make([]string, 0, len(*raw.Inputs))
 	for _, in := range *raw.Inputs {
-		clean, err := cleanRepoPath(in)
+		clean, err := CleanRepoPath(in)
 		if err != nil {
 			return Marker{}, fmt.Errorf("marker input %q: %w", in, err)
 		}
 		inputs = append(inputs, clean)
 	}
-	dockerfile, err := cleanRepoPath(*raw.Dockerfile)
+	dockerfile, err := CleanRepoPath(*raw.Dockerfile)
 	if err != nil {
 		return Marker{}, fmt.Errorf("marker dockerfile %q: %w", *raw.Dockerfile, err)
 	}
@@ -88,10 +88,10 @@ func ParseMarker(b []byte) (Marker, error) {
 	return Marker{}, fmt.Errorf("marker dockerfile %q does not lie inside any of its inputs", dockerfile)
 }
 
-// cleanRepoPath accepts a relative path inside the repository and returns it
+// CleanRepoPath accepts a relative path inside the repository and returns it
 // cleaned. Absolute paths, ".." segments, empty paths, pathspec magic (":")
 // and option-like names ("-") are refused: the value ends up in git arguments.
-func cleanRepoPath(p string) (string, error) {
+func CleanRepoPath(p string) (string, error) {
 	if p == "" {
 		return "", errors.New("path is empty")
 	}

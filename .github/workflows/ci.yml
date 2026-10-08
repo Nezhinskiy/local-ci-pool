@@ -39,7 +39,7 @@ jobs:
       - name: govulncheck
         run: govulncheck ./...
       - name: shellcheck
-        run: shellcheck route/route.sh
+        run: shellcheck route/route.sh runner/entrypoint.sh
       - name: go test
         run: go test -race ./...
       - name: actionlint
