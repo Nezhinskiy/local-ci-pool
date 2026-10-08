@@ -55,10 +55,14 @@ const (
 	maxPingFailures = 3
 	releaseEvery    = time.Hour
 	authWindow      = 10 * time.Minute
-	deleteRetry     = 10 * time.Second
-	drainPoll       = time.Second
-	inUsePoll       = time.Second
-	callTimeout     = 30 * time.Second
+	// A token read that fails at start is retried for startRetryWindow.
+	startRetryWindow = 2 * time.Minute
+	startRetryFirst  = 2 * time.Second
+	startRetryMax    = 30 * time.Second
+	deleteRetry      = 10 * time.Second
+	drainPoll        = time.Second
+	inUsePoll        = time.Second
+	callTimeout      = 30 * time.Second
 )
 
 // Config configures a Supervisor. Zero durations take their defaults.
@@ -292,8 +296,17 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 	defer func() { _ = ln.Close() }()
 
-	// The token cache is empty at start, so this reads it from gh.
-	if _, err := s.deps.Token.Token(ctx); err != nil {
+	// The token cache is empty at start, so this reads it from gh. Right
+	// after boot gh may not produce one yet (the login keychain is still
+	// locked), so a failed read is retried for startRetryWindow.
+	err = s.retryAtStart(ctx, func() error {
+		_, err := s.deps.Token.Token(ctx)
+		return err
+	})
+	switch {
+	case ctx.Err() != nil:
+		return nil
+	case err != nil:
 		return terminal("gh logged out: %v; run gh auth login", err)
 	}
 	m, arch, err := s.deps.Detect(ctx)
@@ -314,7 +327,15 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if s.cfg.Probe {
 		instance = "probe-" + m.Owner
 	}
-	mount, err := s.deps.Mount(ctx, arch)
+	var mount runnermount.Mount
+	err = s.retryAtStart(ctx, func() error {
+		var err error
+		mount, err = s.deps.Mount(ctx, arch)
+		return err
+	})
+	if ctx.Err() != nil {
+		return nil
+	}
 	if t := loginRejected(err); t != nil {
 		return t
 	}
@@ -363,6 +384,34 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	_ = ln.Close()
 	bg.Wait()
 	return err
+}
+
+// retryAtStart calls f until it returns an error that is not a failed token
+// read, or until startRetryWindow has passed since the first call, waiting
+// startRetryFirst doubling to startRetryMax between calls. A token rejection
+// (ErrUnauthorized after the GitHub client's own re-read) is never retried:
+// it returns at once. It returns f's last error, or nil once ctx ends.
+func (s *Supervisor) retryAtStart(ctx context.Context, f func() error) error {
+	clock := s.deps.Clock
+	began := clock.Now()
+	wait := startRetryFirst
+	for {
+		err := f()
+		if !isTokenRead(err) {
+			return err
+		}
+		left := startRetryWindow - clock.Now().Sub(began)
+		if left <= 0 {
+			return err
+		}
+		s.log.Warn("gh has no token yet; retrying", "error", err.Error(), "in", min(wait, left))
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-clock.After(min(wait, left)):
+		}
+		wait = min(wait*2, startRetryMax)
+	}
 }
 
 // loop runs discovery until ctx ends or a fatal error arrives.

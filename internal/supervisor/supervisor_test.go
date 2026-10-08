@@ -560,24 +560,43 @@ func TestNewRunnerReleaseUsedByNextStarts(t *testing.T) {
 // ---- fix round 1 ----
 
 // The runner mount is the first GitHub call: a 401 there has already been
-// retried with a token read again by the GitHub client, so it is terminal.
+// retried with a token read again by the GitHub client, so it is terminal at
+// once, not after the start-up retry window. The clock runs at wall speed:
+// that window would be two real minutes.
 func TestStartupWithRejectedTokenIsTerminal(t *testing.T) {
-	h := newHarness(t, 2, 1000, "alpha")
+	h := newHarness(t, 2, 1, "alpha")
 	h.mountErr = fmt.Errorf("finding the latest runner release: %w", &github.StatusError{Method: "GET", Path: "/repos/actions/runner/releases/latest", Status: 401})
 	h.start()
-	err := h.wait(defaultWait)
+	err := h.wait(10 * time.Second)
 	if !errors.Is(err, ErrTerminal) || !strings.Contains(err.Error(), "gh login rejected") {
 		t.Fatalf("Run = %v, want terminal gh login rejected", err)
 	}
 }
 
+// Right after boot gh may not produce a token yet: a failed read is retried.
+func TestStartupRetriesAFailedTokenRead(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.tok.firstErr = fmt.Errorf("%w: gh auth token exited with status 1", ghauth.ErrNoToken)
+	h.tok.failFirst = 2
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	if n := h.tok.readCount(); n < 3 {
+		t.Fatalf("%d token reads, want two failures and a success", n)
+	}
+}
+
+// A token read failing for longer than the two-minute window is terminal.
 func TestStartupWithoutTokenIsTerminal(t *testing.T) {
 	h := newHarness(t, 2, 1000, "alpha")
 	h.tok.err = fmt.Errorf("%w: gh auth token exited with status 1", ghauth.ErrNoToken)
 	h.start()
+	began := h.clock.Now()
 	err := h.wait(defaultWait)
 	if !errors.Is(err, ErrTerminal) || !strings.Contains(err.Error(), "gh logged out") {
 		t.Fatalf("Run = %v, want terminal gh logged out", err)
+	}
+	if waited := h.clock.Now().Sub(began); waited < 2*time.Minute || h.tok.readCount() < 3 {
+		t.Fatalf("terminal after %s and %d reads, want retries for two minutes", waited, h.tok.readCount())
 	}
 	if h.detects != 0 {
 		t.Fatal("Docker was probed before the login was checked")

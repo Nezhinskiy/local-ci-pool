@@ -43,6 +43,10 @@ func loginRejected(err error) error {
 	return nil
 }
 
+// isTokenRead reports whether err is a failure to read the token from gh, as
+// opposed to GitHub rejecting it.
+func isTokenRead(err error) bool { return errors.Is(err, ghauth.ErrNoToken) }
+
 // isUnauthorized reports whether err is an authentication failure: the GitHub
 // client's ErrUnauthorized, or a scale set API error whose response was a 401.
 // actions/scaleset v0.4.0 has no typed status error; it writes the status into

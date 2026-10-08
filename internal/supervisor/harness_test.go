@@ -417,11 +417,20 @@ type fakeToken struct {
 	err           error // every read fails with it
 	// errAfter makes every read after an Invalidate fail with err.
 	errAfter bool
+	// failFirst makes the first reads fail with firstErr, then succeed.
+	failFirst int
+	firstErr  error
+	reads     int
 }
 
 func (f *fakeToken) Token(context.Context) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.reads++
+	if f.failFirst > 0 {
+		f.failFirst--
+		return "", f.firstErr
+	}
 	if f.err != nil && (!f.errAfter || f.gen > 0) {
 		return "", f.err
 	}
@@ -433,6 +442,12 @@ func (f *fakeToken) Invalidate() {
 	defer f.mu.Unlock()
 	f.gen++
 	f.invalidations++
+}
+
+func (f *fakeToken) readCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reads
 }
 
 func (f *fakeToken) invalidated() int {
