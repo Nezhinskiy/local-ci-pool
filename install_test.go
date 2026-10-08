@@ -82,7 +82,8 @@ print)
 	echo 0 > "$f"
 	exit 113 ;;
 bootstrap)
-	echo "at-bootstrap binary=$b plist=$p" >> "$STUB_LOG" ;;
+	echo "at-bootstrap binary=$b plist=$p" >> "$STUB_LOG"
+	exit "${STUB_BOOTSTRAP_EXIT:-0}" ;;
 esac
 exit 0
 `,
@@ -93,6 +94,11 @@ echo '{"slots":4,"projects":[]}'
 	"scutil": `#!/bin/sh
 echo "scutil $*" >> "$STUB_LOG"
 echo "${STUB_HOST:-Example-MacBook}"
+`,
+	"mv": `#!/bin/sh
+echo "mv $*" >> "$STUB_LOG"
+[ "${STUB_MV_FAIL:-0}" = 0 ] || exit 1
+exec /bin/mv "$@"
 `,
 	"plutil": `#!/bin/sh
 echo "plutil $*" >> "$STUB_LOG"
@@ -280,7 +286,7 @@ func TestInstallDryRunVerifiesAttestation(t *testing.T) {
 	}
 	for _, want := range []string{
 		"would: unload a running pool", "would: wait until launchd no longer lists it",
-		"would: place the binary", "would: render the launchd agent", "would: load the agent",
+		"would: stage the binary", "would: render the launchd agent", "would: replace", "would: load the agent",
 		"would: wait for http://127.0.0.1:8737/healthz",
 	} {
 		if !strings.Contains(out, want) {
@@ -882,6 +888,9 @@ func TestInstallGivesUpWhenLaunchdKeepsThePool(t *testing.T) {
 	if index(e.calls(), "launchctl bootstrap") >= 0 || exists(e.binPath()) || exists(e.plistPath()) {
 		t.Errorf("the install went on although the old pool is still there: %v", e.calls())
 	}
+	if exists(e.binPath()+".new") || exists(e.plistPath()+".new") {
+		t.Error("a staged file was left behind")
+	}
 }
 
 func TestInstallShowsBootoutErrorsExceptNotLoaded(t *testing.T) {
@@ -939,24 +948,106 @@ func TestInstallLintsThePlistBeforePlacingIt(t *testing.T) {
 	if out, err := e.install(); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	if i := index(e.calls(), "plutil -lint "); i < 0 || e.calls()[i] != "plutil -lint "+e.plistPath()+".new" {
-		t.Fatalf("want a lint of the staged file, calls: %v", e.calls())
+	calls := e.calls()
+	lint := index(calls, "plutil -lint ")
+	if lint < 0 || calls[lint] != "plutil -lint "+e.plistPath()+".new" {
+		t.Fatalf("want a lint of the staged file, calls: %v", calls)
+	}
+	if lint > index(calls, "launchctl bootout") {
+		t.Errorf("the plist was linted after the running pool was unloaded: %v", calls)
 	}
 
+	// A plist that does not lint leaves the running pool and the old files alone.
 	e = newEnv(t)
 	e.placeInstalled() // a good agent from before
-	old, _ := os.ReadFile(e.plistPath())
+	oldPlist, _ := os.ReadFile(e.plistPath())
+	oldBin, _ := os.ReadFile(e.binPath())
 	e.vars["STUB_PLUTIL_EXIT"] = "1"
 	out, err := e.install()
 	if err == nil || !strings.Contains(out, "not a valid property list") {
 		t.Fatalf("want a refusal, got %v\n%s", err, out)
 	}
-	now, _ := os.ReadFile(e.plistPath())
-	if !bytes.Equal(old, now) || exists(e.plistPath()+".new") {
-		t.Error("a bad plist replaced the old one, or a staged file was left")
+	for _, c := range e.calls() {
+		if strings.HasPrefix(c, "launchctl ") {
+			t.Errorf("the running pool was touched before the plist was known to be good: %q", c)
+		}
 	}
-	if index(e.calls(), "launchctl bootstrap") >= 0 {
-		t.Error("the agent was loaded from a plist that did not lint")
+	newPlist, _ := os.ReadFile(e.plistPath())
+	newBin, _ := os.ReadFile(e.binPath())
+	if !bytes.Equal(oldPlist, newPlist) || !bytes.Equal(oldBin, newBin) {
+		t.Error("an old file was replaced")
+	}
+	if exists(e.plistPath()+".new") || exists(e.binPath()+".new") {
+		t.Error("a staged file was left behind")
+	}
+	if strings.Contains(out, "the old pool is stopped") {
+		t.Errorf("the output claims the pool was stopped:\n%s", out)
+	}
+}
+
+const strandedLine = "the old pool is stopped and the new one is not running; rerun install.sh (CI falls back to hosted runners meanwhile)"
+
+// After the unload, a failing rename or load says so, and the old pool is gone.
+func TestInstallSaysWhenThePoolIsDown(t *testing.T) {
+	for name, vars := range map[string]map[string]string{
+		"rename fails": {"STUB_MV_FAIL": "1"},
+		"load fails":   {"STUB_BOOTSTRAP_EXIT": "1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.placeInstalled()
+			for k, v := range vars {
+				e.vars[k] = v
+			}
+			out, err := e.install()
+			if err == nil {
+				t.Fatalf("the install succeeded:\n%s", out)
+			}
+			if !strings.Contains(out, strandedLine) {
+				t.Errorf("output lacks the line about the stopped pool:\n%s", out)
+			}
+			if index(e.calls(), "launchctl bootout") < 0 {
+				t.Error("the test never reached the unload")
+			}
+			if exists(e.binPath()+".new") || exists(e.plistPath()+".new") {
+				t.Error("a staged file was left behind")
+			}
+		})
+	}
+}
+
+// The line is only for the case it describes.
+func TestInstallStoppedLineOnlyWhenTrue(t *testing.T) {
+	// success
+	e := newEnv(t)
+	out, err := e.install()
+	if err != nil || strings.Contains(out, "is stopped") {
+		t.Fatalf("a good install: %v\n%s", err, out)
+	}
+	// failure before the unload: attestation
+	e = newEnv(t)
+	e.vars["STUB_VERIFY_EXIT"] = "1"
+	if out, err := e.install(); err == nil || strings.Contains(out, "is stopped") {
+		t.Fatalf("verify failure: %v\n%s", err, out)
+	}
+	// the pool never leaves: it is still running, so it is not "stopped"
+	e = newEnv(t)
+	e.vars["STUB_PRINT_SUCCESSES"] = "1000000"
+	e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "1"
+	out, err = e.install()
+	if err == nil || strings.Contains(out, "is stopped") || !strings.Contains(out, "asked to stop and is still finishing its jobs") {
+		t.Fatalf("timeout: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "nothing else was changed") {
+		t.Errorf("the timeout message claims nothing changed:\n%s", out)
+	}
+	// uninstall has no new pool to miss
+	e = newEnv(t)
+	e.placeInstalled()
+	e.vars["STUB_PRINT_SUCCESSES"] = "1000000"
+	e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "1"
+	if out, err := e.install("--uninstall"); err == nil || strings.Contains(out, "is stopped") {
+		t.Fatalf("uninstall timeout: %v\n%s", err, out)
 	}
 }
 

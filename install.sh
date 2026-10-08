@@ -36,6 +36,9 @@ DRY=0
 UNINSTALL=0
 VERSION=""
 TMP=""
+# STOPPED is 1 from the moment the installer asks launchd to unload the old
+# pool until the new one is loaded; a failure in between leaves no pool running.
+STOPPED=0
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'install.sh: %s\n' "$*" >&2; }
@@ -70,8 +73,13 @@ act() {
 }
 
 cleanup() {
+  local rc=$?
   if [ -n "$TMP" ]; then
     rm -rf "$TMP"
+  fi
+  rm -f "$BIN.new" "$PLIST.new"
+  if [ "$rc" -ne 0 ] && [ "$STOPPED" = 1 ]; then
+    warn "local-ci-pool: the old pool is stopped and the new one is not running; rerun install.sh (CI falls back to hosted runners meanwhile)"
   fi
 }
 trap cleanup EXIT
@@ -208,10 +216,17 @@ fetch() {
   say "release: $("$TMP/x/pool" version)"
 }
 
-place_binary() {
+# stage_binary and stage_plist prepare the new files next to the old ones, so
+# that everything that can fail does so before the running pool is touched.
+stage_binary() {
   mkdir -p "$BIN_DIR"
   install -m 0755 "$TMP/x/pool" "$BIN.new"
+}
+
+# commit_staged is the only step between the unload and the load: two renames.
+commit_staged() {
   mv -f "$BIN.new" "$BIN"
+  mv -f "$PLIST.new" "$PLIST"
 }
 
 # xml_sed_escape makes a value safe inside an XML text node and as the
@@ -220,7 +235,7 @@ xml_sed_escape() {
   printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/[\\|&]/\\&/g'
 }
 
-render_plist() {
+stage_plist() {
   mkdir -p "$(dirname "$PLIST")" "$LOG_DIR"
   sed -e "s|@BIN@|$(xml_sed_escape "$BIN")|g" \
     -e "s|@LOG_DIR@|$(xml_sed_escape "$LOG_DIR")|g" \
@@ -228,9 +243,8 @@ render_plist() {
   chmod 0644 "$PLIST.new"
   if command -v plutil > /dev/null 2>&1 && ! plutil -lint "$PLIST.new" > /dev/null; then
     rm -f "$PLIST.new"
-    die "the rendered agent is not a valid property list; $PLIST was not changed"
+    die "the rendered agent is not a valid property list; nothing was changed"
   fi
-  mv -f "$PLIST.new" "$PLIST"
 }
 
 # bootout_agent asks launchd to unload the agent. It does not rely on the call
@@ -255,7 +269,8 @@ wait_gone() {
   while launchctl print "$DOMAIN/$LABEL" > /dev/null 2>&1; do
     waited=$((SECONDS - began))
     if [ "$waited" -ge "$WAIT_LIMIT" ]; then
-      die "launchd still has $DOMAIN/$LABEL after ${waited}s; nothing else was changed. Check 'launchctl print $DOMAIN/$LABEL' and $LOG_DIR/pool.log, then run this again"
+      STOPPED=0 # the pool is still running, so the "stopped" line would be false
+      die "launchd still has $DOMAIN/$LABEL after ${waited}s. The pool was asked to stop and is still finishing its jobs; no installed file was changed, but once it exits nothing restarts it (workflows fall back to hosted runners). Check 'launchctl print $DOMAIN/$LABEL' and $LOG_DIR/pool.log, then run this script again"
     fi
     if [ "$waited" -ge "$next" ]; then
       say "still waiting for the pool to finish its jobs and exit (${waited}s)"
@@ -274,12 +289,10 @@ bootstrap_agent() {
     if [ "$attempt" -ge 5 ]; then
       die "launchctl bootstrap $DOMAIN $PLIST failed"
     fi
-    sleep 2
+    sleep "$WAIT_POLL"
   done
 }
 
-# wait_healthy reports whether the pool answers. A first start downloads the
-# runner and builds images, so a slow answer is not a failure.
 # health_addr prints the address the pool serves /healthz on, as the given
 # pool binary reports it.
 health_addr() {
@@ -289,6 +302,8 @@ health_addr() {
   printf '%s' "$addr"
 }
 
+# wait_healthy reports whether the pool answers. A first start downloads the
+# runner and builds images, so a slow answer is not a failure.
 wait_healthy() {
   local addr="$1"
   for _ in $(seq 1 30); do
@@ -304,16 +319,21 @@ wait_healthy() {
 install_pool() {
   check_prerequisites
   fetch
-  # Stop the old pool first and let it finish: nothing is replaced under a
-  # pool that is still draining, and a pool that never leaves is reported
-  # with the old install untouched.
-  act "unload a running pool, if any: launchctl bootout $DOMAIN/$LABEL" bootout_agent
-  act "wait until launchd no longer lists it (the pool finishes its jobs first, up to 45 minutes; gives up after $WAIT_LIMIT s)" wait_gone
-  act "place the binary at $BIN" place_binary
-  act "render the launchd agent at $PLIST (logs in $LOG_DIR)" render_plist
-  act "load the agent: launchctl bootstrap $DOMAIN $PLIST" bootstrap_agent
   local addr
   addr="$(health_addr "$TMP/x/pool")"
+  # Everything that can fail without touching the running pool comes first:
+  # the new binary and the checked plist are staged beside the old files. After
+  # the unload only two renames and the load remain.
+  act "stage the binary as $BIN.new" stage_binary
+  act "render the launchd agent as $PLIST.new (logs in $LOG_DIR) and check it with plutil" stage_plist
+  if [ "$DRY" != 1 ]; then
+    STOPPED=1
+  fi
+  act "unload a running pool, if any: launchctl bootout $DOMAIN/$LABEL" bootout_agent
+  act "wait until launchd no longer lists it (the pool finishes its jobs first, up to 45 minutes; gives up after $WAIT_LIMIT s)" wait_gone
+  act "replace $BIN and $PLIST with the staged files" commit_staged
+  act "load the agent: launchctl bootstrap $DOMAIN $PLIST" bootstrap_agent
+  STOPPED=0
   if [ "$DRY" = 1 ]; then
     say "would: wait for http://$addr/healthz"
   else

@@ -41,14 +41,16 @@ Run `./install.sh --dry-run` first if you want to see what it would do. The inst
 2. downloads the release archive with `gh release download` and runs `gh attestation verify` on it,
    requiring that it was signed by this repository's `release.yml` workflow for the very tag it
    downloaded. If the verification fails, nothing is installed;
-3. runs `launchctl bootout gui/$UID/com.local-ci-pool.pool` and then polls `launchctl print` until
+3. stages the new binary as `pool.new` beside the old one, and renders the agent to
+   `com.local-ci-pool.pool.plist.new` (logs go to `~/Library/Logs/local-ci-pool/pool.log`), checking it
+   with `plutil -lint`. Everything that can fail does so here, while the running pool is untouched;
+4. runs `launchctl bootout gui/$UID/com.local-ci-pool.pool` and then polls `launchctl print` until
    launchd no longer lists the agent. The pool finishes its running jobs first (up to 45 minutes,
    the plist's `ExitTimeOut`), and the installer prints a line every minute while it waits. It does
-   not trust `bootout` to block: if the agent is still there after 46 minutes it stops and changes
-   nothing;
-4. places the binary at `~/Library/Application Support/local-ci-pool/bin/pool`;
-5. renders `~/Library/LaunchAgents/com.local-ci-pool.pool.plist`, checks it with `plutil -lint`
-   before moving it into place (logs go to `~/Library/Logs/local-ci-pool/pool.log`);
+   not trust `bootout` to block: if the agent is still there after 46 minutes it stops, and no
+   installed file has been changed;
+5. renames the staged files into place (`~/Library/Application Support/local-ci-pool/bin/pool` and
+   `~/Library/LaunchAgents/com.local-ci-pool.pool.plist`);
 6. runs `launchctl bootstrap` (retried a few times) and waits for `/healthz`.
 
 It writes no configuration. The pool keeps derived state only: its git mirrors under
@@ -62,9 +64,11 @@ installer again (or `launchctl kickstart gui/$UID/com.local-ci-pool.pool`).
 
 ## Upgrade
 
-Run `./install.sh` again (or with `--version`). It stops the old pool, waits until its jobs have
-finished and launchd has let go of it (up to 46 minutes), then replaces the binary and the plist and
-starts the new one. A restarted pool may wait 21 to 39 seconds
+Run `./install.sh` again (or with `--version`). It stages the new files, stops the old pool, waits
+until its jobs have finished and launchd has let go of it (up to 46 minutes), then renames the staged
+files into place and starts the new pool. If anything fails after the old pool was stopped, the
+installer says `the old pool is stopped and the new one is not running`; run it again. Workflows use
+hosted runners meanwhile. A restarted pool may wait 21 to 39 seconds
 for its previous session to expire: a `409` on opening the session is retried for up to 3 minutes. A
 `409` beyond that means another pool, or another Mac with the same machine name, holds the scale set,
 and the pool exits (terminal).
@@ -132,9 +136,10 @@ tail -f ~/Library/Logs/local-ci-pool/pool.log
 | `probe` | whether this is a probe run |
 | `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, and a `reason` when not healthy |
 
-The endpoint binds `127.0.0.1:8737` and answers only requests whose `Host` is a loopback name. Binding it is also the single-instance lock: a second pool on the
-same Mac exits with `terminal: already running`. The log is not rotated; stop the pool and delete the
-file when it grows large.
+The endpoint binds `127.0.0.1:8737` and answers only requests whose `Host` is a loopback name.
+Binding it is also the single-instance lock: a second pool on the same Mac exits with
+`terminal: already running`. The log is not rotated; stop the pool and delete the file when it grows
+large.
 
 A job assigned to a Mac that then went to sleep or lost power is requeued by GitHub to another live Mac
 after about five minutes. With no other Mac, the run waits; see [stranded runs](#stranded-runs).
