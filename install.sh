@@ -313,6 +313,23 @@ agent_pid() {
   pid_in "$(agent_print)"
 }
 
+# launchd_let_go PID reports whether launchctl print shows that the agent no
+# longer runs PID: it names another pid, or says "state = not running". An
+# empty or failed print shows nothing either way.
+launchd_let_go() {
+  local out now
+  out="$(agent_print)"
+  now="$(pid_in "$out")"
+  if [ -n "$now" ]; then
+    [ "$now" != "$1" ]
+    return
+  fi
+  case "$out" in
+    *"state = not running"*) return 0 ;;
+  esac
+  return 1
+}
+
 # already_stopping PID reports whether the pool process PID was already asked
 # to stop (by an earlier run of this script, or by hand): its log has the
 # "stopping: draining every project" line after its own "pool starting" line,
@@ -340,11 +357,14 @@ already_stopping() {
 # from launchctl bootout: launchd clamps a LaunchAgent's exit timeout to 60 s
 # and SIGKILLs a pool still draining after that, losing its running jobs.
 #
-# The process counts as exited once launchd reports another pid or none, as
-# well as when it is gone: a pid reused by another process is not waited for.
+# The process counts as exited when it is gone, or when launchd reports
+# another pid for the agent or says it is not running: a pid reused by another
+# process is not waited for. A print that fails or shows no pid without saying
+# "not running" proves nothing, so the wait goes on while the process lives.
 # A pool that exits non-zero mid-drain (a fatal error) is restarted by launchd
-# at once; the new process is then booted out by the next step, and the jobs
-# the old one left running are kept by the pool that starts after the install.
+# (KeepAlive, at most once per 30 s ThrottleInterval); a new process is then
+# booted out by the next step, and the jobs the old one left running are kept
+# by the pool that starts after the install.
 stop_pool() {
   local out pid began next waited
   out="$(agent_print)"
@@ -368,7 +388,7 @@ stop_pool() {
   fi
   began="$SECONDS"
   next="$WAIT_PROGRESS"
-  while kill -0 "$pid" 2> /dev/null && [ "$(agent_pid)" = "$pid" ]; do
+  while kill -0 "$pid" 2> /dev/null && ! launchd_let_go "$pid"; do
     waited=$((SECONDS - began))
     if [ "$waited" -ge "$WAIT_LIMIT" ]; then
       STOPPED=0 # the pool is still running, so the "stopped" line would be false

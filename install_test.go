@@ -102,11 +102,17 @@ print)
 		# service's, which is indented by one tab.
 		# After STUB_PID_PRINTS such calls launchd reports STUB_NEXT_PID
 		# instead (a restart, or the pid now names another process).
+		# Calls STUB_PRINT_FAIL_FROM up to before STUB_PRINT_FAIL_TO fail,
+		# as a transient launchctl error does.
 		pid="$STUB_POOL_PID"
-		if [ -n "${STUB_PID_PRINTS:-}" ]; then
-			n=$(cat "$STUB_LOG.pidprints" 2>/dev/null || echo 0)
-			echo $((n + 1)) > "$STUB_LOG.pidprints"
-			[ "$n" -lt "$STUB_PID_PRINTS" ] || pid="${STUB_NEXT_PID:-}"
+		n=$(cat "$STUB_LOG.pidprints" 2>/dev/null || echo 0)
+		echo $((n + 1)) > "$STUB_LOG.pidprints"
+		if [ -n "${STUB_PID_PRINTS:-}" ] && [ "$n" -ge "$STUB_PID_PRINTS" ]; then
+			pid="${STUB_NEXT_PID:-}"
+		fi
+		if [ -n "${STUB_PRINT_FAIL_FROM:-}" ] && [ "$n" -ge "$STUB_PRINT_FAIL_FROM" ] && [ "$n" -lt "$STUB_PRINT_FAIL_TO" ]; then
+			echo "Bad request." >&2
+			exit 5
 		fi
 		printf 'gui/501/` + label + ` = {\n\tactive count = 1\n\tpath = /x.plist\n'
 		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -1704,30 +1710,37 @@ func TestStopNeverSignalsADrainingPoolTwice(t *testing.T) {
 	}
 }
 
-// launchd reporting another pid, or none, means the process it ran is gone:
+// launchd reporting another pid, or "not running", means the process it ran
+// is gone, even while the old pid answers kill -0:
 // a pid reused by an unrelated process is not waited for, and a pool that
 // launchd restarted after a non-zero exit mid-drain is not signalled but
 // booted out with the agent.
 func TestStopTreatsAChangedPidAsExited(t *testing.T) {
-	e := newEnv(t)
-	e.placeInstalled()
-	e.vars["STUB_POOL_PID"] = strconv.Itoa(e.startStandIn("", -1, false)) // never exits
-	e.vars["STUB_NEXT_PID"] = strconv.Itoa(e.startStandIn("-restarted", -1, false))
-	e.vars["STUB_PID_PRINTS"] = "4"
-	e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "10"
-	out, err := e.install()
-	if err != nil {
-		t.Fatalf("install failed: %v\n%s", err, out)
-	}
-	calls := e.calls()
-	if index(calls, "pool-process TERM") < 0 || index(calls, "launchctl bootout ") < index(calls, "pool-process TERM") {
-		t.Errorf("want SIGTERM to the pool, then the bootout; calls: %v", calls)
-	}
-	if index(calls, "pool-process-restarted TERM") >= 0 {
-		t.Errorf("the installer signalled the restarted pool: %v", calls)
-	}
-	if !strings.Contains(out, "the pool has exited") {
-		t.Errorf("output:\n%s", out)
+	for name, restarted := range map[string]bool{"another pid": true, "not running": false} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.placeInstalled()
+			e.vars["STUB_POOL_PID"] = strconv.Itoa(e.startStandIn("", -1, false)) // never exits
+			if restarted {
+				e.vars["STUB_NEXT_PID"] = strconv.Itoa(e.startStandIn("-restarted", -1, false))
+			}
+			e.vars["STUB_PID_PRINTS"] = "4"
+			e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "10"
+			out, err := e.install()
+			if err != nil {
+				t.Fatalf("install failed: %v\n%s", err, out)
+			}
+			calls := e.calls()
+			if index(calls, "pool-process TERM") < 0 || index(calls, "launchctl bootout ") < index(calls, "pool-process TERM") {
+				t.Errorf("want SIGTERM to the pool, then the bootout; calls: %v", calls)
+			}
+			if index(calls, "pool-process-restarted TERM") >= 0 {
+				t.Errorf("the installer signalled the restarted pool: %v", calls)
+			}
+			if !strings.Contains(out, "the pool has exited") {
+				t.Errorf("output:\n%s", out)
+			}
+		})
 	}
 }
 
@@ -1751,5 +1764,30 @@ func TestDryRunStatesThePoolsStopBound(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("%v: the dry run lacks %q:\n%s", args, want, out)
 		}
+	}
+}
+
+// A launchctl print that fails, or shows no pid, while the signalled process
+// still lives proves nothing: the installer keeps waiting for the process and
+// boots the agent out only after it has exited.
+func TestStopKeepsWaitingThroughAFailedPrint(t *testing.T) {
+	e := newEnv(t)
+	e.placeInstalled()
+	e.startPool(40)                      // drains for 0.8 s after the SIGTERM
+	e.vars["STUB_PRINT_FAIL_FROM"] = "1" // every print after the first, for a while
+	e.vars["STUB_PRINT_FAIL_TO"] = "8"
+	e.vars["LOCAL_CI_INSTALL_WAIT_LIMIT"] = "20"
+	out, err := e.install()
+	if err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	calls := e.calls()
+	term, exited, bootout := index(calls, "pool-process TERM"), index(calls, "pool-process exit"), index(calls, "launchctl bootout ")
+	if term < 0 || exited < term || bootout < exited {
+		t.Fatalf("want SIGTERM, the pool's exit, then the bootout; calls: %v", calls)
+	}
+	// The failing prints were all reached, so the wait went through them.
+	if b, _ := os.ReadFile(e.log + ".pidprints"); func() int { n, _ := strconv.Atoi(strings.TrimSpace(string(b))); return n }() < 8 {
+		t.Errorf("only %q prints before the bootout; the failing ones were not reached", b)
 	}
 }
