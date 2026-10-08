@@ -155,9 +155,12 @@ A project is also unhealthy, with the reason in `/healthz`, while:
 
 - its image changed and the new one failed to pull, build or pass the preflight. Runners keep using
   the last good image; the project recovers on the next discovery pass whose refresh succeeds;
-- a new actions/runner release failed the preflight with its image. Runners keep the older runner
-  (its image is not pruned) until a later preflight with the new one passes, on the next hourly
-  release check or the next discovery pass;
+- a new actions/runner release failed the preflight with its image. While the pool keeps running,
+  runners stay on the older runner (its image is not pruned) until a later preflight with the new one
+  passes, on the next hourly release check or the next discovery pass. A pool restart or upgrade
+  keeps only the newest runner, so the project then cannot start at all: it stays unhealthy, with
+  the runner version in the reason, and its workflows use hosted runners until the image is fixed
+  or a runner release it passes with arrives;
 - three runners in a row went away without starting a job (they exited idle, or could not start,
   for example because an image was deleted under the pool). A job report clears it, and so does the
   preflight the next discovery pass runs for it.

@@ -149,7 +149,7 @@ func (pr *project) setup() error {
 	m := s.currentMount()
 	user, err := s.deps.Check(pr.ctx, ref, m)
 	if err != nil {
-		return fmt.Errorf("image %s: %w", ref, err)
+		return fmt.Errorf("image %s with runner %s: %w", ref, m.Version, err)
 	}
 	pr.mu.Lock()
 	pr.img, pr.mount = Image{Ref: ref, User: user}, m

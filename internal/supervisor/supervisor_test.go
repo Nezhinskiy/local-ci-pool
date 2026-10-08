@@ -274,7 +274,7 @@ func TestFailedProjectDoesNotStopOthers(t *testing.T) {
 	h.eventually("beta healthy", func() bool { return h.healthy(betaRepo) })
 	h.eventually("alpha reported", func() bool { _, ok := h.health(alphaRepo); return ok && h.logged("cannot be served") })
 	a, _ := h.health(alphaRepo)
-	if a.Healthy || !strings.Contains(a.Reason, "NO_CA") {
+	if a.Healthy || !strings.Contains(a.Reason, "NO_CA") || !strings.Contains(a.Reason, "with runner 2.338.0") {
 		t.Fatalf("alpha %+v, want unhealthy with the preflight's reason", a)
 	}
 	if h.actions.ScaleSet(alphaSet) != nil {
