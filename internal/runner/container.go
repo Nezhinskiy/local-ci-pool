@@ -127,7 +127,7 @@ func StartRunner(ctx context.Context, d Docker, s ContainerSpec) (id string, err
 		}
 		rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		defer cancel()
-		if rmErr := RemoveRunner(rmCtx, d, cid); rmErr != nil {
+		if rmErr := RemoveContainer(rmCtx, d, cid); rmErr != nil {
 			err = errors.Join(err, fmt.Errorf("removing the unstarted container: %w", rmErr))
 		}
 	}()
@@ -156,11 +156,12 @@ func writeStdin(h client.HijackedResponse, line string) error {
 	return h.CloseWrite()
 }
 
-// RemoveRunner force-removes a runner container by name or id. A container
-// that no longer exists counts as removed, and so does one Docker is already
-// removing: an exited AutoRemove container answers a remove with a conflict
-// while its own removal runs (measured).
-func RemoveRunner(ctx context.Context, d ContainerRemover, nameOrID string) error {
+// RemoveContainer force-removes a runner container by name or id. It removes
+// the container only; the runner's GitHub registration is the Registry's. A
+// container that no longer exists counts as removed, and so does one Docker is
+// already removing: an exited AutoRemove container answers a remove with a
+// conflict while its own removal runs.
+func RemoveContainer(ctx context.Context, d ContainerRemover, nameOrID string) error {
 	if nameOrID == "" {
 		return errors.New("removing a runner container needs a name")
 	}
@@ -168,6 +169,10 @@ func RemoveRunner(ctx context.Context, d ContainerRemover, nameOrID string) erro
 	switch {
 	case err == nil, cerrdefs.IsNotFound(err):
 		return nil
+	// Measured on Docker Desktop 4.92.0 (Engine 29.8.0, API 1.56): "removal of
+	// container <name> is already in progress", a 409. If a later daemon words
+	// it differently, the remove fails and the scaler retries on its next call,
+	// when the container is gone and the remove reports not found.
 	case cerrdefs.IsConflict(err) && strings.Contains(err.Error(), "already in progress"):
 		return nil
 	}

@@ -16,9 +16,22 @@ import (
 // namePrefix starts every runner name and container name the pool creates.
 const namePrefix = "local-ci-"
 
-// forgetTimeout bounds the best-effort unregistration of a runner that never
-// started.
-const forgetTimeout = 30 * time.Second
+// Every call the scaler makes runs under the listener's context, which the
+// listener strips of cancellation while it handles a message, so each is
+// bounded here instead. They are variables so tests can shorten them.
+var (
+	// launchTimeout bounds one runner's start: minting its JIT configuration,
+	// then creating, attaching to and starting its container. A start that
+	// times out is a failed start, and its slot is released.
+	launchTimeout = 2 * time.Minute
+	// reapTimeout bounds reaping one idle runner: unregistering it, then
+	// removing its container. A reap that times out leaves the runner idle,
+	// still holding its slot, for the next call.
+	reapTimeout = time.Minute
+	// forgetTimeout bounds the best-effort unregistration of a runner that
+	// never started.
+	forgetTimeout = 30 * time.Second
+)
 
 // JITSource mints a runner's JIT configuration. *scaleset.Client satisfies it.
 type JITSource interface {
@@ -170,13 +183,21 @@ func (s *Scaler) reserve(ctx context.Context, count int) (string, bool) {
 	return name, true
 }
 
-// launch mints the runner's JIT configuration and starts its container. On
-// failure it unregisters the runner if its configuration was minted, then
-// releases its slot through Exited.
+// launch mints the runner's JIT configuration and starts its container,
+// within launchTimeout. On failure it unregisters the runner if its
+// configuration was minted, then releases its slot through Exited. A Drain that
+// lands while the configuration is minted is honoured the same way: the runner
+// is unregistered and released instead of started.
 func (s *Scaler) launch(ctx context.Context, name string) bool {
+	ctx, cancel := context.WithTimeout(ctx, launchTimeout)
+	defer cancel()
 	minted, err := s.startRunner(ctx, name)
 	if err != nil {
-		s.log.Error("starting a runner", slog.String("runner", name), slog.String("error", err.Error()))
+		if errors.Is(err, errDrained) {
+			s.log.Info("draining; not starting the runner", slog.String("runner", name))
+		} else {
+			s.log.Error("starting a runner", slog.String("runner", name), slog.String("error", err.Error()))
+		}
 		if minted {
 			s.forget(ctx, name)
 		}
@@ -193,6 +214,9 @@ func (s *Scaler) launch(ctx context.Context, name string) bool {
 	return true
 }
 
+// errDrained stops a start whose scaler began draining while it minted.
+var errDrained = errors.New("the scaler is draining")
+
 // startRunner reports whether the JIT configuration was minted, which
 // registers the runner on GitHub, and any error.
 func (s *Scaler) startRunner(ctx context.Context, name string) (minted bool, err error) {
@@ -202,6 +226,14 @@ func (s *Scaler) startRunner(ctx context.Context, name string) (minted bool, err
 	}
 	if cfg == nil || cfg.EncodedJITConfig == "" {
 		return true, errors.New("minting the JIT configuration: the response is empty")
+	}
+	// reserve checked draining before the mint; check again before a
+	// container exists.
+	s.mu.Lock()
+	draining := s.draining
+	s.mu.Unlock()
+	if draining {
+		return true, errDrained
 	}
 	return true, s.start(ctx, name, cfg.EncodedJITConfig)
 }
@@ -259,33 +291,48 @@ func (s *Scaler) reap(ctx context.Context, count int) {
 	s.mu.Unlock()
 
 	for _, name := range victims {
-		err := s.unregister(ctx, name)
-		switch {
-		case errors.Is(err, scaleset.JobStillRunningError):
-			s.log.Info("idle runner is running a job; keeping it", slog.String("runner", name))
-			s.mu.Lock()
-			if st, ok := s.runners[name]; ok && st == stateReaping {
-				s.runners[name] = stateBusy
-				s.slots.SetBusy(1)
-			}
-			s.mu.Unlock()
-			continue
-		case err != nil:
-			s.log.Warn("unregistering an idle runner", slog.String("runner", name), slog.String("error", err.Error()))
-			s.keepIdle(name)
-			continue
-		}
-		if err := RemoveRunner(ctx, s.docker, name); err != nil {
-			s.log.Warn("removing an idle runner", slog.String("runner", name), slog.String("error", err.Error()))
-			s.keepIdle(name)
-			continue
-		}
-		s.log.Info("idle runner removed", slog.String("runner", name))
-		s.Exited(name)
+		s.reapOne(ctx, name)
 	}
 }
 
-// keepIdle returns a runner whose reaping failed to idle, for the next call.
+// reapOne unregisters one idle runner and removes its container, within
+// reapTimeout.
+func (s *Scaler) reapOne(ctx context.Context, name string) {
+	ctx, cancel := context.WithTimeout(ctx, reapTimeout)
+	defer cancel()
+	err := s.unregister(ctx, name)
+	switch {
+	case errors.Is(err, scaleset.JobStillRunningError):
+		s.log.Info("idle runner is running a job; keeping it", slog.String("runner", name))
+		s.keepBusy(name)
+		return
+	case err != nil:
+		s.log.Warn("unregistering an idle runner", slog.String("runner", name), slog.String("error", err.Error()))
+		s.keepIdle(name)
+		return
+	}
+	if err := RemoveContainer(ctx, s.docker, name); err != nil {
+		s.log.Warn("removing an idle runner", slog.String("runner", name), slog.String("error", err.Error()))
+		s.keepIdle(name)
+		return
+	}
+	s.log.Info("idle runner removed", slog.String("runner", name))
+	s.Exited(name)
+}
+
+// keepBusy marks a runner GitHub reports as running a job busy, unless its
+// container exited meanwhile.
+func (s *Scaler) keepBusy(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, ok := s.runners[name]; ok && st == stateReaping {
+		s.runners[name] = stateBusy
+		s.slots.SetBusy(1)
+	}
+}
+
+// keepIdle returns a runner whose reaping failed to idle, for the next call,
+// unless its container exited meanwhile.
 func (s *Scaler) keepIdle(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -348,7 +395,11 @@ func (s *Scaler) Exited(name string) {
 	s.slots.Release()
 }
 
-// Drain stops all further starts.
+// Drain stops new starts: Desired starts nothing from now on, and a start
+// whose JIT configuration is being minted is unregistered and released instead
+// of started. A start already creating its container completes. Desired still
+// reaps idle runners, and Exited still releases slots; the supervisor's drain
+// (T8) waits for InUse() to reach 0.
 func (s *Scaler) Drain() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

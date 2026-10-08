@@ -233,27 +233,27 @@ func TestReapNeverRemovesBusyRunners(t *testing.T) {
 func TestRemoveNotFoundIsNotAnError(t *testing.T) {
 	d := newFakeDocker()
 	d.removeErr = func(string) error { return cerrdefs.ErrNotFound.WithMessage("No such container") }
-	if err := RemoveRunner(context.Background(), d, "alpha-1"); err != nil {
-		t.Fatalf("RemoveRunner on a missing container: %v", err)
+	if err := RemoveContainer(context.Background(), d, "alpha-1"); err != nil {
+		t.Fatalf("RemoveContainer on a missing container: %v", err)
 	}
 	// What the daemon answers for an exited AutoRemove container (measured).
 	d.removeErr = func(string) error {
 		return cerrdefs.ErrConflict.WithMessage("removal of container alpha-1 is already in progress")
 	}
-	if err := RemoveRunner(context.Background(), d, "alpha-1"); err != nil {
-		t.Fatalf("RemoveRunner on a container being removed: %v", err)
+	if err := RemoveContainer(context.Background(), d, "alpha-1"); err != nil {
+		t.Fatalf("RemoveContainer on a container being removed: %v", err)
 	}
 	for _, failure := range []error{
 		errors.New("daemon unavailable"),
 		cerrdefs.ErrConflict.WithMessage("some other conflict"),
 	} {
 		d.removeErr = func(string) error { return failure }
-		if err := RemoveRunner(context.Background(), d, "alpha-1"); err == nil {
-			t.Fatalf("RemoveRunner hid a real failure: %v", failure)
+		if err := RemoveContainer(context.Background(), d, "alpha-1"); err == nil {
+			t.Fatalf("RemoveContainer hid a real failure: %v", failure)
 		}
 	}
-	if err := RemoveRunner(context.Background(), d, ""); err == nil {
-		t.Fatal("RemoveRunner accepted an empty name")
+	if err := RemoveContainer(context.Background(), d, ""); err == nil {
+		t.Fatal("RemoveContainer accepted an empty name")
 	}
 	if got := d.removed(); len(got) != 4 {
 		t.Fatalf("removes %v, want four (none for the empty name)", got)

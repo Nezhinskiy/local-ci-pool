@@ -79,7 +79,7 @@ func TestRealRunnerExitReachesWatchExits(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_ = runner.RemoveRunner(context.WithoutCancel(ctx), cli, id)
+		_ = runner.RemoveContainer(context.WithoutCancel(ctx), cli, id)
 	}()
 
 	select {
@@ -100,7 +100,7 @@ func TestRealRunnerExitReachesWatchExits(t *testing.T) {
 		t.Fatal("no die event with an exit code")
 	}
 	// AutoRemove: the container is gone, and removing it again is not an error.
-	if err := runner.RemoveRunner(ctx, cli, name); err != nil {
+	if err := runner.RemoveContainer(ctx, cli, name); err != nil {
 		t.Fatalf("removing the auto-removed container: %v", err)
 	}
 }

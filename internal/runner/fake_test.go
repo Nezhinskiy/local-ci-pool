@@ -29,9 +29,12 @@ type fakeDocker struct {
 	stdinDone map[string]chan struct{}
 	removes   []string
 	removeErr func(id string) error
-	startErr  error
-	attachErr error
-	events    func(ctx context.Context, opts client.EventsListOptions) client.EventsResult
+	// removeHangs makes ContainerRemove wait for its context, like a stuck
+	// daemon.
+	removeHangs bool
+	startErr    error
+	attachErr   error
+	events      func(ctx context.Context, opts client.EventsListOptions) client.EventsResult
 }
 
 func newFakeDocker() *fakeDocker {
@@ -82,8 +85,13 @@ func (f *fakeDocker) ContainerStart(context.Context, string, client.ContainerSta
 	return client.ContainerStartResult{}, f.startErr
 }
 
-func (f *fakeDocker) ContainerRemove(_ context.Context, id string, o client.ContainerRemoveOptions) (client.ContainerRemoveResult, error) {
+func (f *fakeDocker) ContainerRemove(ctx context.Context, id string, o client.ContainerRemoveOptions) (client.ContainerRemoveResult, error) {
 	f.mu.Lock()
+	if f.removeHangs {
+		f.mu.Unlock()
+		<-ctx.Done()
+		return client.ContainerRemoveResult{}, ctx.Err()
+	}
 	f.calls = append(f.calls, "remove")
 	if o.Force {
 		f.removes = append(f.removes, id)
@@ -141,13 +149,17 @@ func (f *fakeDocker) stdinOf(t *testing.T, id string) string {
 
 // fakeJIT mints a JIT configuration per runner name.
 type fakeJIT struct {
-	mu    sync.Mutex
-	names []string
-	ids   []int
-	err   error
+	mu     sync.Mutex
+	names  []string
+	ids    []int
+	err    error
+	onMint func(name string)
 }
 
 func (j *fakeJIT) GenerateJitRunnerConfig(_ context.Context, s *scaleset.RunnerScaleSetJitRunnerSetting, scaleSetID int) (*scaleset.RunnerScaleSetJitRunnerConfig, error) {
+	if j.onMint != nil {
+		j.onMint(s.Name)
+	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.err != nil {
@@ -168,16 +180,27 @@ type fakeRegistry struct {
 	ids       map[string]int
 	missing   map[string]bool
 	lookupErr error
+	// onLookup runs before a lookup answers, outside the fake's lock; a
+	// non-nil result is the lookup's error.
+	onLookup  func(ctx context.Context, name string) error
 	removeErr func(id int64) error
 	lookups   []string
 	removed   []int64
 }
 
-func (r *fakeRegistry) GetRunnerByName(_ context.Context, name string) (*scaleset.RunnerReference, error) {
+func (r *fakeRegistry) GetRunnerByName(ctx context.Context, name string) (*scaleset.RunnerReference, error) {
+	r.mu.Lock()
+	r.lookups = append(r.lookups, name)
+	hook := r.onLookup
+	r.mu.Unlock()
+	r.docker.record("lookup")
+	if hook != nil {
+		if err := hook(ctx, name); err != nil {
+			return nil, err
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.lookups = append(r.lookups, name)
-	r.docker.record("lookup")
 	if r.lookupErr != nil {
 		return nil, r.lookupErr
 	}
@@ -232,9 +255,11 @@ type fakeStarter struct {
 	jits    map[string]string
 	err     error
 	onStart func(name string)
+	// hangs makes a start wait for its context, like a stuck daemon.
+	hangs bool
 }
 
-func (s *fakeStarter) start(_ context.Context, name, jit string) error {
+func (s *fakeStarter) start(ctx context.Context, name, jit string) error {
 	s.mu.Lock()
 	hook := s.onStart
 	if s.jits == nil {
@@ -243,9 +268,14 @@ func (s *fakeStarter) start(_ context.Context, name, jit string) error {
 	s.names = append(s.names, name)
 	s.jits[name] = jit
 	err := s.err
+	hangs := s.hangs
 	s.mu.Unlock()
 	if hook != nil {
 		hook(name)
+	}
+	if hangs {
+		<-ctx.Done()
+		return ctx.Err()
 	}
 	return err
 }
