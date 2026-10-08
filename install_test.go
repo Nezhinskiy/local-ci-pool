@@ -1,0 +1,763 @@
+package localcipool
+
+import (
+	"bytes"
+	"encoding/json"
+	"encoding/xml"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// The installer is driven with stubs for every tool that would touch the real
+// machine: gh, docker, launchctl, curl, scutil and uname. HOME is a temporary
+// directory, so nothing is written under the real ~/Library, and no test
+// reaches the real launchctl.
+
+const (
+	label        = "com.local-ci-pool.pool"
+	templateName = label + ".plist.tmpl"
+)
+
+// stubScripts are the stub commands. Each appends what it was called with to
+// $STUB_LOG; the ones whose behaviour a test varies read STUB_* variables.
+var stubScripts = map[string]string{
+	"gh": `#!/bin/sh
+echo "gh $*" >> "$STUB_LOG"
+case "$1 $2" in
+"auth status") exit "${STUB_GH_AUTH_EXIT:-0}" ;;
+"release download")
+	dir=""; pattern=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--dir) dir="$2"; shift ;;
+		--pattern) pattern="$2"; shift ;;
+		esac
+		shift
+	done
+	mkdir -p "$dir"
+	arch=arm64
+	case "$pattern" in *amd64*) arch=amd64 ;; esac
+	tar -czf "$dir/local-ci-pool_0.1.0_darwin_$arch.tar.gz" -C "$STUB_ARCHIVE_SRC" .
+	exit 0 ;;
+"attestation verify")
+	if [ -e "$HOME/Library/Application Support/local-ci-pool" ] || [ -e "$HOME/Library/LaunchAgents/` + label + `.plist" ]; then
+		echo "PLACED-BEFORE-VERIFY" >> "$STUB_LOG"
+	fi
+	exit "${STUB_VERIFY_EXIT:-0}" ;;
+esac
+exit 0
+`,
+	"docker": `#!/bin/sh
+echo "docker $*" >> "$STUB_LOG"
+[ "${STUB_DOCKER_EXIT:-0}" = 0 ] || exit "$STUB_DOCKER_EXIT"
+echo "${STUB_DOCKER_INFO:-19327352832 10}"
+`,
+	"launchctl": `#!/bin/sh
+echo "launchctl $*" >> "$STUB_LOG"
+if [ "$1" = bootout ]; then
+	b=gone; p=gone
+	[ -e "$HOME/Library/Application Support/local-ci-pool/bin/pool" ] && b=present
+	[ -e "$HOME/Library/LaunchAgents/` + label + `.plist" ] && p=present
+	echo "at-bootout binary=$b plist=$p" >> "$STUB_LOG"
+fi
+exit 0
+`,
+	"curl": `#!/bin/sh
+echo "curl $*" >> "$STUB_LOG"
+echo '{"slots":4,"projects":[]}'
+`,
+	"scutil": `#!/bin/sh
+echo "scutil $*" >> "$STUB_LOG"
+echo "${STUB_HOST:-Example-MacBook}"
+`,
+	"uname": `#!/bin/sh
+case "$1" in
+-s) echo "${STUB_OS:-Darwin}" ;;
+-m) echo "${STUB_ARCH:-arm64}" ;;
+*) echo "${STUB_OS:-Darwin}" ;;
+esac
+`,
+}
+
+// stubPool is the pool binary inside the stub archive.
+const stubPool = `#!/bin/sh
+echo "pool $*" >> "$STUB_LOG"
+case "$1" in
+version) echo "v0.1.0 abc1234" ;;
+print-defaults) echo '{"drain_seconds":2400,"health_addr":"127.0.0.1:8737"}' ;;
+forget) exit "${STUB_FORGET_EXIT:-0}" ;;
+esac
+`
+
+type env struct {
+	t       *testing.T
+	home    string
+	stubs   string
+	archive string // the tree the stub gh packs into the release archive
+	log     string
+	vars    map[string]string
+}
+
+func newEnv(t *testing.T) *env {
+	t.Helper()
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("no bash")
+	}
+	root := t.TempDir()
+	e := &env{
+		t:       t,
+		home:    filepath.Join(root, "home"),
+		stubs:   filepath.Join(root, "stubs"),
+		archive: filepath.Join(root, "archive"),
+		log:     filepath.Join(root, "calls.log"),
+		vars:    map[string]string{},
+	}
+	for _, d := range []string{e.home, e.stubs, filepath.Join(e.archive, "launchd")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, body := range stubScripts {
+		write(t, filepath.Join(e.stubs, name), body, 0o755)
+	}
+	write(t, filepath.Join(e.archive, "pool"), stubPool, 0o755)
+	tmpl, err := os.ReadFile(filepath.Join("launchd", templateName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(e.archive, "launchd", templateName), string(tmpl), 0o644)
+	write(t, e.log, "", 0o644)
+	return e
+}
+
+func write(t *testing.T, path, body string, mode os.FileMode) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (e *env) binPath() string {
+	return filepath.Join(e.home, "Library", "Application Support", "local-ci-pool", "bin", "pool")
+}
+
+func (e *env) plistPath() string {
+	return filepath.Join(e.home, "Library", "LaunchAgents", label+".plist")
+}
+
+// install runs install.sh with the stubs first on PATH. It returns the combined
+// output and the exit error, if any.
+func (e *env) install(args ...string) (string, error) {
+	e.t.Helper()
+	bash, _ := exec.LookPath("bash")
+	cmd := exec.Command(bash, append([]string{"install.sh"}, args...)...)
+	cmd.Env = []string{
+		"HOME=" + e.home,
+		"PATH=" + e.stubs + ":/usr/bin:/bin",
+		"STUB_LOG=" + e.log,
+		"STUB_ARCHIVE_SRC=" + e.archive,
+		"TMPDIR=" + e.t.TempDir(),
+	}
+	for k, v := range e.vars {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	return out.String(), err
+}
+
+func (e *env) calls() []string {
+	b, err := os.ReadFile(e.log)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	var out []string
+	for _, l := range strings.Split(string(b), "\n") {
+		if l != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// index returns the position of the first call that starts with prefix, or -1.
+func index(calls []string, prefix string) int {
+	for i, c := range calls {
+		if strings.HasPrefix(c, prefix) {
+			return i
+		}
+	}
+	return -1
+}
+
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func TestInstallDryRunVerifiesAttestation(t *testing.T) {
+	e := newEnv(t)
+	out, err := e.install("--dry-run")
+	if err != nil {
+		t.Fatalf("dry run failed: %v\n%s", err, out)
+	}
+	calls := e.calls()
+	if index(calls, "gh attestation verify ") < 0 {
+		t.Fatalf("the attestation was never verified; calls: %v", calls)
+	}
+	if !strings.Contains(strings.Join(calls, "\n"), "--repo Nezhinskiy/local-ci-pool") {
+		t.Errorf("verify is not pinned to this repository: %v", calls)
+	}
+	if index(calls, "gh release download ") > index(calls, "gh attestation verify ") {
+		t.Errorf("the release was verified before it was downloaded: %v", calls)
+	}
+	for _, c := range calls {
+		if c == "PLACED-BEFORE-VERIFY" {
+			t.Fatal("something was placed before the attestation was verified")
+		}
+		if strings.HasPrefix(c, "launchctl ") {
+			t.Errorf("a dry run called launchctl: %q", c)
+		}
+	}
+	if exists(filepath.Join(e.home, "Library")) {
+		t.Errorf("a dry run placed files under %s/Library", e.home)
+	}
+	for _, want := range []string{"would: place the binary", "would: render the launchd agent", "would: stop a running pool"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the dry run does not announce %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestInstallRefusesWhenAttestationFailsAndPlacesNothing(t *testing.T) {
+	for name, args := range map[string][]string{"install": nil, "dry run": {"--dry-run"}} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.vars["STUB_VERIFY_EXIT"] = "1"
+			out, err := e.install(args...)
+			if err == nil {
+				t.Fatalf("the install succeeded although the attestation failed:\n%s", out)
+			}
+			if !strings.Contains(out, "did not verify") {
+				t.Errorf("output does not say the verification failed:\n%s", out)
+			}
+			if exists(filepath.Join(e.home, "Library")) {
+				t.Error("files were placed although the attestation failed")
+			}
+			for _, c := range e.calls() {
+				if strings.HasPrefix(c, "launchctl ") || strings.HasPrefix(c, "pool ") {
+					t.Errorf("%q ran after a failed verification", c)
+				}
+			}
+		})
+	}
+}
+
+func TestInstallVerifiesBeforePlacingAndLoadsTheAgent(t *testing.T) {
+	e := newEnv(t)
+	out, err := e.install("--version", "v0.1.0")
+	if err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	calls := e.calls()
+	for _, c := range calls {
+		if c == "PLACED-BEFORE-VERIFY" {
+			t.Fatal("something was placed before the attestation was verified")
+		}
+	}
+	if !strings.Contains(strings.Join(calls, "\n"), "gh release download v0.1.0 --repo Nezhinskiy/local-ci-pool") {
+		t.Errorf("the requested version was not downloaded: %v", calls)
+	}
+	uid := strconv.Itoa(os.Getuid())
+	bootout := index(calls, "launchctl bootout gui/"+uid+"/"+label)
+	bootstrap := index(calls, "launchctl bootstrap gui/"+uid+" "+e.plistPath())
+	if bootout < 0 || bootstrap < bootout {
+		t.Errorf("want bootout, then bootstrap; calls: %v", calls)
+	}
+	if !exists(e.binPath()) || !exists(e.plistPath()) {
+		t.Errorf("binary %v, plist %v", exists(e.binPath()), exists(e.plistPath()))
+	}
+	if fi, err := os.Stat(e.binPath()); err != nil || fi.Mode()&0o111 == 0 {
+		t.Errorf("the binary is not executable: %v %v", fi, err)
+	}
+	if !exists(filepath.Join(e.home, "Library", "Logs", "local-ci-pool")) {
+		t.Error("the log directory was not created")
+	}
+	if !strings.Contains(out, "4 slots") || !strings.Contains(out, "CI_POOL_HB_EXAMPLEMACBO") {
+		t.Errorf("output lacks the slots and the heartbeat variable:\n%s", out)
+	}
+}
+
+func TestInstallIdempotentNoConfig(t *testing.T) {
+	e := newEnv(t)
+	first, err := e.install("--dry-run")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, first)
+	}
+	second, err := e.install("--dry-run")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, second)
+	}
+	if first != second {
+		t.Fatalf("two dry runs differ:\n--- first\n%s--- second\n%s", first, second)
+	}
+
+	// Two real installs leave the same files and print the same actions.
+	a, err := e.install()
+	if err != nil {
+		t.Fatalf("%v\n%s", err, a)
+	}
+	plist1, _ := os.ReadFile(e.plistPath())
+	bin1, _ := os.ReadFile(e.binPath())
+	b, err := e.install()
+	if err != nil {
+		t.Fatalf("%v\n%s", err, b)
+	}
+	plist2, _ := os.ReadFile(e.plistPath())
+	bin2, _ := os.ReadFile(e.binPath())
+	if a != b || !bytes.Equal(plist1, plist2) || !bytes.Equal(bin1, bin2) {
+		t.Errorf("a second install differs from the first:\n--- first\n%s--- second\n%s", a, b)
+	}
+
+	// Configuration is never written, in any mode.
+	for _, p := range []string{".config", ".docker", ".gitconfig", ".zshrc", ".bash_profile", ".ssh"} {
+		if exists(filepath.Join(e.home, p)) {
+			t.Errorf("the installer wrote %s", p)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(e.home, "Library"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, en := range entries {
+		got = append(got, en.Name())
+	}
+	sort.Strings(got)
+	if strings.Join(got, " ") != "Application Support LaunchAgents Logs" {
+		t.Errorf("Library holds %v, want only Application Support, LaunchAgents and Logs", got)
+	}
+}
+
+func TestInstallPicksTheArchiveByArchitecture(t *testing.T) {
+	for _, tc := range []struct{ uname, pattern string }{
+		{"arm64", "--pattern *darwin_arm64*"},
+		{"x86_64", "--pattern *darwin_amd64*"},
+	} {
+		t.Run(tc.uname, func(t *testing.T) {
+			e := newEnv(t)
+			e.vars["STUB_ARCH"] = tc.uname
+			if out, err := e.install("--dry-run"); err != nil {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			if i := index(e.calls(), "gh release download "); i < 0 || !strings.Contains(e.calls()[i], tc.pattern) {
+				t.Fatalf("calls %v, want %q", e.calls(), tc.pattern)
+			}
+		})
+	}
+	t.Run("unsupported", func(t *testing.T) {
+		e := newEnv(t)
+		e.vars["STUB_ARCH"] = "riscv64"
+		out, err := e.install("--dry-run")
+		if err == nil || !strings.Contains(out, "unsupported architecture") {
+			t.Fatalf("want a refusal, got %v\n%s", err, out)
+		}
+		if index(e.calls(), "gh release download ") >= 0 {
+			t.Error("a release was downloaded for an unsupported architecture")
+		}
+	})
+}
+
+func TestInstallRefusesBeforeDownloading(t *testing.T) {
+	for name, tc := range map[string]struct {
+		vars map[string]string
+		want string
+	}{
+		"gh logged out":      {map[string]string{"STUB_GH_AUTH_EXIT": "1"}, "gh auth login"},
+		"docker not running": {map[string]string{"STUB_DOCKER_EXIT": "1"}, "Docker is not answering"},
+		// 5 GiB: (5 - 2) / 4 = 0 slots.
+		"too little memory": {map[string]string{"STUB_DOCKER_INFO": "5368709120 10"}, "too little for one runner slot"},
+		// 18 GiB but 1 CPU: 0 slots.
+		"too few CPUs": {map[string]string{"STUB_DOCKER_INFO": "19327352832 1"}, "too little for one runner slot"},
+		"not macOS":    {map[string]string{"STUB_OS": "Linux"}, "macOS only"},
+		"bad host":     {map[string]string{"STUB_HOST": "---"}, "no letters or digits"},
+		"garbled info": {map[string]string{"STUB_DOCKER_INFO": "lots of memory"}, "unexpected output of docker info"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			for k, v := range tc.vars {
+				e.vars[k] = v
+			}
+			out, err := e.install()
+			if err == nil || !strings.Contains(out, tc.want) {
+				t.Fatalf("want a refusal mentioning %q, got %v\n%s", tc.want, err, out)
+			}
+			if index(e.calls(), "gh release download ") >= 0 || exists(filepath.Join(e.home, "Library")) {
+				t.Errorf("the installer went on after refusing; calls %v", e.calls())
+			}
+		})
+	}
+}
+
+// The installer prints the same slot count the pool computes (memory rounded
+// to the nearest GiB, then the CPU and the cap).
+func TestInstallSlotsMatchThePool(t *testing.T) {
+	const gib = 1 << 30
+	for _, tc := range []struct {
+		mem   int64
+		cpus  int
+		slots int
+	}{
+		{10 * gib, 10, 2},
+		{8319504384, 10, 1},  // 7.75 GiB reads as 8 GiB
+		{10413000000, 10, 2}, // a 10 GB slider reads 9.7 GiB: rounded to 10, not floored to 9
+		{18 * gib, 10, 4},
+		{18 * gib, 6, 3},
+		{100 * gib, 64, 8},
+		{6 * gib, 2, 1},
+	} {
+		e := newEnv(t)
+		e.vars["STUB_DOCKER_INFO"] = fmt.Sprintf("%d %d", tc.mem, tc.cpus)
+		out, err := e.install("--dry-run")
+		if err != nil {
+			t.Fatalf("%+v: %v\n%s", tc, err, out)
+		}
+		if want := fmt.Sprintf("(%d slots;", tc.slots); !strings.Contains(out, want) {
+			t.Errorf("mem %d, cpus %d: output lacks %q:\n%s", tc.mem, tc.cpus, want, out)
+		}
+	}
+}
+
+func TestInstallRejectsABadVersion(t *testing.T) {
+	e := newEnv(t)
+	out, err := e.install("--version", "latest; rm -rf /")
+	if err == nil || !strings.Contains(out, "--version must look like") {
+		t.Fatalf("want a refusal, got %v\n%s", err, out)
+	}
+	if len(e.calls()) != 0 {
+		t.Errorf("tools ran: %v", e.calls())
+	}
+}
+
+// placeInstalled puts a stub pool and a plist where a previous install left them.
+func (e *env) placeInstalled() {
+	write(e.t, e.binPath(), stubPool, 0o755)
+	write(e.t, e.plistPath(), "<plist/>\n", 0o644)
+}
+
+func TestUninstallForgetsThenBootsOut(t *testing.T) {
+	e := newEnv(t)
+	e.placeInstalled()
+	out, err := e.install("--uninstall")
+	if err != nil {
+		t.Fatalf("uninstall failed: %v\n%s", err, out)
+	}
+	calls := e.calls()
+	forget := index(calls, "pool forget")
+	bootout := index(calls, "launchctl bootout gui/"+strconv.Itoa(os.Getuid())+"/"+label)
+	if forget < 0 || bootout < 0 || forget > bootout {
+		t.Fatalf("want pool forget, then bootout; calls: %v", calls)
+	}
+	// At bootout the files are still there; the removals come after it.
+	if at := index(calls, "at-bootout "); at < 0 || calls[at] != "at-bootout binary=present plist=present" {
+		t.Errorf("the files were removed before the pool was stopped: %v", calls)
+	}
+	if exists(e.binPath()) || exists(e.plistPath()) {
+		t.Errorf("binary %v, plist %v still exist", exists(e.binPath()), exists(e.plistPath()))
+	}
+	for _, c := range calls {
+		if strings.HasPrefix(c, "gh ") {
+			t.Errorf("uninstall called gh: %q", c)
+		}
+	}
+}
+
+func TestUninstallGoesOnWhenForgetFails(t *testing.T) {
+	e := newEnv(t)
+	e.placeInstalled()
+	e.vars["STUB_FORGET_EXIT"] = "1"
+	out, err := e.install("--uninstall")
+	if err != nil {
+		t.Fatalf("uninstall failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "could not delete the heartbeat variables") {
+		t.Errorf("the failed forget was not reported:\n%s", out)
+	}
+	if index(e.calls(), "launchctl bootout") < 0 || exists(e.binPath()) || exists(e.plistPath()) {
+		t.Errorf("the uninstall stopped at the failed forget; calls %v", e.calls())
+	}
+}
+
+func TestUninstallDryRunChangesNothing(t *testing.T) {
+	e := newEnv(t)
+	e.placeInstalled()
+	out, err := e.install("--uninstall", "--dry-run")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if len(e.calls()) != 0 {
+		t.Errorf("a dry run ran %v", e.calls())
+	}
+	if !exists(e.binPath()) || !exists(e.plistPath()) {
+		t.Error("a dry run removed files")
+	}
+	for _, want := range []string{"would: delete this Mac's heartbeat variables", "would: stop the pool", "would: remove"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// plistValue is a decoded property list value: a map, a slice, a string, an
+// int or a bool.
+type plistValue = any
+
+// parsePlist decodes the XML property list subset the template uses.
+func parsePlist(t *testing.T, b []byte) plistValue {
+	t.Helper()
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	dec.Strict = true
+	// Find <plist>, then decode its single child.
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			t.Fatalf("no <plist> element: %v", err)
+		}
+		if se, ok := tok.(xml.StartElement); ok && se.Name.Local == "plist" {
+			break
+		}
+	}
+	v, err := plistNext(dec)
+	if err != nil {
+		t.Fatalf("parsing the plist: %v", err)
+	}
+	return v
+}
+
+func nextStart(dec *xml.Decoder) (xml.StartElement, bool, error) {
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return xml.StartElement{}, false, err
+		}
+		switch tt := tok.(type) {
+		case xml.StartElement:
+			return tt, true, nil
+		case xml.EndElement:
+			return xml.StartElement{}, false, nil
+		}
+	}
+}
+
+func plistNext(dec *xml.Decoder) (plistValue, error) {
+	se, ok, err := nextStart(dec)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return plistDecode(dec, se)
+}
+
+func plistDecode(dec *xml.Decoder, se xml.StartElement) (plistValue, error) {
+	switch se.Name.Local {
+	case "dict":
+		m := map[string]plistValue{}
+		for {
+			k, ok, err := nextStart(dec)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return m, nil
+			}
+			if k.Name.Local != "key" {
+				return nil, fmt.Errorf("want <key>, got <%s>", k.Name.Local)
+			}
+			var name string
+			if err := dec.DecodeElement(&name, &k); err != nil {
+				return nil, err
+			}
+			v, err := plistNext(dec)
+			if err != nil {
+				return nil, err
+			}
+			m[name] = v
+		}
+	case "array":
+		var a []plistValue
+		for {
+			e, ok, err := nextStart(dec)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return a, nil
+			}
+			v, err := plistDecode(dec, e)
+			if err != nil {
+				return nil, err
+			}
+			a = append(a, v)
+		}
+	case "string":
+		var s string
+		return s, dec.DecodeElement(&s, &se)
+	case "integer":
+		var s string
+		if err := dec.DecodeElement(&s, &se); err != nil {
+			return nil, err
+		}
+		return strconv.Atoi(strings.TrimSpace(s))
+	case "true", "false":
+		if err := dec.Skip(); err != nil {
+			return nil, err
+		}
+		return se.Name.Local == "true", nil
+	}
+	return nil, fmt.Errorf("unsupported plist element <%s>", se.Name.Local)
+}
+
+func dict(t *testing.T, v plistValue, what string) map[string]plistValue {
+	t.Helper()
+	m, ok := v.(map[string]plistValue)
+	if !ok {
+		t.Fatalf("%s is %T, want a dict", what, v)
+	}
+	return m
+}
+
+func TestPlistKeys(t *testing.T) {
+	e := newEnv(t)
+	if out, err := e.install(); err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	raw, err := os.ReadFile(e.plistPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "@") {
+		t.Errorf("a placeholder is left in the plist:\n%s", raw)
+	}
+	top := dict(t, parsePlist(t, raw), "the plist")
+
+	if top["Label"] != label {
+		t.Errorf("Label = %v", top["Label"])
+	}
+	keep := dict(t, top["KeepAlive"], "KeepAlive")
+	if keep["SuccessfulExit"] != false {
+		t.Errorf("KeepAlive.SuccessfulExit = %v, want false (a clean exit must not restart the pool)", keep["SuccessfulExit"])
+	}
+	if top["ThrottleInterval"] != 30 {
+		t.Errorf("ThrottleInterval = %v, want 30", top["ThrottleInterval"])
+	}
+	if top["ProcessType"] != "Background" {
+		t.Errorf("ProcessType = %v, want Background", top["ProcessType"])
+	}
+	if top["RunAtLoad"] != true {
+		t.Errorf("RunAtLoad = %v, want true", top["RunAtLoad"])
+	}
+	args, _ := top["ProgramArguments"].([]plistValue)
+	if len(args) != 2 || args[0] != e.binPath() || args[1] != "run" {
+		t.Errorf("ProgramArguments = %v, want [%s run]", args, e.binPath())
+	}
+	logs := filepath.Join(e.home, "Library", "Logs", "local-ci-pool", "pool.log")
+	if top["StandardOutPath"] != logs || top["StandardErrorPath"] != logs {
+		t.Errorf("log paths = %v, %v, want %s", top["StandardOutPath"], top["StandardErrorPath"], logs)
+	}
+	path, _ := dict(t, top["EnvironmentVariables"], "EnvironmentVariables")["PATH"].(string)
+	for _, d := range []string{"/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"} {
+		if !hasPathEntry(path, d) {
+			t.Errorf("PATH %q lacks %s", path, d)
+		}
+	}
+	// The pool shells out to scutil and ioreg, which live in /usr/sbin.
+	if !hasPathEntry(path, "/usr/sbin") {
+		t.Errorf("PATH %q lacks /usr/sbin (scutil, ioreg)", path)
+	}
+
+	// launchd must not kill a pool that is still draining: ExitTimeOut is
+	// above the pool's own drain bound, which the pool itself reports.
+	drain := poolDefaults(t).DrainSeconds
+	exitTimeOut, _ := top["ExitTimeOut"].(int)
+	if exitTimeOut != 2700 {
+		t.Errorf("ExitTimeOut = %v, want 2700", top["ExitTimeOut"])
+	}
+	if exitTimeOut <= drain {
+		t.Errorf("ExitTimeOut %d must exceed the drain default %d s", exitTimeOut, drain)
+	}
+}
+
+func hasPathEntry(path, dir string) bool {
+	for _, p := range strings.Split(path, ":") {
+		if p == dir {
+			return true
+		}
+	}
+	return false
+}
+
+type defaultsJSON struct {
+	DrainSeconds int    `json:"drain_seconds"`
+	HealthAddr   string `json:"health_addr"`
+}
+
+// poolDefaults reads the defaults from the real program, so the plist is
+// checked against the number the pool uses and not a copy of it.
+func poolDefaults(t *testing.T) defaultsJSON {
+	t.Helper()
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("no go toolchain on PATH")
+	}
+	cmd := exec.Command(goBin, "run", "./cmd/pool", "print-defaults")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go run ./cmd/pool print-defaults: %v\n%s", err, stderr.String())
+	}
+	var d defaultsJSON
+	if err := json.Unmarshal(out, &d); err != nil {
+		t.Fatalf("print-defaults printed %q: %v", out, err)
+	}
+	if d.DrainSeconds <= 0 {
+		t.Fatalf("print-defaults = %+v", d)
+	}
+	return d
+}
+
+// A home directory with characters that matter to sed and XML still gives a
+// valid plist with the right paths.
+func TestPlistRenderingEscapesPaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+	e := newEnv(t)
+	home := filepath.Join(filepath.Dir(e.home), "ho&me|dir")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.home = home
+	if out, err := e.install(); err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	raw, err := os.ReadFile(e.plistPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	top := dict(t, parsePlist(t, raw), "the plist")
+	args, _ := top["ProgramArguments"].([]plistValue)
+	if len(args) != 2 || args[0] != e.binPath() {
+		t.Fatalf("ProgramArguments = %v, want %s first", args, e.binPath())
+	}
+}

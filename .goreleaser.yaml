@@ -1,0 +1,51 @@
+# GoReleaser configuration; the release workflow runs it on a v* tag.
+version: 2
+
+project_name: local-ci-pool
+
+before:
+  hooks:
+    - go mod verify
+
+builds:
+  - id: pool
+    main: ./cmd/pool
+    binary: pool
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+    goarch:
+      - arm64
+      - amd64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Tag }} -X main.commit={{ .ShortCommit }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: pool
+    ids:
+      - pool
+    formats:
+      - tar.gz
+    # Archive names carry the OS and the architecture (darwin_arm64,
+    # darwin_amd64); install.sh selects by those words.
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # The launchd template travels with the binary it was written for, so the
+    # installer renders a template that has been attested together with it.
+    files:
+      - LICENSE
+      - src: launchd/com.local-ci-pool.pool.plist.tmpl
+        dst: launchd/com.local-ci-pool.pool.plist.tmpl
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  disable: true
+
+release:
+  prerelease: auto

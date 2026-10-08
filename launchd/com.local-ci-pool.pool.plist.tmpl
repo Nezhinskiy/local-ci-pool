@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.local-ci-pool.pool</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@BIN@</string>
+		<string>run</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Restart after a crash or a Docker change (non-zero exit). A cause that
+	     restarting cannot fix, such as a logged-out gh, makes the pool exit 0. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<!-- 45 minutes: longer than the pool's 40 minute drain, so launchd never
+	     kills a pool that is finishing its jobs. -->
+	<key>ExitTimeOut</key>
+	<integer>2700</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@LOG_DIR@/pool.log</string>
+	<key>StandardErrorPath</key>
+	<string>@LOG_DIR@/pool.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- gh and git live under /opt/homebrew or /usr/local; scutil and ioreg
+		     are in /usr/sbin. -->
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+</dict>
+</plist>
