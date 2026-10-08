@@ -10,7 +10,8 @@
 #   HOSTED_LABEL   label to use when no machine is fresh
 #   HOSTED_SHARDS  shard count to use when no machine is fresh
 #   MODE           auto | hosted
-#   NOW            unix time override (tests only; defaults to the clock)
+#   ROUTE_TEST_NOW unix time override (tests only; defaults to the clock). Not named NOW
+#                  so that a caller workflow's own NOW cannot skew freshness.
 set -euo pipefail
 
 die() {
@@ -26,7 +27,7 @@ identity="${IDENTITY-}"
 hosted_label="${HOSTED_LABEL-}"
 hosted_shards="${HOSTED_SHARDS-}"
 mode="${MODE-auto}"
-now="${NOW-}"
+now="${ROUTE_TEST_NOW-}"
 if [[ -z "$now" ]]; then
   now="$(date +%s)"
 fi
@@ -35,7 +36,7 @@ fi
 [[ "$hosted_label" =~ ^[a-z0-9.-]{1,64}$ ]] || die "hosted-label must match [a-z0-9.-]{1,64}"
 [[ "$hosted_shards" =~ ^[1-9][0-9]?$ ]] || die "hosted-shards must be a positive integer below 100"
 [[ "$mode" == "auto" || "$mode" == "hosted" ]] || die "mode must be auto or hosted"
-[[ "$now" =~ ^[0-9]{1,12}$ ]] || die "NOW must be a unix time in seconds"
+[[ "$now" =~ ^[0-9]{1,12}$ ]] || die "ROUTE_TEST_NOW must be a unix time in seconds"
 [[ -n "${GITHUB_OUTPUT-}" ]] || die "GITHUB_OUTPUT is not set"
 
 fresh=0

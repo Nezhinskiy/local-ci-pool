@@ -2,12 +2,14 @@ package route
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -59,15 +61,15 @@ func runRoute(t *testing.T, env map[string]string) result {
 		t.Fatal(err)
 	}
 	vars := map[string]string{
-		"PATH":          os.Getenv("PATH"),
-		"HOME":          work,
-		"NOW":           now,
-		"IDENTITY":      identity,
-		"HOSTED_LABEL":  hostedLabel,
-		"HOSTED_SHARDS": hostedShards,
-		"MODE":          "auto",
-		"VARS_JSON":     "{}",
-		"GITHUB_OUTPUT": outFile,
+		"PATH":           os.Getenv("PATH"),
+		"HOME":           work,
+		"ROUTE_TEST_NOW": now,
+		"IDENTITY":       identity,
+		"HOSTED_LABEL":   hostedLabel,
+		"HOSTED_SHARDS":  hostedShards,
+		"MODE":           "auto",
+		"VARS_JSON":      "{}",
+		"GITHUB_OUTPUT":  outFile,
 	}
 	for k, v := range env {
 		if v == "\x00unset" {
@@ -181,7 +183,7 @@ func TestRouteSelection(t *testing.T) {
 				env["MODE"] = c.mode
 			}
 			if c.noNow {
-				env["NOW"] = "\x00unset"
+				env["ROUTE_TEST_NOW"] = "\x00unset"
 			}
 			r := runRoute(t, env)
 			if r.exit != 0 {
@@ -210,6 +212,32 @@ func TestRouteSelection(t *testing.T) {
 	}
 }
 
+// The table above fixes the clock with ROUTE_TEST_NOW. These two run the
+// script's real default clock (`date +%s`) against a heartbeat stamped now.
+func TestRouteDefaultClockSeesFreshHeartbeat(t *testing.T) {
+	vars := fmt.Sprintf("{\n  \"CI_POOL_HB_ALPHA\": \"%d 2\"\n}\n", time.Now().Unix())
+	for name, extra := range map[string]map[string]string{
+		"clock_override_unset": {},
+		// A caller workflow's own NOW must not skew freshness.
+		"caller_now_env_ignored": {"NOW": "1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := map[string]string{"VARS_JSON": vars, "ROUTE_TEST_NOW": "\x00unset"}
+			for k, v := range extra {
+				env[k] = v
+			}
+			r := runRoute(t, env)
+			if r.exit != 0 {
+				t.Fatalf("exit %d: %s", r.exit, r.stderr)
+			}
+			got := parseOutputs(t, r)
+			if got["label"] != localLabel || got["shards"] != "2" || got["local"] != "true" {
+				t.Errorf("got %v, want label=%s shards=2 local=true", got, localLabel)
+			}
+		})
+	}
+}
+
 func TestRouteInvalidJSONIsLoggedOnce(t *testing.T) {
 	r := runRoute(t, map[string]string{"VARS_JSON": fixture(t, "newline_raw")})
 	if r.exit != 0 {
@@ -232,7 +260,7 @@ func TestRouteRejectsBadInputs(t *testing.T) {
 		"hosted_shards_zero":     {"HOSTED_SHARDS": "0"},
 		"mode_unknown":           {"MODE": "per-machine"},
 		"mode_newline":           {"MODE": "auto\n"},
-		"now_not_a_number":       {"NOW": "abc"},
+		"now_not_a_number":       {"ROUTE_TEST_NOW": "abc"},
 		"github_output_empty":    {"GITHUB_OUTPUT": ""},
 		"github_output_unset":    {"GITHUB_OUTPUT": "\x00unset"},
 		"identity_unset_in_step": {"IDENTITY": "\x00unset"},
@@ -292,6 +320,11 @@ func TestActionWiring(t *testing.T) {
 		if !want.MatchString(text) {
 			t.Errorf("env %s is not set from ${{ %s }}", env, expr)
 		}
+	}
+
+	// The outputs map through steps.route, so the step must carry that id.
+	if !regexp.MustCompile(`(?m)^\s+- id: route$`).MatchString(text) {
+		t.Error("the run step does not have id: route")
 	}
 
 	runLine := regexp.MustCompile(`(?m)^\s+run:\s*(.*)$`)
