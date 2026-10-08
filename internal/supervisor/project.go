@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
 	"github.com/Nezhinskiy/local-ci-pool/internal/machine"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runner"
+	"github.com/Nezhinskiy/local-ci-pool/internal/runnermount"
 )
 
 // project serves one repository: its image, its scale set, one session at a
@@ -30,10 +33,14 @@ type project struct {
 	cancel   context.CancelFunc
 	done     chan struct{} // closed when run returns
 
-	mu         sync.Mutex
-	p          discovery.Project
-	img        Image
-	imgErr     string // the last image refresh failed
+	mu     sync.Mutex
+	p      discovery.Project
+	img    Image
+	mount  runnermount.Mount // the runner mount img passed the preflight with
+	imgErr string            // the last image refresh failed
+	// mountErr: the newest runner failed the preflight with img, so the
+	// project's runners stay on the older mount.
+	mountErr   string
 	up         bool   // a listener runs on an open session
 	reason     string // why the project is not up
 	failed     bool   // setup failed; the next discovery pass starts it again
@@ -117,7 +124,7 @@ func (pr *project) run() {
 		}
 		pr.setDown(err.Error())
 		pr.log.Warn("the listener stopped; restarting it", "error", err.Error(), "in", wait)
-		pr.closeSession()
+		pr.closeSession(context.Background())
 		if pr.s.deps.Clock.Now().Sub(began) >= restartMax {
 			wait = restartMin
 		}
@@ -139,12 +146,13 @@ func (pr *project) setup() error {
 	if err != nil {
 		return fmt.Errorf("preparing the image: %w", err)
 	}
-	user, err := s.deps.Check(pr.ctx, ref, s.currentMount())
+	m := s.currentMount()
+	user, err := s.deps.Check(pr.ctx, ref, m)
 	if err != nil {
 		return fmt.Errorf("image %s: %w", ref, err)
 	}
 	pr.mu.Lock()
-	pr.img = Image{Ref: ref, User: user}
+	pr.img, pr.mount = Image{Ref: ref, User: user}, m
 	pr.mu.Unlock()
 	if err := pr.connect(); err != nil {
 		return err
@@ -199,21 +207,30 @@ func (pr *project) reauth(gen int) error {
 }
 
 // ensureScaleSet gets the scale set by name or, when there is none, creates
-// it with the shared label and runner updates disabled.
+// it with the shared label and runner updates disabled. A scale set found with
+// other labels than exactly its name and the shared label is updated to
+// those; it is never deleted, since this process may hold no session on it.
 func (pr *project) ensureScaleSet() (int, error) {
+	want := scaleset.RunnerScaleSet{
+		Name:          pr.name,
+		RunnerGroupID: runnerGroupID,
+		Labels:        labelsOf(pr.labels),
+		RunnerSetting: scaleset.RunnerSetting{DisableUpdate: true},
+	}
 	for {
 		c, gen := pr.currentClient()
 		ss, err := c.GetRunnerScaleSet(pr.ctx, runnerGroupID, pr.name)
-		if err == nil && ss == nil {
-			ss, err = c.CreateRunnerScaleSet(pr.ctx, &scaleset.RunnerScaleSet{
-				Name:          pr.name,
-				RunnerGroupID: runnerGroupID,
-				Labels:        labelsOf(pr.labels),
-				RunnerSetting: scaleset.RunnerSetting{DisableUpdate: true},
-			})
+		switch {
+		case err == nil && ss == nil:
+			body := want
+			ss, err = c.CreateRunnerScaleSet(pr.ctx, &body)
 			if err == nil {
 				pr.log.Info("scale set created")
 			}
+		case err == nil && !sameLabels(ss.Labels, pr.labels):
+			pr.log.Warn("the scale set has other labels; updating them", "labels", strings.Join(namesOf(ss.Labels), ","), "want", strings.Join(pr.labels, ","))
+			body := want
+			ss, err = c.UpdateRunnerScaleSet(pr.ctx, ss.ID, &body)
 		}
 		switch {
 		case err == nil && ss != nil:
@@ -228,6 +245,29 @@ func (pr *project) ensureScaleSet() (int, error) {
 			return 0, fmt.Errorf("getting or creating scale set %s: %w", pr.name, err)
 		}
 	}
+}
+
+// sameLabels reports whether have names exactly the labels want, in any
+// order.
+func sameLabels(have []scaleset.Label, want []string) bool {
+	names := namesOf(have)
+	if len(names) != len(want) {
+		return false
+	}
+	for _, w := range want {
+		if !slices.Contains(names, w) {
+			return false
+		}
+	}
+	return true
+}
+
+func namesOf(labels []scaleset.Label) []string {
+	out := make([]string, 0, len(labels))
+	for _, l := range labels {
+		out = append(out, l.Name)
+	}
+	return out
 }
 
 func labelsOf(names []string) []scaleset.Label {
@@ -328,14 +368,14 @@ func (pr *project) serveOnce() error {
 }
 
 // recheck asks GitHub again, before a session opens, whether the repository
-// is still there and private. One that is not is drained; the run returns
-// errLeft.
+// is still there, still under the same owner and name (a case-only rename
+// aside), and private. One that is not is drained; the run returns errLeft.
 func (pr *project) recheck() error {
 	r, err := pr.s.deps.GitHub.Repo(pr.ctx, pr.repo)
 	switch {
-	case errors.Is(err, github.ErrNotFound), err == nil && !r.Private:
-		pr.log.Warn("the repository is gone or no longer private; draining")
-		pr.setDown("the repository is gone or no longer private")
+	case errors.Is(err, github.ErrNotFound), err == nil && (!r.Private || !strings.EqualFold(r.FullName, pr.repo)):
+		pr.log.Warn("the repository is gone, moved or no longer private; draining", "now", r.FullName)
+		pr.setDown("the repository is gone, moved or no longer private")
 		pr.s.requestDrain(pr)
 		return errLeft
 	case err != nil:
@@ -353,47 +393,93 @@ func (pr *project) currentID() int {
 	return pr.scaleSetID
 }
 
-// start is the scaler's Start: one runner container in the current image with
-// the current runner mount.
+// start is the scaler's Start: one runner container in the project's image
+// with the project's runner mount.
 func (pr *project) start(ctx context.Context, name, jit string) error {
 	pr.mu.Lock()
-	img := pr.img
+	img, m := pr.img, pr.mount
 	pr.mu.Unlock()
 	_, err := runner.StartRunner(ctx, pr.s.deps.Docker, runner.ContainerSpec{
 		Image:    img.Ref,
 		User:     img.User,
 		Name:     name,
 		Instance: pr.s.instance,
-		Mount:    pr.s.currentMount().Spec,
+		Mount:    m.Spec,
 		JIT:      jit,
 	})
 	return err
 }
 
-// refresh ensures the discovered project's image again; a changed reference
-// is preflighted and used by the next starts. A failure marks the project
-// unhealthy and keeps the current image.
+func (pr *project) mountVersion() string {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	return pr.mount.Version
+}
+
+// heldBack is the reason of a project whose image failed the preflight with
+// the newest runner.
+func heldBack(newest, ref, kept string, err error) string {
+	return fmt.Sprintf("runner %s failed the preflight with image %s, so the runners stay on runner %s: %v", newest, ref, kept, err)
+}
+
+// adopt moves the project to the runner mount m once its current image has
+// passed the preflight with it. A project whose image fails keeps its mount,
+// and so its runners work as before, but is unhealthy with the reason until a
+// later preflight with the newest mount passes (the next release check, or
+// the next image refresh).
+func (pr *project) adopt(m runnermount.Mount) {
+	pr.mu.Lock()
+	ready := pr.scaler != nil && !pr.draining && !pr.failed
+	img, cur := pr.img, pr.mount
+	pr.mu.Unlock()
+	if !ready || cur.Version == m.Version {
+		return
+	}
+	user, err := pr.s.deps.Check(pr.ctx, img.Ref, m)
+	if pr.ctx.Err() != nil {
+		return
+	}
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	if pr.img.Ref != img.Ref || pr.mount.Version != cur.Version {
+		return // an image refresh moved the project meanwhile
+	}
+	if err != nil {
+		pr.log.Warn("the new runner failed the preflight; keeping the old one", "runner", m.Version, "kept", cur.Version, "error", err.Error())
+		pr.mountErr = heldBack(m.Version, img.Ref, cur.Version, err)
+		return
+	}
+	pr.log.Info("the next runners use the new runner release", "runner", m.Version)
+	pr.img.User = user
+	pr.mount, pr.mountErr = m, ""
+	pr.resetNoJobLocked()
+}
+
+// refresh ensures the discovered project's image again. The image is
+// preflighted with the newest runner mount when its reference changed, when
+// the project is still on an older mount, or when its runners keep exiting
+// without a job; a passed preflight makes both the next starts' image and
+// mount. A failed refresh keeps the current image and mount, so the runners
+// work as before, and marks the project unhealthy until a refresh passes.
 func (pr *project) refresh(p discovery.Project) {
 	defer func() {
 		pr.mu.Lock()
 		pr.refreshing = false
 		pr.mu.Unlock()
 	}()
+	newest := pr.s.currentMount()
+	pr.mu.Lock()
+	cur, kept, sc := pr.img, pr.mount, pr.scaler
+	pr.mu.Unlock()
+	stuck := sc != nil && sc.NoJobExits() >= noJobLimit
+
 	ref, err := pr.s.deps.Ensure(pr.ctx, p)
-	if err == nil {
-		pr.mu.Lock()
-		same := ref == pr.img.Ref
-		pr.mu.Unlock()
-		if !same {
-			var user string
-			if user, err = pr.s.deps.Check(pr.ctx, ref, pr.s.currentMount()); err == nil {
-				pr.log.Info("the image changed; the next runners use it", "image", ref)
-				pr.mu.Lock()
-				pr.img = Image{Ref: ref, User: user}
-				pr.mu.Unlock()
-			} else {
-				err = fmt.Errorf("image %s: %w", ref, err)
-			}
+	var user string
+	var checkErr error
+	checked := err == nil && (ref != cur.Ref || kept.Version != newest.Version || stuck)
+	if checked {
+		if user, checkErr = pr.s.deps.Check(pr.ctx, ref, newest); checkErr != nil {
+			err = fmt.Errorf("image %s with runner %s: %w", ref, newest.Version, checkErr)
 		}
 	}
 	if pr.ctx.Err() != nil {
@@ -403,9 +489,32 @@ func (pr *project) refresh(p discovery.Project) {
 	defer pr.mu.Unlock()
 	pr.p = p
 	pr.imgErr = ""
-	if err != nil {
+	switch {
+	case err == nil && checked:
+		if ref != cur.Ref {
+			pr.log.Info("the image changed; the next runners use it", "image", ref)
+		}
+		if pr.mount.Version != newest.Version {
+			pr.log.Info("the next runners use the new runner release", "runner", newest.Version)
+		}
+		pr.img = Image{Ref: ref, User: user}
+		pr.mount, pr.mountErr = newest, ""
+		pr.resetNoJobLocked()
+	case err == nil:
+	case checkErr != nil && ref == pr.img.Ref && pr.mount.Version != newest.Version:
+		pr.log.Warn("the newest runner still fails the preflight; keeping the old one", "runner", newest.Version, "error", checkErr.Error())
+		pr.mountErr = heldBack(newest.Version, ref, pr.mount.Version, checkErr)
+	default:
 		pr.log.Warn("refreshing the image", "error", err.Error())
 		pr.imgErr = "refreshing the image: " + err.Error()
+	}
+}
+
+// resetNoJobLocked clears the scaler's no-job exits after a passed
+// preflight. pr.mu is held.
+func (pr *project) resetNoJobLocked() {
+	if pr.scaler != nil {
+		pr.scaler.ResetNoJobExits()
 	}
 }
 
@@ -424,8 +533,11 @@ func (pr *project) claimRefresh() bool {
 // drain stops the project for good: no new runners, then it waits until the
 // scaler holds no runner or the deadline passes, stops the listener, closes
 // the session and deletes the scale set, retrying a delete refused while a
-// job still runs until the deadline. It reports false if life ended first,
-// leaving the session to Run.
+// job still runs until the deadline. Everything after the wait shares one
+// budget, afterBound past the later of now and the deadline, so a stop never
+// outlasts the drain bound by more than that. At the bound the runners left
+// are removed and an in-flight start or reap is aborted. It reports false if
+// life ended first, leaving the session to Run.
 func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	clock := pr.s.deps.Clock
 	pr.mu.Lock()
@@ -453,18 +565,27 @@ func (pr *project) drain(life context.Context, deadline time.Time) bool {
 		case <-clock.After(drainPoll):
 		}
 	}
+	post, cancel := context.WithTimeout(context.Background(), afterBound+max(deadline.Sub(clock.Now()), 0))
+	defer cancel()
+	if sc := pr.getScaler(); sc != nil && len(sc.Held()) > 0 {
+		sc.Abort()
+	}
 	pr.cancel()
-	<-pr.done
-	pr.removeLeft()
-	held := pr.closeSession()
+	select {
+	case <-pr.done:
+	case <-post.Done():
+		pr.log.Warn("the listener did not stop within the drain's budget; going on")
+	}
+	pr.removeLeft(post)
+	held := pr.closeSession(post)
 	if !held && pr.mayReopen() {
-		held = pr.reopenToDelete()
+		held = pr.reopenToDelete(post)
 	}
 	if !held {
 		pr.log.Info("no session held; leaving the scale set")
 		return true
 	}
-	pr.deleteScaleSet(life, deadline)
+	pr.deleteScaleSet(life, post, deadline)
 	return true
 }
 
@@ -479,9 +600,9 @@ func (pr *project) mayReopen() bool {
 
 // reopenToDelete opens and closes one session, once, and reports whether it
 // opened: only then may the scale set be deleted.
-func (pr *project) reopenToDelete() bool {
+func (pr *project) reopenToDelete(post context.Context) bool {
 	c, _ := pr.currentClient()
-	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	ctx, cancel := context.WithTimeout(post, callTimeout)
 	defer cancel()
 	sess, err := c.OpenSession(ctx, pr.currentID(), pr.s.machine.Owner)
 	if err != nil {
@@ -495,14 +616,14 @@ func (pr *project) reopenToDelete() bool {
 }
 
 // removeLeft removes the containers of runners still held after the drain
-// bound and releases their slots.
-func (pr *project) removeLeft() {
+// bound and releases their slots, all within post.
+func (pr *project) removeLeft(post context.Context) {
 	sc := pr.getScaler()
 	if sc == nil {
 		return
 	}
 	for _, r := range sc.Held() {
-		ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+		ctx, cancel := context.WithTimeout(post, callTimeout)
 		if err := runner.RemoveContainer(ctx, pr.s.deps.Docker, r.Name); err != nil {
 			pr.log.Warn("removing a runner left after the drain", "runner", r.Name, "error", err.Error())
 		}
@@ -528,11 +649,11 @@ func (pr *project) unregister(ctx context.Context, name string) error {
 	return clientRef{pr}.RemoveRunner(ctx, int64(ref.ID))
 }
 
-func (pr *project) deleteScaleSet(life context.Context, deadline time.Time) {
+func (pr *project) deleteScaleSet(life, post context.Context, deadline time.Time) {
 	clock := pr.s.deps.Clock
 	for {
 		c, _ := pr.currentClient()
-		ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+		ctx, cancel := context.WithTimeout(post, callTimeout)
 		err := c.DeleteRunnerScaleSet(ctx, pr.currentID())
 		cancel()
 		if err == nil {
@@ -547,14 +668,17 @@ func (pr *project) deleteScaleSet(life context.Context, deadline time.Time) {
 		select {
 		case <-life.Done():
 			return
+		case <-post.Done():
+			pr.log.Warn("leaving the scale set for the next start: the drain's budget is spent")
+			return
 		case <-clock.After(min(deleteRetry, left)):
 		}
 	}
 }
 
-// closeSession closes the open session, if any, and reports whether there
-// was one.
-func (pr *project) closeSession() bool {
+// closeSession closes the open session, if any, within ctx, and reports
+// whether there was one.
+func (pr *project) closeSession(ctx context.Context) bool {
 	pr.mu.Lock()
 	sess := pr.session
 	pr.session = nil
@@ -562,7 +686,7 @@ func (pr *project) closeSession() bool {
 	if sess == nil {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
 	if err := sess.Close(ctx); err != nil {
 		pr.log.Warn("closing the session", "error", err.Error())
@@ -616,7 +740,6 @@ func (pr *project) isFailed() bool {
 
 func (pr *project) health() ProjectHealth {
 	pr.mu.Lock()
-	defer pr.mu.Unlock()
 	h := ProjectHealth{Repo: pr.repo, Identity: pr.identity, Image: pr.img.Ref}
 	switch {
 	case pr.draining:
@@ -625,8 +748,18 @@ func (pr *project) health() ProjectHealth {
 		h.Reason = pr.reason
 	case pr.imgErr != "":
 		h.Reason = pr.imgErr
+	case pr.mountErr != "":
+		h.Reason = pr.mountErr
 	default:
 		h.Healthy = true
+	}
+	sc := pr.scaler
+	pr.mu.Unlock()
+	if h.Healthy && sc != nil {
+		if n := sc.NoJobExits(); n >= noJobLimit {
+			h.Healthy = false
+			h.Reason = fmt.Sprintf("%d runners in a row went away without starting a job: the image or the runner is broken; this clears on the next job or passed preflight", n)
+		}
 	}
 	return h
 }

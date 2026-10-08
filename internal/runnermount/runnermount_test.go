@@ -454,6 +454,24 @@ func TestPrune(t *testing.T) {
 	}
 }
 
+// A project whose image failed the preflight with the newest runner keeps
+// the older mount, so Prune keeps every version it is given.
+func TestPruneKeepsEveryVersionInUse(t *testing.T) {
+	d := &fakeDocker{
+		list: []image.Summary{
+			summary("sha256:new", "local-ci/runner:2.339.0"),
+			summary("sha256:held", "local-ci/runner:2.338.0"),
+			summary("sha256:old", "local-ci/runner:2.337.0"),
+		},
+	}
+	if err := Prune(context.Background(), d, "2.339.0", "2.338.0"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(d.removed, ",") != "local-ci/runner:2.337.0" {
+		t.Fatalf("removed %v, want only 2.337.0", d.removed)
+	}
+}
+
 func TestPruneAcceptsAFullReferenceAndJoinsErrors(t *testing.T) {
 	d := &fakeDocker{
 		list: []image.Summary{

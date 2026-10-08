@@ -397,3 +397,31 @@ func TestSetScaleSetIDRetargetsLaterStarts(t *testing.T) {
 		t.Fatalf("JIT minted for scale sets %v, want 7 then 9", h.jit.ids)
 	}
 }
+
+// Scaling down is not a broken runner: reaped idle runners, a completed job's
+// exit and a start stopped by a drain never count towards NoJobExits; an idle
+// runner's exit does, and a job report clears the count.
+func TestNoJobExitsCountOnlyRunnersThatNeverTookAJob(t *testing.T) {
+	h := newHarness(NewSlots(4))
+	desired(t, h.scaler, 3)
+	desired(t, h.scaler, 0) // reaps all three
+	if n := h.scaler.NoJobExits(); n != 0 || len(h.docker.removed()) != 3 {
+		t.Fatalf("no-job exits %d after reaping %v, want 0", n, h.docker.removed())
+	}
+	desired(t, h.scaler, 2)
+	names := h.starter.started()[3:]
+	h.scaler.Started(names[0])
+	h.scaler.Completed(names[0])
+	h.scaler.Exited(names[0])
+	if n := h.scaler.NoJobExits(); n != 0 {
+		t.Fatalf("no-job exits %d after a completed job's exit, want 0", n)
+	}
+	h.scaler.Exited(names[1])
+	if n := h.scaler.NoJobExits(); n != 1 {
+		t.Fatalf("no-job exits %d after an idle runner's exit, want 1", n)
+	}
+	h.scaler.Completed("local-ci-000000000000") // late, for a runner already gone
+	if n := h.scaler.NoJobExits(); n != 0 {
+		t.Fatalf("no-job exits %d after a job report, want 0", n)
+	}
+}

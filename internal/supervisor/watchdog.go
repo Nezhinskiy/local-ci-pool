@@ -147,7 +147,9 @@ func (s *Supervisor) listContainers(ctx context.Context) ([]container.Summary, e
 }
 
 // releases checks for a new runner release every releaseEvery. A new version
-// becomes the mount of the next started runners.
+// becomes the mount of projects set up from then on; a served project moves to
+// it only after its current image passed the preflight with it (adopt), and
+// the mounts no project uses are pruned.
 func (s *Supervisor) releases(ctx context.Context, arch string) {
 	for {
 		select {
@@ -169,9 +171,17 @@ func (s *Supervisor) releases(ctx context.Context, arch string) {
 		s.mu.Lock()
 		old := s.mount
 		s.mount = m
+		prs := s.projectList()
 		s.mu.Unlock()
 		if m.Version != old.Version {
-			s.log.Info("new runner release; the next runners use it", "from", old.Version, "to", m.Version)
+			s.log.Info("new runner release; preflighting every project with it", "from", old.Version, "to", m.Version)
 		}
+		for _, pr := range prs {
+			if ctx.Err() != nil {
+				return
+			}
+			pr.adopt(m)
+		}
+		s.prune(ctx)
 	}
 }

@@ -75,6 +75,7 @@ type fakeDocker struct {
 	containers map[string]*fakeContainer
 	removed    []string
 	subs       []chan events.Message
+	subErrs    []chan error
 	info       system.Info
 	infoErr    error
 	// createGate, when set, holds every ContainerCreate until it is closed;
@@ -82,6 +83,9 @@ type fakeDocker struct {
 	createGate  chan struct{}
 	createFirst bool
 	listHook    func() // runs once, inside the next ContainerList
+	createErr   error  // every ContainerCreate fails with it
+	// removeHang makes every ContainerRemove wait for its context to end.
+	removeHang bool
 }
 
 func newFakeDocker() *fakeDocker {
@@ -91,19 +95,26 @@ func newFakeDocker() *fakeDocker {
 	}
 }
 
-func (f *fakeDocker) ContainerCreate(_ context.Context, o client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
+func (f *fakeDocker) ContainerCreate(ctx context.Context, o client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
 	c := &fakeContainer{labels: o.Config.Labels, image: o.Config.Image, state: container.StateCreated}
 	if len(o.HostConfig.Mounts) == 1 {
 		c.mount = o.HostConfig.Mounts[0].Source
 	}
 	f.mu.Lock()
-	gate, first := f.createGate, f.createFirst
+	gate, first, cerr := f.createGate, f.createFirst, f.createErr
 	if gate != nil && first {
 		f.containers[o.Name] = c
 	}
 	f.mu.Unlock()
+	if cerr != nil {
+		return client.ContainerCreateResult{}, cerr
+	}
 	if gate != nil {
-		<-gate
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return client.ContainerCreateResult{}, ctx.Err()
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -128,7 +139,14 @@ func (f *fakeDocker) ContainerStart(_ context.Context, id string, _ client.Conta
 	return client.ContainerStartResult{}, nil
 }
 
-func (f *fakeDocker) ContainerRemove(_ context.Context, id string, _ client.ContainerRemoveOptions) (client.ContainerRemoveResult, error) {
+func (f *fakeDocker) ContainerRemove(ctx context.Context, id string, _ client.ContainerRemoveOptions) (client.ContainerRemoveResult, error) {
+	f.mu.Lock()
+	hang := f.removeHang
+	f.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+		return client.ContainerRemoveResult{}, ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.removed = append(f.removed, id)
@@ -147,8 +165,30 @@ func (f *fakeDocker) Events(context.Context, client.EventsListOptions) client.Ev
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	ch := make(chan events.Message, 64)
+	errs := make(chan error, 1)
 	f.subs = append(f.subs, ch)
-	return client.EventsResult{Messages: ch, Err: make(chan error)}
+	f.subErrs = append(f.subErrs, errs)
+	return client.EventsResult{Messages: ch, Err: errs}
+}
+
+// breakEvents ends every events stream with an error, as a Docker restart
+// does; the watcher subscribes again.
+func (f *fakeDocker) breakEvents() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, errs := range f.subErrs {
+		select {
+		case errs <- errors.New("unexpected EOF"):
+		default:
+		}
+	}
+	f.subs, f.subErrs = nil, nil
+}
+
+func (f *fakeDocker) set(mut func(f *fakeDocker)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	mut(f)
 }
 
 func (f *fakeDocker) ContainerList(_ context.Context, o client.ContainerListOptions) (client.ContainerListResult, error) {
@@ -327,6 +367,9 @@ type fakeRepo struct {
 	marker     string
 	readErr    error
 	recheckErr error
+	// movedTo is the full name GitHub answers for the repository, as after a
+	// transfer or a rename; empty means its own.
+	movedTo string
 }
 
 type fakeGitHub struct {
@@ -402,6 +445,9 @@ func (g *fakeGitHub) listings() int {
 }
 
 func repoOf(full string, r *fakeRepo) github.Repo {
+	if r.movedTo != "" {
+		full = r.movedTo
+	}
 	_, name, _ := strings.Cut(full, "/")
 	return github.Repo{FullName: full, Name: name, DefaultBranch: "main", Private: r.private}
 }
@@ -517,10 +563,13 @@ type harness struct {
 	slots   int
 	logs    *syncBuffer
 
-	mu        sync.Mutex
-	images    map[string]string // identity -> image reference
-	checkErr  map[string]error  // image reference -> preflight failure
+	mu       sync.Mutex
+	images   map[string]string // identity -> image reference
+	checkErr map[string]error  // image reference -> preflight failure
+	// runnerErr: runner version -> preflight failure of every image with it.
+	runnerErr map[string]error
 	checked   []string
+	pruned    [][]string // the versions each Prune kept
 	detects   int
 	runnerV   []string // the runner versions Mount returns, in turn
 	mounts    int
@@ -538,17 +587,18 @@ type harness struct {
 func newHarness(t *testing.T, slots int, factor time.Duration, repos ...string) *harness {
 	t.Helper()
 	h := &harness{
-		t:        t,
-		actions:  fakeactions.New(t),
-		docker:   newFakeDocker(),
-		gh:       &fakeGitHub{repos: map[string]*fakeRepo{}},
-		tok:      &fakeToken{},
-		caff:     &fakeCaffeinate{},
-		clock:    fastClock{start: time.Now(), factor: factor},
-		slots:    slots,
-		logs:     &syncBuffer{},
-		images:   map[string]string{},
-		checkErr: map[string]error{},
+		t:         t,
+		actions:   fakeactions.New(t),
+		docker:    newFakeDocker(),
+		gh:        &fakeGitHub{repos: map[string]*fakeRepo{}},
+		tok:       &fakeToken{},
+		caff:      &fakeCaffeinate{},
+		clock:     fastClock{start: time.Now(), factor: factor},
+		slots:     slots,
+		logs:      &syncBuffer{},
+		images:    map[string]string{},
+		checkErr:  map[string]error{},
+		runnerErr: map[string]error{},
 	}
 	for _, r := range repos {
 		h.gh.repos["example/"+r] = &fakeRepo{private: true, marker: marker()}
@@ -577,6 +627,26 @@ func (h *harness) setImage(identity, ref string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.images[identity] = ref
+}
+
+func (h *harness) setRunnerErr(version string, err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err == nil {
+		delete(h.runnerErr, version)
+		return
+	}
+	h.runnerErr[version] = err
+}
+
+// lastPrune is the versions the last Prune kept, joined by commas.
+func (h *harness) lastPrune() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.pruned) == 0 {
+		return ""
+	}
+	return strings.Join(h.pruned[len(h.pruned)-1], ",")
 }
 
 func (h *harness) setCheckErr(ref string, err error) {
@@ -625,14 +695,23 @@ func (h *harness) deps() Deps {
 		Ensure: func(_ context.Context, p discovery.Project) (string, error) {
 			return h.imageOf(p.Identity), nil
 		},
-		Check: func(_ context.Context, ref string, _ runnermount.Mount) (string, error) {
+		Check: func(_ context.Context, ref string, m runnermount.Mount) (string, error) {
 			h.mu.Lock()
 			defer h.mu.Unlock()
 			h.checked = append(h.checked, ref)
 			if err := h.checkErr[ref]; err != nil {
 				return "", err
 			}
+			if err := h.runnerErr[m.Version]; err != nil {
+				return "", err
+			}
 			return "1001", nil
+		},
+		Prune: func(_ context.Context, keep []string) error {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			h.pruned = append(h.pruned, slices.Sorted(slices.Values(keep)))
+			return nil
 		},
 		Caffeinate: h.caff.start,
 	}

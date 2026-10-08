@@ -247,6 +247,9 @@ func TestExistingScaleSetReused(t *testing.T) {
 	if n := h.actions.Count("POST scaleset " + alphaSet); n != 0 {
 		t.Fatalf("%d creates of an existing scale set", n)
 	}
+	if n := h.actions.Count("PATCH scaleset " + alphaSet); n != 0 {
+		t.Fatalf("%d updates of a scale set whose labels are right", n)
+	}
 	if !h.actions.SessionOpen(alphaSet) {
 		t.Fatal("no session on the existing scale set")
 	}
@@ -837,6 +840,11 @@ func TestDefaultsAreWhatCmdAndPlistAssume(t *testing.T) {
 	s := New(Config{}, Deps{})
 	if s.cfg.Drain != 40*time.Minute || DefaultDrain != 40*time.Minute {
 		t.Errorf("drain = %v, want 40m", s.cfg.Drain)
+	}
+	// The drain and the work after it end before launchd's ExitTimeOut
+	// (2700 s) kills the pool.
+	if DefaultDrain+afterBound >= 45*time.Minute {
+		t.Errorf("drain %v plus the budget after it %v reach the launchd ExitTimeOut of 45m", DefaultDrain, afterBound)
 	}
 	if s.cfg.HealthAddr != "127.0.0.1:8737" || DefaultHealthAddr != "127.0.0.1:8737" {
 		t.Errorf("health address = %q, want 127.0.0.1:8737", s.cfg.HealthAddr)

@@ -38,8 +38,14 @@ const (
 	runnerGroupID = 1
 
 	defaultDiscoverEvery = 10 * time.Minute
-	// DefaultDrain is above the longest job timeout of the served projects
-	// and below the launchd ExitTimeOut of 45 minutes.
+	// A first discovery pass that fails is retried after firstDiscoverRetry,
+	// doubling up to the discovery period, until one succeeds.
+	firstDiscoverRetry = 30 * time.Second
+	// DefaultDrain bounds how long a stopping pool waits for its running jobs.
+	// It is not above every served job's timeout: a job still running at the
+	// bound is stopped (its container removed) on an upgrade or an uninstall,
+	// and needs a re-run. With afterBound it stays below the launchd
+	// ExitTimeOut of 45 minutes.
 	DefaultDrain = 40 * time.Minute
 	// DefaultHealthAddr is where the health endpoint listens, and so the
 	// address whose binding is the single-instance lock.
@@ -66,7 +72,17 @@ const (
 	drainPoll        = time.Second
 	inUsePoll        = time.Second
 	callTimeout      = 30 * time.Second
+	// noJobLimit runners in a row that go away without reporting a job mark
+	// the project unhealthy: its image or the runner is broken.
+	noJobLimit = 3
 )
+
+// afterBound caps, as a whole, the work a drain does once its runners are
+// gone or its bound has passed: stopping an in-flight start, removing the
+// runners left, closing the session and deleting the scale set. Every project
+// drains at once, so the drain bound plus afterBound is the longest a stop
+// takes. A variable so tests can shorten it.
+var afterBound = 3 * time.Minute
 
 // Config configures a Supervisor. Zero durations take their defaults.
 type Config struct {
@@ -121,6 +137,7 @@ type ScaleSets interface {
 	runner.Registry
 	GetRunnerScaleSet(ctx context.Context, runnerGroupID int, name string) (*scaleset.RunnerScaleSet, error)
 	CreateRunnerScaleSet(ctx context.Context, ss *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error)
+	UpdateRunnerScaleSet(ctx context.Context, id int, ss *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error)
 	DeleteRunnerScaleSet(ctx context.Context, id int) error
 	OpenSession(ctx context.Context, scaleSetID int, owner string) (Session, error)
 }
@@ -187,8 +204,11 @@ type Deps struct {
 	// Detect derives the machine and the runner architecture
 	// (machine.Detect over Docker's Info).
 	Detect func(ctx context.Context) (machine.Machine, string, error)
-	// Mount ensures the newest runner mount (runnermount.Ensure, then Prune).
+	// Mount ensures the newest runner mount (runnermount.Ensure).
 	Mount func(ctx context.Context, arch string) (runnermount.Mount, error)
+	// Prune removes the runner mounts other than the versions kept
+	// (runnermount.Prune).
+	Prune func(ctx context.Context, keep []string) error
 	// Ensure makes a project's image available (image.Ensure).
 	Ensure func(ctx context.Context, p discovery.Project) (string, error)
 	// Check preflights an image with the mount and returns its run user
@@ -280,7 +300,14 @@ func New(cfg Config, deps Deps) *Supervisor {
 		s.deps.Detect = s.detect
 	}
 	if s.deps.Mount == nil {
-		s.deps.Mount = s.ensureMount
+		s.deps.Mount = func(ctx context.Context, arch string) (runnermount.Mount, error) {
+			return runnermount.Ensure(ctx, s.deps.Docker, s.deps.GitHub, arch)
+		}
+	}
+	if s.deps.Prune == nil {
+		s.deps.Prune = func(ctx context.Context, keep []string) error {
+			return runnermount.Prune(ctx, s.deps.Docker, keep...)
+		}
 	}
 	if s.deps.Ensure == nil {
 		s.deps.Ensure = func(ctx context.Context, p discovery.Project) (string, error) {
@@ -363,6 +390,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	s.dockerOK = true
 	s.mu.Unlock()
 	s.log.Info("pool starting", "machine", m.Name, "slots", m.Slots, "instance", instance, "runner", mount.Version, "probe", s.cfg.Probe)
+	s.prune(ctx)
 	if err := s.sweep(ctx); err != nil {
 		return err
 	}
@@ -429,17 +457,27 @@ func (s *Supervisor) retryAtStart(ctx context.Context, f func() error) error {
 	}
 }
 
-// loop runs discovery until ctx ends or a fatal error arrives.
+// loop runs discovery until ctx ends or a fatal error arrives. Until a pass
+// has succeeded (a listing failed at start, say), the next pass comes after
+// firstDiscoverRetry, doubling up to the discovery period.
 func (s *Supervisor) loop(ctx, life context.Context, stopLife context.CancelFunc) error {
-	s.discover(ctx, life)
+	served := s.discover(ctx, life)
+	retry := min(firstDiscoverRetry, s.cfg.DiscoverEvery)
 	for {
+		next := s.cfg.DiscoverEvery
+		if !served {
+			next = retry
+			retry = min(retry*2, s.cfg.DiscoverEvery)
+		}
 		select {
 		case <-ctx.Done():
 			return s.shutdown(life, stopLife)
 		case err := <-s.fatal:
 			return err
-		case <-s.deps.Clock.After(s.cfg.DiscoverEvery):
-			s.discover(ctx, life)
+		case <-s.deps.Clock.After(next):
+			if s.discover(ctx, life) {
+				served = true
+			}
 		}
 	}
 }
@@ -502,19 +540,20 @@ func (s *Supervisor) requestReconcile() {
 // discover runs one discovery pass and applies it: a new project starts, a
 // project positively gone (absent, public, without a valid marker) drains, a
 // project whose repository errored is left exactly as it is, and a failed
-// listing changes nothing, unless it failed because the login is gone.
-func (s *Supervisor) discover(ctx, life context.Context) {
+// listing changes nothing, unless it failed because the login is gone. It
+// reports whether the listing succeeded.
+func (s *Supervisor) discover(ctx, life context.Context) bool {
 	res, err := discovery.Discover(ctx, s.deps.GitHub, discovery.Options{OnlyRepo: s.cfg.OnlyRepo, MarkerRef: s.cfg.MarkerRef}, s.log)
 	if err != nil {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
 		if t := loginRejected(err); t != nil {
 			s.fail(t)
-			return
+			return false
 		}
 		s.log.Warn("discovery failed; keeping the current projects", "error", err.Error())
-		return
+		return false
 	}
 	want := map[string]bool{}
 	for _, p := range res.Projects {
@@ -544,6 +583,7 @@ func (s *Supervisor) discover(ctx, life context.Context) {
 			s.goLocked(func() { pr.refresh(p) }, pr.claimRefresh())
 		}
 	}
+	return true
 }
 
 func (s *Supervisor) startLocked(life context.Context, p discovery.Project) {
@@ -600,7 +640,7 @@ func (s *Supervisor) closeSessions() {
 	prs := s.projectList()
 	s.mu.Unlock()
 	for _, pr := range prs {
-		pr.closeSession()
+		pr.closeSession(context.Background())
 	}
 }
 
@@ -788,16 +828,21 @@ func (s *Supervisor) detect(ctx context.Context) (machine.Machine, string, error
 	return m, runnerArch, nil
 }
 
-// ensureMount is the default Deps.Mount.
-func (s *Supervisor) ensureMount(ctx context.Context, arch string) (runnermount.Mount, error) {
-	m, err := runnermount.Ensure(ctx, s.deps.Docker, s.deps.GitHub, arch)
-	if err != nil {
-		return runnermount.Mount{}, err
+// prune removes the runner mounts no project uses: it keeps the newest and
+// every older one a project still runs on.
+func (s *Supervisor) prune(ctx context.Context) {
+	s.mu.Lock()
+	keep := []string{s.mount.Version}
+	prs := s.projectList()
+	s.mu.Unlock()
+	for _, pr := range prs {
+		if v := pr.mountVersion(); v != "" && !slices.Contains(keep, v) {
+			keep = append(keep, v)
+		}
 	}
-	if err := runnermount.Prune(ctx, s.deps.Docker, m.Version); err != nil {
+	if err := s.deps.Prune(ctx, keep); err != nil {
 		s.log.Warn("pruning old runner mounts", "error", err.Error())
 	}
-	return m, nil
 }
 
 // checkImage is the default Deps.Check.

@@ -93,9 +93,17 @@ type Scaler struct {
 	docker     ContainerRemover
 	log        *slog.Logger
 
+	// abort ends every launch and reap in flight; see Abort.
+	abort   context.Context
+	aborted context.CancelFunc
+
 	mu       sync.Mutex
 	runners  map[string]runnerState
 	draining bool
+	// noJob counts the runners in a row that went away without ever
+	// reporting a job: a container that exited idle, or a start that failed
+	// after its JIT configuration was minted. Any job report clears it.
+	noJob int
 }
 
 // NewScaler returns a Scaler for one scale set.
@@ -104,7 +112,10 @@ func NewScaler(cfg ScalerConfig) *Scaler {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	abort, aborted := context.WithCancel(context.Background())
 	return &Scaler{
+		abort:      abort,
+		aborted:    aborted,
 		scaleSetID: cfg.ScaleSetID,
 		slots:      cfg.Slots,
 		start:      cfg.Start,
@@ -191,11 +202,12 @@ func (s *Scaler) reserve(ctx context.Context, count int) (string, bool) {
 // lands while the configuration is minted is honoured the same way: the runner
 // is unregistered and released instead of started.
 func (s *Scaler) launch(ctx context.Context, name string) bool {
-	ctx, cancel := context.WithTimeout(ctx, launchTimeout)
+	ctx, cancel := s.bounded(ctx, launchTimeout)
 	defer cancel()
 	minted, err := s.startRunner(ctx, name)
 	if err != nil {
-		if errors.Is(err, errDrained) {
+		drained := errors.Is(err, errDrained)
+		if drained {
 			s.log.Info("draining; not starting the runner", slog.String("runner", name))
 		} else {
 			s.log.Error("starting a runner", slog.String("runner", name), slog.String("error", err.Error()))
@@ -203,7 +215,9 @@ func (s *Scaler) launch(ctx context.Context, name string) bool {
 		if minted {
 			s.forget(ctx, name)
 		}
-		s.Exited(name)
+		// A runner that was registered and then could not start counts
+		// towards the no-job exits: a missing image fails every start.
+		s.release(name, minted && !drained)
 		return false
 	}
 	s.mu.Lock()
@@ -303,7 +317,7 @@ func (s *Scaler) reap(ctx context.Context, count int) {
 // reapOne unregisters one idle runner and removes its container, within
 // reapTimeout.
 func (s *Scaler) reapOne(ctx context.Context, name string) {
-	ctx, cancel := context.WithTimeout(ctx, reapTimeout)
+	ctx, cancel := s.bounded(ctx, reapTimeout)
 	defer cancel()
 	err := s.unregister(ctx, name)
 	switch {
@@ -322,7 +336,17 @@ func (s *Scaler) reapOne(ctx context.Context, name string) {
 		return
 	}
 	s.log.Info("idle runner removed", slog.String("runner", name))
-	s.Exited(name)
+	s.release(name, false)
+}
+
+// bounded limits ctx to d and to Abort.
+func (s *Scaler) bounded(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(ctx, d)
+	stop := context.AfterFunc(s.abort, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
 }
 
 // keepBusy marks a runner GitHub reports as running a job busy, unless its
@@ -351,6 +375,9 @@ func (s *Scaler) keepIdle(name string) {
 func (s *Scaler) Started(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// A job report, even a late one for a runner already gone, proves that
+	// runners can take jobs.
+	s.noJob = 0
 	st, ok := s.runners[name]
 	switch {
 	case !ok:
@@ -369,6 +396,7 @@ func (s *Scaler) Started(name string) {
 func (s *Scaler) Completed(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.noJob = 0
 	st, ok := s.runners[name]
 	switch {
 	case !ok:
@@ -385,7 +413,14 @@ func (s *Scaler) Completed(name string) {
 // Exited forgets a runner whose container is gone and releases its slot. It is
 // the only release point and is idempotent per name: every Scaler on the
 // machine hears every exit, and a name it does not hold is logged and ignored.
-func (s *Scaler) Exited(name string) {
+// A runner that exits after its start and before any job report counts
+// towards NoJobExits.
+func (s *Scaler) Exited(name string) { s.release(name, false) }
+
+// release forgets a runner and gives its slot back. The runner counts towards
+// NoJobExits if it was idle (started, no job reported) or if failedStart says
+// it was registered and could not start.
+func (s *Scaler) release(name string, failedStart bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st, ok := s.runners[name]
@@ -397,14 +432,39 @@ func (s *Scaler) Exited(name string) {
 	if st == stateBusy {
 		s.slots.SetBusy(-1)
 	}
+	if (st == stateIdle || failedStart) && !s.draining {
+		s.noJob++
+	}
 	s.slots.Release()
 }
+
+// NoJobExits is the number of runners in a row that went away without
+// reporting a job. A job report on this scale set, or ResetNoJobExits after a
+// passed preflight, clears it.
+func (s *Scaler) NoJobExits() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.noJob
+}
+
+// ResetNoJobExits clears NoJobExits.
+func (s *Scaler) ResetNoJobExits() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.noJob = 0
+}
+
+// Abort ends every launch and reap in flight, and makes later ones fail at
+// once: a drain past its bound uses it so that nothing waits on a start or an
+// unregistration it is about to undo. A start already minted still forgets
+// its runner, within forgetTimeout.
+func (s *Scaler) Abort() { s.aborted() }
 
 // Drain stops new starts: Desired starts nothing from now on, and a start
 // whose JIT configuration is being minted is unregistered and released instead
 // of started. A start already creating its container completes. Desired still
 // reaps idle runners, and Exited still releases slots; the supervisor's drain
-// (T8) waits for InUse() to reach 0.
+// waits for Held() to be empty.
 func (s *Scaler) Drain() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

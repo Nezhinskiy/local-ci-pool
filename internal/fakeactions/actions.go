@@ -56,6 +56,10 @@ type Actions struct {
 	rejectAll    bool
 	tokens       []string
 	log          []string
+	capacity     map[int]string // scale set -> the capacity header of its last message request
+	// barrier holds the registration requests until barrierN have arrived.
+	barrier  chan struct{}
+	barrierN int
 }
 
 type registered struct {
@@ -83,6 +87,7 @@ func New(t testing.TB) *Actions {
 		queues:    map[int][]*message{},
 		runners:   map[string]*registered{},
 		rejected:  map[string]bool{},
+		capacity:  map[int]string{},
 	}
 	a.actionsServer = newServer(t, http.HandlerFunc(a.serve), WithRunnerRegistrationTokenHandler(a.registrationToken))
 	return a
@@ -218,6 +223,23 @@ func (a *Actions) RejectTokens(tokens ...string) {
 	for _, t := range tokens {
 		a.rejected[t] = true
 	}
+}
+
+// BarrierRegistrations holds the next n registration requests until all n
+// have arrived, so n clients are known to have registered with the same
+// token before any answer reaches them.
+func (a *Actions) BarrierRegistrations(n int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.barrier, a.barrierN = make(chan struct{}), n
+}
+
+// Capacity is the maximum capacity the scale set's listener sent with its
+// last message request (scaleset.HeaderScaleSetMaxCapacity).
+func (a *Actions) Capacity(name string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.capacity[a.idLocked(name)]
 }
 
 // Tokens lists the personal access tokens the registration endpoint saw.
@@ -358,7 +380,22 @@ func (a *Actions) registrationToken(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	a.tokens = append(a.tokens, tok)
 	reject := a.rejectAll || a.rejected[tok]
+	barrier := a.barrier
+	if barrier != nil {
+		a.barrierN--
+		if a.barrierN == 0 {
+			close(barrier)
+			a.barrier = nil
+		}
+	}
 	a.mu.Unlock()
+	if barrier != nil {
+		select {
+		case <-barrier:
+		case <-r.Context().Done():
+			return
+		}
+	}
 	if reject {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"message": "Bad credentials"})
 		return
@@ -400,6 +437,8 @@ func (a *Actions) serve(w http.ResponseWriter, r *http.Request) {
 		a.createScaleSet(w, r)
 	case m[2] == "" && r.Method == http.MethodDelete:
 		a.deleteScaleSet(w, id)
+	case m[2] == "" && r.Method == http.MethodPatch:
+		a.updateScaleSet(w, r, id)
 	case m[2] == "sessions" && r.Method == http.MethodPost:
 		a.createSession(w, r, id)
 	case m[2] == "sessions" && r.Method == http.MethodDelete:
@@ -441,6 +480,26 @@ func (a *Actions) createScaleSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.addLocked(&ss)
+	writeJSON(w, http.StatusOK, ss)
+}
+
+func (a *Actions) updateScaleSet(w http.ResponseWriter, r *http.Request, id int) {
+	var patch scaleset.RunnerScaleSet
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"message": err.Error()})
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ss := a.scaleSets[id]
+	if ss == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": "not found"})
+		return
+	}
+	a.logLocked("PATCH scaleset %s", ss.Name)
+	if patch.Labels != nil {
+		ss.Labels = append([]scaleset.Label(nil), patch.Labels...)
+	}
 	writeJSON(w, http.StatusOK, ss)
 }
 
@@ -561,6 +620,7 @@ func (a *Actions) getMessage(w http.ResponseWriter, r *http.Request, id int) {
 		}
 		_, open := a.sessions[id]
 		capacity := r.Header.Get(scaleset.HeaderScaleSetMaxCapacity)
+		a.capacity[id] = capacity
 		if open && capacity != "0" && len(a.queues[id]) > 0 {
 			m := a.queues[id][0]
 			a.queues[id] = a.queues[id][1:]

@@ -283,8 +283,10 @@ func cleanName(name string) (string, error) {
 	return clean, nil
 }
 
-// Prune removes the local-ci/runner images other than keep that no container
-// uses. keep is a version ("2.338.0") or a full reference. Images of other
+// Prune removes the local-ci/runner images other than those in keep that no
+// container uses. Each keep is a version ("2.338.0") or a full reference: the
+// newest version, and any older one a project still runs on because its image
+// failed the preflight with the newest. Images of other
 // repositories are never touched. A failure on one image does not stop the
 // others; the errors are joined.
 //
@@ -295,10 +297,13 @@ func cleanName(name string) (string, error) {
 // by name; and Docker removes a mounted image by ID without complaint. The
 // untagged ones are therefore removed only when no container mounts any
 // local-ci/runner image at all.
-func Prune(ctx context.Context, d Docker, keep string) error {
-	keepRef := keep
-	if !strings.Contains(keep, ":") {
-		keepRef = Ref(keep)
+func Prune(ctx context.Context, d Docker, keep ...string) error {
+	kept := map[string]bool{}
+	for _, k := range keep {
+		if !strings.Contains(k, ":") {
+			k = Ref(k)
+		}
+		kept[k] = true
 	}
 	listed, err := d.ImageList(ctx, client.ImageListOptions{Filters: make(client.Filters).Add("reference", Repository+":*")})
 	if err != nil {
@@ -344,7 +349,7 @@ func Prune(ctx context.Context, d Docker, keep string) error {
 	}
 	for _, img := range images {
 		for _, tag := range img.RepoTags {
-			if !strings.HasPrefix(tag, Repository+":") || tag == keepRef {
+			if !strings.HasPrefix(tag, Repository+":") || kept[tag] {
 				continue
 			}
 			if inUse[img.ID] || inUse[tag] {
