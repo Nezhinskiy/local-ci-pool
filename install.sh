@@ -25,9 +25,12 @@ BIN_DIR="$SUPPORT_DIR/bin"
 BIN="$BIN_DIR/pool"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/local-ci-pool"
-# The budget settings file the installed pool reads. launchd starts it with
-# PATH alone, so it never sees XDG_CONFIG_HOME and resolves ~/.config, or the
-# macOS fallback beside bin/ when only that file exists.
+# The budget settings file the installed pool reads. The pool does not inherit
+# your shell's environment (its agent sets PATH only), so a shell's
+# XDG_CONFIG_HOME does not reach it, and it resolves ~/.config, or the macOS
+# fallback beside bin/ when only that file exists. This script assumes that no
+# XDG_CONFIG_HOME was set for launchd itself with launchctl setenv, which would
+# reach the pool (launchctl getenv XDG_CONFIG_HOME prints such a value).
 SETTINGS_XDG="$HOME/.config/local-ci-pool/config.toml"
 SETTINGS_MAC="$SUPPORT_DIR/config.toml"
 DOMAIN="gui/$(id -u)"
@@ -529,10 +532,11 @@ log_size() {
 }
 
 # terminal_since prints the first "terminal:" line the pool logged after byte
-# offset $1, if any.
+# offset $1, if any. The pool logs it as its message (msg="terminal: ..."); a
+# value such as a job's name that merely contains "terminal: " is not one.
 terminal_since() {
   [ -f "$LOG_DIR/pool.log" ] || return 0
-  tail -c +"$(($1 + 1))" "$LOG_DIR/pool.log" | grep -m 1 'terminal: ' || true
+  tail -c +"$(($1 + 1))" "$LOG_DIR/pool.log" | grep -m 1 'msg="terminal: ' || true
 }
 
 # wait_new_pool waits until /healthz reports the version just installed. An
@@ -588,10 +592,12 @@ settings_in_use() {
 }
 
 # write_settings creates SETTINGS_XDG with the budget on and BUDGET_CPU cores
-# per job, in one step that refuses to replace anything: noclobber opens with
-# O_EXCL, so a file created meanwhile, or a dangling symlink, is refused rather
-# than written through. It never fails the install, which has stopped the old
-# pool by now.
+# per job, in one step. noclobber refuses an existing regular file and creates
+# a missing one with O_EXCL, so a regular file created meanwhile, or a dangling
+# symlink, is refused rather than written through. It would still write into an
+# existing FIFO or other non-regular file: place_settings calls it only when no
+# such path exists. It never fails the install, which has stopped the old pool
+# by now.
 write_settings() {
   local p="$SETTINGS_XDG"
   if (
@@ -626,8 +632,8 @@ place_settings() {
 }
 
 # warn_foreign_xdg says that a shell's XDG_CONFIG_HOME other than ~/.config is
-# not where the installed pool looks for its budget settings: launchd does not
-# pass it on. It matters only with --budget-cpu, or when a settings file sits
+# not where the installed pool looks for its budget settings: the pool does not
+# inherit the shell's environment. It matters only with --budget-cpu, or when a settings file sits
 # under that XDG_CONFIG_HOME, which the installed pool never reads.
 warn_foreign_xdg() {
   local xdg="${XDG_CONFIG_HOME:-}"
@@ -638,16 +644,17 @@ warn_foreign_xdg() {
   xdg="${xdg%/}"
   [ "$xdg" != "$HOME/.config" ] || return 0
   if [ "$BUDGET_SET" = 1 ] || [ -e "$xdg/local-ci-pool/config.toml" ]; then
-    warn "XDG_CONFIG_HOME is set, but launchd does not pass it to the pool: the installed pool reads the budget settings from $SETTINGS_XDG, not $xdg/local-ci-pool/config.toml"
+    warn "XDG_CONFIG_HOME is set in this shell, but the installed pool does not inherit the shell's environment: the installed pool reads the budget settings from $SETTINGS_XDG, not $xdg/local-ci-pool/config.toml"
   fi
 }
 
 # check_budget_applied warns when the new pool's /healthz says the settings file
 # in use is invalid (the pool has judged it: the shell parses no TOML). It also
 # warns when the file seems to turn the budget on (a line setting enabled =
-# true, as a key of its own, a dotted key or in an inline table), or cannot be
-# read as a regular file (the pool then reports it invalid), and /healthz has
-# no budget (a release before it) or shows it off. A FIFO is never opened.
+# true, as a key of its own, a dotted key or in an inline table, the key bare
+# or quoted), or cannot be read as a regular file (the pool then reports it
+# invalid), and /healthz has no budget (a release before it) or shows it off.
+# A FIFO is never opened.
 check_budget_applied() {
   local p budget
   p="$(settings_in_use)"
@@ -664,7 +671,7 @@ check_budget_applied() {
       ;;
   esac
   if [ -f "$p" ] && [ -r "$p" ]; then
-    grep -Eq '^([^#]*[[:space:].{,])?enabled[[:space:]]*=[[:space:]]*true' "$p" 2> /dev/null || return 0
+    grep -Eq "^([^#]*[[:space:].{,])?[\"']?enabled[\"']?[[:space:]]*=[[:space:]]*true" "$p" 2> /dev/null || return 0
   fi
   case "$budget" in
     '') warn "the pool does not apply $p; the budget is off: this release reports no budget in /healthz, so it predates the core budget and ignores the file" ;;

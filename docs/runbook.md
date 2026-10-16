@@ -258,9 +258,11 @@ before its container starts. Without the file the pool runs as it always has.
    `~/Library/Application Support/local-ci-pool/config.toml` does, the latter (the macOS fallback,
    beside the installer's `bin/`).
 
-launchd starts the installed pool with `PATH` alone, so it never sees `XDG_CONFIG_HOME` and reads
-`~/.config/local-ci-pool/config.toml`, or the fallback. A pool started by hand (probe mode) resolves
-with its shell's `XDG_CONFIG_HOME`. `pool.log` logs `budget settings` with the `path` at start, and
+The installed pool does not inherit your shell's environment (its launchd agent sets only `PATH`), so
+an `XDG_CONFIG_HOME` set in a shell does not reach it, and it reads
+`~/.config/local-ci-pool/config.toml`, or the fallback. A value set for launchd itself with
+`launchctl setenv XDG_CONFIG_HOME` does reach it (`launchctl getenv XDG_CONFIG_HOME` prints it, if
+any), and the installer does not follow it. A pool started by hand (probe mode) resolves with its shell's `XDG_CONFIG_HOME`. `pool.log` logs `budget settings` with the `path` at start, and
 again whenever the resolution changes; `/healthz` never shows the path.
 
 **Keys.** One table, `[budget]`, with exactly two keys. Key names are case-sensitive: `CPU = 2` is an
@@ -289,8 +291,9 @@ missing file at the `~/.config` path is refused too, never written through). It 
 `XDG_CONFIG_HOME` names another directory, which the installed pool does not read, if you passed
 `--budget-cpu` or a settings file sits under that directory. `--dry-run` prints what it would write.
 After any install, the installer warns when the new pool's `/healthz` reports the file invalid
-(`budget.error = "config"`), and when the file turns the budget on but `/healthz` shows it off (a
-path the pool does not read, or a release before the budget, which ignores the file).
+(`budget.error = "config"`), and when the file seems to turn the budget on (the installer only
+looks for a line setting `enabled = true`; it parses no TOML) but `/healthz` shows it off (a path
+the pool does not read, or a release before the budget, which ignores the file).
 `--uninstall` leaves the file and prints its path.
 
 **Edits apply without a restart.** The pool reads the file on every decision, with no cache. A new

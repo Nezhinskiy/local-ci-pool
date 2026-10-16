@@ -1335,6 +1335,18 @@ func TestInstallRequiresTheNewVersionOnHealthz(t *testing.T) {
 			t.Fatalf("%d restarts, want 1", n)
 		}
 	})
+	t.Run("a job named like a terminal line", func(t *testing.T) {
+		e := newEnv(t)
+		e.vars["STUB_NEW_VERSION"] = "none" // a first start is slow to answer
+		e.vars["STUB_LOG_AT_LOAD"] = `level=INFO msg="job started" runnerRequestId=7 jobId=a1 runner=local-ci-0123456789ab job="terminal: deploy"`
+		out, err := e.install()
+		if err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+		if n := kicks(e.calls()); n != 0 || strings.Contains(out, "WARNING") {
+			t.Fatalf("a job's name was taken for a terminal exit (%d restarts):\n%s", n, out)
+		}
+	})
 	t.Run("a terminal line from an earlier run", func(t *testing.T) {
 		e := newEnv(t)
 		write(t, filepath.Join(e.home, "Library", "Logs", "local-ci-pool", "pool.log"),
@@ -2126,6 +2138,10 @@ func TestInstallWarnsWhenBudgetNotApplied(t *testing.T) {
 		{name: "dotted key, off", settings: "budget.enabled = true\nbudget.cpu = 3\n", budget: "off", warn: true},
 		{name: "dotted key, no budget field", settings: "budget.enabled = true\nbudget.cpu = 3\n", budget: "none", warn: true},
 		{name: "inline table, off", settings: "budget = { enabled = true, cpu = 3 }\n", budget: "off", warn: true},
+		{name: "quoted key, off", settings: "[budget]\n\"enabled\" = true\ncpu = 3\n", budget: "off", warn: true},
+		{name: "literal quoted key, off", settings: "[budget]\n'enabled' = true\ncpu = 3\n", budget: "off", warn: true},
+		{name: "quoted dotted key, off", settings: "budget.\"enabled\" = true\nbudget.cpu = 3\n", budget: "off", warn: true},
+		{name: "quoted key, on", settings: "[budget]\n\"enabled\" = true\ncpu = 3\n", budget: "on"},
 		{name: "dotted key, on", settings: "budget.enabled = true\nbudget.cpu = 3\n", budget: "on"},
 		{name: "miscased key, invalid", settings: "[budget]\nEnabled = true\ncpu = 3\n", budget: "config", warn: true},
 		{name: "miscased table, invalid", settings: "[Budget]\nenabled = true\ncpu = 3\n", budget: "config", warn: true},
