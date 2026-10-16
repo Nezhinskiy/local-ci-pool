@@ -196,6 +196,16 @@ func (c *manualClock) pending() int {
 	return len(c.timers)
 }
 
+// waitReleases waits for the goroutines closing released grants.
+func (g *Gate) waitReleases() { g.closing.Wait() }
+
+// monitorRunning reports whether the monitor runs.
+func (g *Gate) monitorRunning() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.monitorOn
+}
+
 // harness is a gate on a real state directory, with its counting client, clock and log.
 type harness struct {
 	g    *Gate

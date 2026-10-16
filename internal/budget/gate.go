@@ -280,9 +280,6 @@ func (g *Gate) Adopt(ctx context.Context, a runner.Admission) runner.Admitted {
 	return ad
 }
 
-// waitReleases waits for the goroutines closing released grants.
-func (g *Gate) waitReleases() { g.closing.Wait() }
-
 // request is the coreslot request for a: label <project>:ci, priority 0, cpu need..need, where
 // need is a.Need when it is in 1..256 and the settings' cpu otherwise.
 func request(a runner.Admission, s Settings) (req coreslot.Request, label string, need int) {

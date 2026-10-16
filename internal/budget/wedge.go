@@ -69,13 +69,6 @@ func (g *Gate) monitor() {
 	}
 }
 
-// monitorRunning reports whether the monitor runs.
-func (g *Gate) monitorRunning() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.monitorOn
-}
-
 // observeLocked applies a snapshot: it wedges the gate when the section has been held by the same
 // (PID, Entered) for WedgeAfter, clears the wedge when the section is free or held by another,
 // and reports a budget full for too long. g.mu is held.

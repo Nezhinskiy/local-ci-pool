@@ -670,3 +670,55 @@ func TestAdoptWithEndedContext(t *testing.T) {
 		}
 	})
 }
+
+// An Enqueue that meets a busy section while the runner's ctx is live is retried, not failed open.
+func TestSectionBusyIsRetried(t *testing.T) {
+	t.Parallel()
+	h := newGate(t, stateDir(t, cpu4), on3)
+	h.cc.enqueueErr = &coreslot.SectionBusyError{PID: 4242, Err: context.DeadlineExceeded}
+	ad, err := h.g.Admit(context.Background(), alpha("r1"))
+	if err != nil || ad.Mode != runner.ModeQueued {
+		t.Fatalf("Admit = %+v, %v; want queued", ad, err)
+	}
+	ad.Release()
+	if n := h.cc.enqueues.Load(); n != 2 {
+		t.Fatalf("Enqueue called %d times; want 2", n)
+	}
+}
+
+// While both apply, /healthz names open before state.
+func TestOpenClassBeforeStateClass(t *testing.T) {
+	t.Parallel()
+	h := newGate(t, stateDir(t, cpu4), on3)
+	h.cc.enqueueErr = &coreslot.StateError{Reason: "injected"}
+	if ad, err := h.g.Admit(context.Background(), alpha("r1")); err != nil || ad.Mode != runner.ModeFailOpen {
+		t.Fatalf("Admit r1 = %+v, %v; want fail_open", ad, err)
+	}
+	if got := h.g.State().Error; got != "state" {
+		t.Fatalf("State().Error = %q after the state error; want state", got)
+	}
+	h.cc.mu.Lock()
+	h.cc.openFails, h.cc.openErr = 2, errors.New("open refused") // the second Open, the reopen, fails
+	h.cc.mu.Unlock()
+	if ad, err := h.g.Admit(context.Background(), alpha("r2")); err != nil || ad.Mode != runner.ModeFailOpen {
+		t.Fatalf("Admit r2 = %+v, %v; want fail_open", ad, err)
+	}
+	if n := h.cc.opens.Load(); n != 2 {
+		t.Fatalf("Open called %d times; want 2", n)
+	}
+	if got := h.g.State().Error; got != "open" {
+		t.Fatalf("State().Error = %q with both a failed Open and a state error; want open", got)
+	}
+}
+
+// A need outside 1..256 (a survivor's label of 300, or one that did not parse) asks the
+// configured cpu; one inside asks itself.
+func TestRequestNeedOutsideRangeAsksConfigured(t *testing.T) {
+	t.Parallel()
+	for need, want := range map[int]int{-1: 3, 0: 3, 257: 3, 300: 3, 1: 1, 256: 256} {
+		req, _, got := request(runner.Admission{Runner: "s1", Project: "alpha", Need: need}, Settings{Enabled: true, CPU: 3})
+		if got != want || req.Need["cpu"] != (coreslot.Range{Min: want, Max: want}) {
+			t.Errorf("need %d: request asks %d (%+v); want %d", need, got, req.Need["cpu"], want)
+		}
+	}
+}
