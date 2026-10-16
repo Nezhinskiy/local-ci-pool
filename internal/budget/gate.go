@@ -69,9 +69,16 @@ type Gate struct {
 	nextOpen    time.Time               // no Open before then while openFailed
 	stateErr    bool                    // the last admission or adoption failed open on a *StateError
 	admits      map[*admitting]struct{} // the Admits in progress
+	monitorOn   bool                    // the monitor runs
+	wedged      bool                    // the admission section is wedged
+	tracked     sectionSeen             // the held section the snapshots show
+	lastHolds   []coreslot.HoldInfo     // the holds of the last snapshot
+	lastFull    time.Time               // when budget full was last logged, zero when not since
 
 	closing sync.WaitGroup // the goroutines closing released grants
 }
+
+var _ runner.Gate = (*Gate)(nil)
 
 // admitting is one Admit in progress.
 type admitting struct {
@@ -123,7 +130,8 @@ func (g *Gate) Enabled() bool {
 	return s.Enabled
 }
 
-// State is the budget's part of /healthz. It reads the settings file once.
+// State is the budget's part of /healthz: off, on or wedged, the error class, and the seconds the
+// oldest Admit in progress has waited. It reads the settings file once.
 func (g *Gate) State() State {
 	s, invalid := g.settings.Load()
 	st := State{State: "off"}
@@ -132,6 +140,10 @@ func (g *Gate) State() State {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if s.Enabled && g.wedged {
+		st.State = "wedged"
+	}
+	st.OldestWaitS = int(g.oldestWaitLocked(g.clock.Now()) / time.Second)
 	switch {
 	case invalid:
 		st.Error = "config"
@@ -162,6 +174,9 @@ func (g *Gate) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, 
 	cl, err := g.client()
 	if err != nil {
 		return g.failOpen(a.Runner, label, need, g.since(ad), "open", err), nil
+	}
+	if !g.proceedWhenWedged(cl) {
+		return g.failOpen(a.Runner, label, need, g.since(ad), "wedged", errWedged), nil
 	}
 	var w waiter
 	for backoff := busyBackoffFirst; ; backoff = min(2*backoff, busyBackoffMax) {
@@ -218,6 +233,9 @@ func (g *Gate) Adopt(ctx context.Context, a runner.Admission) runner.Admitted {
 	cl, err := g.client()
 	if err != nil {
 		return g.failOpen(a.Runner, label, need, 0, "open", err)
+	}
+	if !g.proceedWhenWedged(cl) {
+		return g.failOpen(a.Runner, label, need, 0, "wedged", errWedged)
 	}
 	actx, cancel := context.WithTimeout(ctx, g.adoptTimeout)
 	defer cancel()
@@ -310,11 +328,12 @@ func (g *Gate) client() (client, error) {
 	return cl, nil
 }
 
-// begin registers an Admit in progress.
+// begin registers an Admit in progress and starts the monitor unless it runs.
 func (g *Gate) begin(cancel context.CancelFunc) *admitting {
 	ad := &admitting{start: g.clock.Now(), cancel: cancel}
 	g.mu.Lock()
 	g.admits[ad] = struct{}{}
+	g.startMonitorLocked()
 	g.mu.Unlock()
 	return ad
 }

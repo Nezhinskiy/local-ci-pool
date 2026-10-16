@@ -5,6 +5,7 @@ package budget
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -180,6 +181,13 @@ func (c *manualClock) Advance(d time.Duration) {
 	c.timers = kept
 }
 
+// pending is the number of timers waiting.
+func (c *manualClock) pending() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.timers)
+}
+
 // harness is a gate on a real state directory, with its counting client, clock and log.
 type harness struct {
 	g    *Gate
@@ -226,6 +234,39 @@ func (h *harness) setSettings(t *testing.T, body string) {
 
 const on3 = "[budget]\nenabled = true\ncpu = 3\n"
 
+// eventually waits up to 5 s for cond, failing the test otherwise.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// advance waits until the monitor has a timer pending, advances the clock by d, and waits for
+// the snapshot that fires and for the monitor to arm its next timer, which it does once that
+// tick is handled.
+func (h *harness) advance(t *testing.T, d time.Duration) {
+	t.Helper()
+	eventually(t, "a monitor timer", func() bool { return h.clk.pending() > 0 })
+	for len(h.cc.snapped) > 0 {
+		<-h.cc.snapped
+	}
+	h.clk.Advance(d)
+	select {
+	case <-h.cc.snapped:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("no snapshot within 5 s of advancing the clock by %v", d)
+	}
+	eventually(t, "the monitor's next timer", func() bool { return h.clk.pending() > 0 })
+}
+
+// step is one monitor tick: advance by the snapshot period.
+func (h *harness) step(t *testing.T) { h.advance(t, h.g.snapshotEvery) }
+
 // snapshot reads dir through a client of the test's own.
 func snapshot(t *testing.T, dir string) coreslot.Report {
 	t.Helper()
@@ -268,9 +309,16 @@ func holdSection(t *testing.T, dir string, pid int) (rewrite func(pid int), unlo
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		f.Close()
-		t.Fatalf("flock admit.lock: %v", err)
+	// A waiting client enters the section for a moment on each poll: retry until it is free.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) || time.Now().After(deadline) {
+			f.Close()
+			t.Fatalf("flock admit.lock: %v", err)
+		}
 	}
 	rewrite = func(pid int) {
 		body, err := json.Marshal(map[string]int64{"pid": int64(pid), "entered_ns": time.Now().UnixNano()})
