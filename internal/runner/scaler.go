@@ -54,9 +54,10 @@ type ScalerConfig struct {
 	// Slots is the machine-wide limit, shared by every Scaler.
 	Slots *Slots
 	// Start starts a runner container with the given name and JIT
-	// configuration; the supervisor binds it to StartRunner with the
-	// project's image, user and the runner mount.
-	Start func(ctx context.Context, name, jit string) error
+	// configuration, labelled with need when need is not 0; the supervisor
+	// binds it to StartRunner with the project's image, user and the runner
+	// mount.
+	Start func(ctx context.Context, name, jit string, need int) error
 	JIT   JITSource
 	// Registry unregisters runners before they are reaped, and runners whose
 	// start failed after their JIT configuration was minted.
@@ -87,7 +88,7 @@ const (
 type Scaler struct {
 	scaleSetID int
 	slots      *Slots
-	start      func(ctx context.Context, name, jit string) error
+	start      func(ctx context.Context, name, jit string, need int) error
 	jit        JITSource
 	registry   Registry
 	docker     ContainerRemover
@@ -254,7 +255,7 @@ func (s *Scaler) startRunner(ctx context.Context, name string) (minted bool, err
 	if draining {
 		return true, errDrained
 	}
-	return true, s.start(ctx, name, cfg.EncodedJITConfig)
+	return true, s.start(ctx, name, cfg.EncodedJITConfig, 0)
 }
 
 // forget unregisters a runner that never started, so no unused registration

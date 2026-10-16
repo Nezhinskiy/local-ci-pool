@@ -38,6 +38,7 @@ func (a *Adapter) HandleJobStarted(_ context.Context, jobInfo *scaleset.JobStart
 		slog.Int64("runnerRequestId", jobInfo.RunnerRequestID),
 		slog.String("jobId", jobInfo.JobID),
 		slog.String("runner", jobInfo.RunnerName),
+		slog.String("job", jobInfo.JobDisplayName),
 	)
 	a.s.Started(jobInfo.RunnerName)
 	return nil

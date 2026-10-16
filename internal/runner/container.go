@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,11 @@ const (
 	LabelInstance = "local-ci-pool"
 	// LabelRunner carries the runner name, so an exit maps back to its runner.
 	LabelRunner = "local-ci-pool.runner"
+	// LabelProject carries the project's identity on every runner container.
+	LabelProject = "local-ci-pool.project"
+	// LabelNeed carries the cores the budget gate admitted the runner for; a
+	// runner the gate did not admit (the budget off) has none.
+	LabelNeed = "local-ci-pool.need"
 
 	entrypoint = runnermount.Target + "/entrypoint.sh"
 	homeDir    = "/tmp/home"
@@ -56,9 +62,12 @@ type ContainerRemover interface {
 
 // ContainerSpec is one runner container. Name is both the runner name and the
 // container name; Mount is the runner tree (runnermount.Mount.Spec); User is
-// image.RunUser of the image.
+// image.RunUser of the image. Project is the project's identity; Need is the
+// cores the budget gate admitted the runner for, 0 when it did not.
 type ContainerSpec struct {
 	Image, User, Name, Instance string
+	Project                     string
+	Need                        int
 	Mount                       mount.Mount
 	JIT                         string
 }
@@ -69,6 +78,8 @@ func (s ContainerSpec) validate() error {
 		return errors.New("a runner container needs a name")
 	case s.Instance == "":
 		return errors.New("a runner container needs an instance")
+	case s.Project == "":
+		return errors.New("a runner container needs a project")
 	case s.Image == "":
 		return errors.New("a runner container needs an image")
 	case s.User == "":
@@ -94,6 +105,10 @@ func StartRunner(ctx context.Context, d Docker, s ContainerSpec) (id string, err
 	if err := s.validate(); err != nil {
 		return "", err
 	}
+	labels := map[string]string{LabelInstance: s.Instance, LabelRunner: s.Name, LabelProject: s.Project}
+	if s.Need > 0 {
+		labels[LabelNeed] = strconv.Itoa(s.Need)
+	}
 	init := true
 	created, err := d.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Name: s.Name,
@@ -105,7 +120,7 @@ func StartRunner(ctx context.Context, d Docker, s ContainerSpec) (id string, err
 			OpenStdin:   true,
 			StdinOnce:   true,
 			AttachStdin: true,
-			Labels:      map[string]string{LabelInstance: s.Instance, LabelRunner: s.Name},
+			Labels:      labels,
 		},
 		HostConfig: &container.HostConfig{
 			Init:       &init,

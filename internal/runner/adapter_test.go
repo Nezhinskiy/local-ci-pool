@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/actions/scaleset"
@@ -49,4 +50,24 @@ func TestAdapterDrivesTheScaler(t *testing.T) {
 	if slots.Busy() != 0 || slots.InUse() != 2 || h.scaler.Idle() != 1 {
 		t.Fatalf("busy %d in use %d idle %d after stale messages, want 0 2 1", slots.Busy(), slots.InUse(), h.scaler.Idle())
 	}
+}
+
+func TestAdapterJobStartedNamesTheJob(t *testing.T) {
+	h := newHarness(NewSlots(1))
+	a := NewAdapter(h.scaler)
+	if err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		RunnerName:     "alpha-1",
+		JobMessageBase: scaleset.JobMessageBase{JobDisplayName: "unit (2)"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range h.logs.lines() {
+		if strings.Contains(line, `msg="job started"`) {
+			if !strings.Contains(line, `job="unit (2)"`) {
+				t.Fatalf("the job started record does not name the job: %s", line)
+			}
+			return
+		}
+	}
+	t.Fatalf("no job started record in %q", h.logs.lines())
 }

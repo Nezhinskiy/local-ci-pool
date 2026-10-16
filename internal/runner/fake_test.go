@@ -259,7 +259,7 @@ type fakeStarter struct {
 	hangs bool
 }
 
-func (s *fakeStarter) start(ctx context.Context, name, jit string) error {
+func (s *fakeStarter) start(ctx context.Context, name, jit string, _ int) error {
 	s.mu.Lock()
 	hook := s.onStart
 	if s.jits == nil {

@@ -394,8 +394,8 @@ func (pr *project) currentID() int {
 }
 
 // start is the scaler's Start: one runner container in the project's image
-// with the project's runner mount.
-func (pr *project) start(ctx context.Context, name, jit string) error {
+// with the project's runner mount, labelled with the project and the need.
+func (pr *project) start(ctx context.Context, name, jit string, need int) error {
 	pr.mu.Lock()
 	img, m := pr.img, pr.mount
 	pr.mu.Unlock()
@@ -404,6 +404,8 @@ func (pr *project) start(ctx context.Context, name, jit string) error {
 		User:     img.User,
 		Name:     name,
 		Instance: pr.s.instance,
+		Project:  pr.identity,
+		Need:     need,
 		Mount:    m.Spec,
 		JIT:      jit,
 	})

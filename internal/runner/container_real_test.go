@@ -72,6 +72,7 @@ func TestRealRunnerExitReachesWatchExits(t *testing.T) {
 		User:     "1001",
 		Name:     name,
 		Instance: instance,
+		Project:  "alpha",
 		Mount:    mount.Mount{Type: mount.TypeImage, Source: ref, Target: runnermount.Target, ReadOnly: true},
 		JIT:      "not-a-jit-configuration",
 	})

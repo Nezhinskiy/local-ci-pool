@@ -20,6 +20,7 @@ func testSpec() ContainerSpec {
 		User:     "1001",
 		Name:     "local-ci-alpha-1",
 		Instance: "main",
+		Project:  "alpha",
 		Mount:    mount.Mount{Type: mount.TypeImage, Source: "local-ci/runner:2.338.0", Target: "/opt/local-ci", ReadOnly: true},
 		JIT:      testJIT,
 	}
@@ -89,7 +90,7 @@ func TestStartRunnerContract(t *testing.T) {
 	if want := []string{"host.docker.internal:127.0.0.1", "gateway.docker.internal:127.0.0.1"}; !slices.Equal(hc.ExtraHosts, want) {
 		t.Fatalf("ExtraHosts %q, want %q", hc.ExtraHosts, want)
 	}
-	if want := map[string]string{"local-ci-pool": "main", "local-ci-pool.runner": s.Name}; !maps.Equal(c.Labels, want) {
+	if want := map[string]string{"local-ci-pool": "main", "local-ci-pool.runner": s.Name, "local-ci-pool.project": "alpha"}; !maps.Equal(c.Labels, want) {
 		t.Fatalf("Labels %v, want %v", c.Labels, want)
 	}
 
@@ -106,6 +107,38 @@ func TestStartRunnerContract(t *testing.T) {
 
 	if got := d.stdinOf(t, id); got != s.JIT+"\n" {
 		t.Fatalf("stdin %q, want the JIT and a newline", got)
+	}
+}
+
+func TestStartRunnerLabels(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		need int
+		want map[string]string
+	}{
+		{"with a need", 3, map[string]string{
+			"local-ci-pool": "main", "local-ci-pool.runner": "local-ci-alpha-1",
+			"local-ci-pool.project": "alpha", "local-ci-pool.need": "3",
+		}},
+		{"without a need", 0, map[string]string{
+			"local-ci-pool": "main", "local-ci-pool.runner": "local-ci-alpha-1",
+			"local-ci-pool.project": "alpha",
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			d := newFakeDocker()
+			s := testSpec()
+			s.Project, s.Need = "alpha", c.need
+			if _, err := StartRunner(context.Background(), d, s); err != nil {
+				t.Fatal(err)
+			}
+			if len(d.creates) != 1 || d.creates[0].Config == nil {
+				t.Fatalf("%d creates, want 1 with a config", len(d.creates))
+			}
+			if got := d.creates[0].Config.Labels; !maps.Equal(got, c.want) {
+				t.Fatalf("Labels %v, want %v", got, c.want)
+			}
+		})
 	}
 }
 
@@ -138,6 +171,7 @@ func TestStartRunnerRefusesABadSpec(t *testing.T) {
 	for name, mutate := range map[string]func(*ContainerSpec){
 		"no name":            func(s *ContainerSpec) { s.Name = "" },
 		"no instance":        func(s *ContainerSpec) { s.Instance = "" },
+		"no project":         func(s *ContainerSpec) { s.Project = "" },
 		"no image":           func(s *ContainerSpec) { s.Image = "" },
 		"no user":            func(s *ContainerSpec) { s.User = "" },
 		"no jit":             func(s *ContainerSpec) { s.JIT = "" },
