@@ -4,6 +4,8 @@ package budget
 
 import (
 	"context"
+	"errors"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -218,5 +220,55 @@ func TestMonitorStopsWhenNothingWaitsAndNotWedged(t *testing.T) {
 	}
 	if n := h.cc.snapshots.Load() - before; n != 0 {
 		t.Fatalf("%d snapshots after the monitor stopped", n)
+	}
+}
+
+// A *StateError of one Admit marks the client stale; it never takes the client away from the
+// monitor. With every slot held by a waiting Admit, nothing else opens coreslot again, so the
+// monitor must keep snapshotting through the stale client (or the one it reopens) and still
+// wedge the gate when the section is held.
+func TestWedgeAfterAStateError(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name        string
+		reopenFails bool
+	}{
+		{"reopen fails", true},
+		{"reopen succeeds", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newGate(t, stateDir(t, cpu4), on3)
+			hold(t, h.dir, "holder:x", 4)
+			ch := admitAsync(context.Background(), h, alpha("r1"))
+			waitTickets(t, h.dir, 3)
+
+			h.cc.mu.Lock()
+			h.cc.enqueueErr = &coreslot.StateError{Reason: "injected"}
+			if tc.reopenFails {
+				h.cc.openFails, h.cc.openErr = math.MaxInt, errors.New("open refused")
+			}
+			h.cc.mu.Unlock()
+			ad, err := h.g.Admit(context.Background(), alpha("r2"))
+			if err != nil || ad.Mode != runner.ModeFailOpen {
+				t.Fatalf("Admit r2 = %+v, %v; want fail_open", ad, err)
+			}
+			if got := lastLine(h, "runner admitted"); !strings.HasPrefix(got, "runner=r2 ") || !strings.HasSuffix(got, "class=state") {
+				t.Fatalf("runner admitted = %q; want r2 failing open as state", got)
+			}
+
+			holdSection(t, h.dir, 4242)
+			stepUntilWedged(t, h)
+			r := waitResult(t, ch)
+			if r.err != nil || r.ad.Mode != runner.ModeFailOpen {
+				t.Fatalf("the waiting Admit = %+v, %v; want fail_open", r.ad, r.err)
+			}
+			if got := lastLine(h, "runner admitted"); !strings.HasPrefix(got, "runner=r1 ") || !strings.HasSuffix(got, "class=wedged") {
+				t.Fatalf("runner admitted = %q; want r1 failing open as wedged", got)
+			}
+			if got := h.g.State().State; got != "wedged" {
+				t.Fatalf("State().State = %q; want wedged", got)
+			}
+		})
 	}
 }

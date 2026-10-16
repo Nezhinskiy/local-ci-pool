@@ -38,7 +38,9 @@ func (g *Gate) startMonitorLocked() {
 }
 
 // monitor takes a snapshot every SnapshotEvery while an Admit is in progress or the gate is
-// wedged, and stops at the first tick where neither holds.
+// wedged, and stops at the first tick where neither holds. It takes its client from client, as
+// Admit and Adopt do: a stale client is opened again when the backoff allows, and snapshots as it
+// is otherwise. A tick is skipped only while no Open has ever succeeded.
 func (g *Gate) monitor() {
 	for {
 		<-g.clock.After(g.snapshotEvery)
@@ -48,8 +50,11 @@ func (g *Gate) monitor() {
 			g.mu.Unlock()
 			return
 		}
-		cl := g.cl
 		g.mu.Unlock()
+		cl, err := g.client()
+		if err != nil {
+			g.log.Debug("budget open failed", slog.String("error", err.Error()))
+		}
 		if cl == nil {
 			continue
 		}

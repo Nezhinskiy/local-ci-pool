@@ -95,6 +95,14 @@ func (c *countingClient) open(o coreslot.Options) (client, error) {
 	return c, nil
 }
 
+// innerClient is the client the last successful open made; open replaces it under c.mu, possibly
+// from the gate's monitor while another goroutine calls through it.
+func (c *countingClient) innerClient() client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inner
+}
+
 func (c *countingClient) Enqueue(ctx context.Context, r coreslot.Request) (waiter, error) {
 	c.enqueues.Add(1)
 	c.mu.Lock()
@@ -104,7 +112,7 @@ func (c *countingClient) Enqueue(ctx context.Context, r coreslot.Request) (waite
 	if err != nil {
 		return nil, err
 	}
-	w, err := c.inner.Enqueue(ctx, r)
+	w, err := c.innerClient().Enqueue(ctx, r)
 	if err != nil || wrap == nil {
 		return w, err
 	}
@@ -113,11 +121,11 @@ func (c *countingClient) Enqueue(ctx context.Context, r coreslot.Request) (waite
 
 func (c *countingClient) Adopt(ctx context.Context, r coreslot.Request) (*coreslot.Grant, error) {
 	c.adopts.Add(1)
-	return c.inner.Adopt(ctx, r)
+	return c.innerClient().Adopt(ctx, r)
 }
 
 func (c *countingClient) Snapshot() (coreslot.Report, error) {
-	rep, err := c.inner.Snapshot()
+	rep, err := c.innerClient().Snapshot()
 	c.snapshots.Add(1)
 	select {
 	case c.snapped <- struct{}{}:

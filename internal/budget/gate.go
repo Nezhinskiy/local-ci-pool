@@ -50,7 +50,8 @@ type Config struct {
 }
 
 // Gate admits runners into the machine's coreslot budget. It implements runner.Gate. The settings
-// file is read on every call; coreslot is opened by the first call that needs it.
+// file is read on every call; coreslot is opened by the first call that needs it, through the one
+// accessor client.
 type Gate struct {
 	settings *settingsFile
 	stateDir string
@@ -60,10 +61,11 @@ type Gate struct {
 
 	adoptTimeout, snapshotEvery, wedgeAfter, longWait time.Duration
 
-	openMu sync.Mutex // serializes Open
+	openMu sync.Mutex // serializes client
 
 	mu          sync.Mutex
-	cl          client // nil until an Open succeeds
+	cl          client // nil until an Open succeeds, never nil again; read and written by client only
+	stale       bool   // a call failed open on a *StateError since cl was opened: client opens again
 	openFailed  bool   // the last Open failed: class open
 	openBackoff time.Duration
 	nextOpen    time.Time               // no Open before then while openFailed
@@ -300,22 +302,28 @@ func failClass(err error, wedged bool) string {
 	return "other"
 }
 
-// client returns the coreslot client, opening it on first use. After a failed Open, no call opens
-// again before a backoff of 1 s doubling to 1 min.
-func (g *Gate) client() (client, error) {
+// client is the one accessor of the coreslot client, for Admit, Adopt and the monitor alike. It
+// opens coreslot when there is no client yet or the client is stale, and then returns the new
+// client. After a failed Open, no call opens again before a backoff of 1 s doubling to 1 min.
+//
+// When it does not open, or the Open fails, the error is not nil and cl is the client opened last,
+// stale or not, or nil before the first Open succeeded: Admit and Adopt then fail open, and the
+// monitor snapshots through cl, which a stale client still does correctly. Once an Open succeeded,
+// the gate's client is never nil again.
+func (g *Gate) client() (cl client, err error) {
 	g.openMu.Lock()
 	defer g.openMu.Unlock()
 	g.mu.Lock()
-	cl, failed, next := g.cl, g.openFailed, g.nextOpen
+	cl, stale, failed, next := g.cl, g.stale, g.openFailed, g.nextOpen
 	g.mu.Unlock()
-	if cl != nil {
+	if cl != nil && !stale {
 		return cl, nil
 	}
 	now := g.clock.Now()
 	if failed && now.Before(next) {
-		return nil, errOpenBackoff
+		return cl, errOpenBackoff
 	}
-	cl, err := g.open(coreslot.Options{Independent: true, StateDir: g.stateDir})
+	opened, err := g.open(coreslot.Options{Independent: true, StateDir: g.stateDir})
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if err != nil {
@@ -325,10 +333,10 @@ func (g *Gate) client() (client, error) {
 			g.openBackoff = openBackoffFirst
 		}
 		g.openFailed, g.nextOpen = true, now.Add(g.openBackoff)
-		return nil, err
+		return cl, err
 	}
-	g.cl, g.openFailed = cl, false
-	return cl, nil
+	g.cl, g.stale, g.openFailed = opened, false, false
+	return opened, nil
 }
 
 // begin registers an Admit in progress and starts the monitor unless it runs.
@@ -364,10 +372,12 @@ func (g *Gate) admitted(name, label string, mode runner.Mode, need int, grant *c
 // failOpen admits the runner without a grant. The library's reason goes to a debug line only.
 func (g *Gate) failOpen(name, label string, need int, wait time.Duration, class string, err error) runner.Admitted {
 	if class == "state" {
-		// The budget is unusable as opened (its state directory removed, for one): the next call
-		// opens coreslot again, which recreates a missing directory.
+		// The budget may be unusable as opened (its state directory removed, for one): the client
+		// is marked stale, and the next call of client opens coreslot again, which recreates a
+		// missing directory. The client itself stays: the monitor snapshots through it until an
+		// Open succeeds.
 		g.mu.Lock()
-		g.stateErr, g.cl = true, nil
+		g.stateErr, g.stale = true, true
 		g.mu.Unlock()
 	}
 	g.log.Debug("budget call failed", slog.String("runner", name), slog.String("class", class),
