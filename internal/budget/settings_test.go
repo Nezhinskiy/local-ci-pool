@@ -135,6 +135,10 @@ func TestSettingsInvalid(t *testing.T) {
 		"[budget]\nenabled = true\nCPU = 3\n",
 		"[budget]\nEnabled = true\ncpu = 3\n",
 		"not toml\n",
+		"[Budget]\nenabled = true\ncpu = 3\n",
+		"[BUDGET]\nEnabled = true\nCPU = 3\ncpus = 9\n",
+		"[budget]\nenabled = true\ncpu = 3\n[Budget]\ncpu = 7\n",
+		"Budget.enabled = true\nBudget.cpu = 3\n",
 	} {
 		p := filepath.Join(t.TempDir(), "config.toml")
 		writeSettings(t, p, body)

@@ -2,7 +2,39 @@
 
 package budget
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
+
+func TestResolveSettingsPathHome(t *testing.T) {
+	noHome := func() (string, error) { return "", errors.New("no home") }
+	noUCD := func() (string, error) { return "", errors.New("no user config dir") }
+	never := func(string) bool { return false }
+	xdg := func(v string) func(string) string {
+		return func(k string) string {
+			if k == "XDG_CONFIG_HOME" {
+				return v
+			}
+			return ""
+		}
+	}
+
+	got, err := resolveSettingsPath(xdg("/x"), noHome, noUCD, never)
+	if err != nil || got != "/x/local-ci-pool/config.toml" {
+		t.Fatalf("absolute XDG_CONFIG_HOME, no home: %q, %v; want /x/local-ci-pool/config.toml, nil", got, err)
+	}
+	for _, v := range []string{"", "rel"} {
+		if got, err := resolveSettingsPath(xdg(v), noHome, noUCD, never); err == nil {
+			t.Fatalf("XDG_CONFIG_HOME=%q, no home: %q, nil; want an error", v, got)
+		}
+	}
+	home := func() (string, error) { return "/home/alpha", nil }
+	got, err = resolveSettingsPath(xdg(""), home, noUCD, never)
+	if err != nil || got != "/home/alpha/.config/local-ci-pool/config.toml" {
+		t.Fatalf("home, no user config dir: %q, %v", got, err)
+	}
+}
 
 func TestSettingsPath(t *testing.T) {
 	const (

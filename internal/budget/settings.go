@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -114,9 +115,16 @@ func parseSettings(data []byte) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	// The decoder matches keys to fields case-insensitively and reports nothing undecoded for a
-	// miscased one, so the names under [budget] are checked here.
+	// The decoder matches table and key names to fields case-insensitively and reports nothing
+	// undecoded for a miscased one, so the names are checked here: a table that is [budget] but
+	// for its case, and any name under [budget] but enabled and cpu, are refused.
 	for _, k := range md.Keys() {
+		if len(k) == 0 {
+			continue
+		}
+		if k[0] != "budget" && strings.EqualFold(k[0], "budget") {
+			return Settings{}, fmt.Errorf("unknown table %q: the settings table is [budget]", k[0])
+		}
 		if len(k) < 2 || k[0] != "budget" {
 			continue
 		}

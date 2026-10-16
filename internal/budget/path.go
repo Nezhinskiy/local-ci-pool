@@ -12,18 +12,27 @@ import (
 // ~/.config/local-ci-pool/config.toml; when that file does not exist and the one under
 // os.UserConfigDir() does, the latter.
 func DefaultSettingsPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
+	return resolveSettingsPath(os.Getenv, os.UserHomeDir, os.UserConfigDir, func(p string) bool {
+		_, err := os.Stat(p)
+		return err == nil
+	})
+}
+
+// resolveSettingsPath is DefaultSettingsPath over its sources.
+func resolveSettingsPath(getenv func(string) string, home, userConfigDir func() (string, error),
+	exists func(string) bool) (string, error) {
+	h := "" // the home directory is needed only when XDG_CONFIG_HOME is not absolute
+	if !filepath.IsAbs(getenv("XDG_CONFIG_HOME")) {
+		var err error
+		if h, err = home(); err != nil {
+			return "", err
+		}
 	}
-	ucd, err := os.UserConfigDir()
+	ucd, err := userConfigDir()
 	if err != nil {
 		ucd = ""
 	}
-	return settingsPath(os.Getenv, home, ucd, func(p string) bool {
-		_, err := os.Stat(p)
-		return err == nil
-	}), nil
+	return settingsPath(getenv, h, ucd, exists), nil
 }
 
 func settingsPath(getenv func(string) string, home, userConfigDir string, exists func(string) bool) string {
