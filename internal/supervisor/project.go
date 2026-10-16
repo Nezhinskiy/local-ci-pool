@@ -763,6 +763,11 @@ func (pr *project) health() ProjectHealth {
 	}
 	sc := pr.scaler
 	pr.mu.Unlock()
+	if sc != nil {
+		waiting, admitted := sc.BudgetCounts()
+		h.Waiting = waiting
+		h.Admitted.Queued, h.Admitted.FailOpen = admitted[runner.ModeQueued], admitted[runner.ModeFailOpen]
+	}
 	if h.Healthy && sc != nil {
 		if n := sc.NoJobExits(); n >= noJobLimit {
 			h.Healthy = false

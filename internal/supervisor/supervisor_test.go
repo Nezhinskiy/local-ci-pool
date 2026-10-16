@@ -1,17 +1,20 @@
 package supervisor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/system"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
 	"github.com/Nezhinskiy/local-ci-pool/internal/ghauth"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
 	"github.com/Nezhinskiy/local-ci-pool/internal/machine"
@@ -854,5 +857,77 @@ func TestDefaultsAreWhatCmdAndPlistAssume(t *testing.T) {
 	}
 	if s.cfg.HealthAddr != "127.0.0.1:8737" || DefaultHealthAddr != "127.0.0.1:8737" {
 		t.Errorf("health address = %q, want 127.0.0.1:8737", s.cfg.HealthAddr)
+	}
+}
+
+// The snapshot carries the budget's state as the gate reports it, and per
+// project its runners waiting for the budget and those admitted, by mode: the
+// scaler's queued and failed-open runners, and the survivors labelled with
+// the project, adopted.
+func TestSnapshotBudgetFields(t *testing.T) {
+	h := newHarness(t, 5, 1, "alpha")
+	b := newFakeBudget(true)
+	b.state = budget.State{State: "wedged", Error: "state", OldestWaitS: 42}
+	var mu sync.Mutex
+	calls := 0
+	b.admit = func(ctx context.Context, a runner.Admission) (runner.Admitted, error) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		switch n {
+		case 1:
+			return b.grant(a.Runner, runner.ModeQueued, 2), nil
+		case 2:
+			return b.grant(a.Runner, runner.ModeFailOpen, 2), nil
+		}
+		return waitOnCtx(ctx, a)
+	}
+	h.budget = b
+	h.docker.add(survivorA, labelled(survivorA, "alpha", "2"))
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.eventually("the survivor adopted", func() bool {
+		e, ok := h.survivorOf(survivorA)
+		return ok && e.mode == runner.ModeAdopted
+	})
+	h.actions.Assign(alphaSet, 4)
+	img := h.imageOf("alpha")
+	h.eventually("two runners admitted and two waiting", func() bool {
+		return len(b.admitted()) == 4 && len(h.docker.runners(img)) == 2
+	})
+	snap := h.sup.Snapshot()
+	if snap.Budget != b.State() {
+		t.Fatalf("budget %+v, want %+v", snap.Budget, b.State())
+	}
+	got, _ := h.health(alphaRepo)
+	want := ProjectHealth{
+		Repo: alphaRepo, Identity: "alpha", Image: img, Healthy: true,
+		Waiting:  2,
+		Admitted: AdmittedHealth{Queued: 1, Adopted: 1, FailOpen: 1},
+	}
+	if got != want {
+		t.Fatalf("alpha's health %+v, want %+v", got, want)
+	}
+}
+
+// With no budget wired the snapshot reports it off, and every project's
+// counts are zero.
+func TestSnapshotWithoutBudgetIsOff(t *testing.T) {
+	h := newHarness(t, 2, 1, "alpha")
+	h.docker.add(survivorA, labelled(survivorA, "alpha", "2"))
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.actions.Assign(alphaSet, 1)
+	img := h.imageOf("alpha")
+	h.eventually("a runner", func() bool { return len(h.docker.runners(img)) == 1 })
+	snap := h.sup.Snapshot()
+	if want := (budget.State{State: "off"}); snap.Budget != want {
+		t.Fatalf("budget %+v, want %+v", snap.Budget, want)
+	}
+	for _, p := range snap.Projects {
+		if p.Waiting != 0 || p.Admitted != (AdmittedHealth{}) {
+			t.Errorf("%s counts waiting %d, admitted %+v; want zero", p.Repo, p.Waiting, p.Admitted)
+		}
 	}
 }

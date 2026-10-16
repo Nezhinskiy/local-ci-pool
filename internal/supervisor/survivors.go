@@ -189,6 +189,26 @@ func (s *Supervisor) releaseSurvivor(name string) bool {
 	return ok
 }
 
+// survivorCountsLocked counts the survivors admitted into the budget, by the
+// project their labels name and by the mode of their adoption: adopted or
+// fail_open. s.mu is held.
+func (s *Supervisor) survivorCountsLocked() map[string]AdmittedHealth {
+	out := map[string]AdmittedHealth{}
+	for _, e := range s.survivors {
+		c := out[e.project]
+		switch e.mode {
+		case runner.ModeAdopted:
+			c.Adopted++
+		case runner.ModeFailOpen:
+			c.FailOpen++
+		default:
+			continue
+		}
+		out[e.project] = c
+	}
+	return out
+}
+
 // survivorNames returns the current survivors' names.
 func (s *Supervisor) survivorNames() map[string]bool {
 	s.mu.Lock()

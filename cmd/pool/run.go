@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
 	"github.com/Nezhinskiy/local-ci-pool/internal/health"
 	"github.com/Nezhinskiy/local-ci-pool/internal/heartbeat"
@@ -148,6 +149,9 @@ func newLogger(w io.Writer) *slog.Logger {
 }
 
 func cmdRun(ctx context.Context, args []string, stderr io.Writer, svc services) int {
+	// First, before anything is opened and whether the budget is on or off:
+	// a pool started inside `coreslot run` must not hold that run's grant.
+	budget.DropInherited()
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	probe := fs.Bool("probe", false, "serve one repository under probe names")

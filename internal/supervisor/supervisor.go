@@ -247,14 +247,16 @@ type Deps struct {
 
 // Snapshot is the pool's state for the health endpoint and the heartbeat.
 type Snapshot struct {
-	Version  string          `json:"version"`
-	Commit   string          `json:"commit"`
-	Machine  string          `json:"machine"`
-	Slots    int             `json:"slots"`
-	InUse    int             `json:"in_use"`
-	Busy     int             `json:"busy"`
-	Docker   bool            `json:"docker"`
-	Probe    bool            `json:"probe"`
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+	Machine string `json:"machine"`
+	Slots   int    `json:"slots"`
+	InUse   int    `json:"in_use"`
+	Busy    int    `json:"busy"`
+	Docker  bool   `json:"docker"`
+	Probe   bool   `json:"probe"`
+	// Budget is the budget's state: {State: "off"} when none is wired.
+	Budget   budget.State    `json:"budget"`
 	Projects []ProjectHealth `json:"projects"`
 }
 
@@ -266,6 +268,20 @@ type ProjectHealth struct {
 	Image    string `json:"image"`
 	Reason   string `json:"reason"`
 	Healthy  bool   `json:"healthy"`
+	// Waiting is the project's runners waiting for the budget.
+	Waiting int `json:"waiting"`
+	// Admitted is the project's runners and survivors that hold an
+	// admission now, by mode.
+	Admitted AdmittedHealth `json:"admitted"`
+}
+
+// AdmittedHealth counts a project's runners and survivors admitted into the
+// budget, by mode: queued and fail_open runners, adopted and fail_open
+// survivors.
+type AdmittedHealth struct {
+	Queued   int `json:"queued"`
+	Adopted  int `json:"adopted"`
+	FailOpen int `json:"fail_open"`
 }
 
 // Supervisor runs the pool; see Run.
@@ -784,12 +800,22 @@ func (s *Supervisor) Snapshot() Snapshot {
 	}
 	slots := s.slots
 	prs := s.projectList()
+	survivors := s.survivorCountsLocked()
 	s.mu.Unlock()
 	if slots != nil {
 		snap.Slots, snap.InUse, snap.Busy = slots.Cap(), slots.InUse(), slots.Busy()
 	}
+	// State reads the settings file: never under s.mu.
+	snap.Budget = budget.State{State: "off"}
+	if s.deps.Budget != nil {
+		snap.Budget = s.deps.Budget.State()
+	}
 	for _, pr := range prs {
-		snap.Projects = append(snap.Projects, pr.health())
+		h := pr.health()
+		c := survivors[pr.identity]
+		h.Admitted.Adopted += c.Adopted
+		h.Admitted.FailOpen += c.FailOpen
+		snap.Projects = append(snap.Projects, h)
 	}
 	return snap
 }

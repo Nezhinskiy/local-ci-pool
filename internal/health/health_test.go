@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
 	"github.com/Nezhinskiy/local-ci-pool/internal/supervisor"
 )
 
@@ -19,8 +20,10 @@ func sample() supervisor.Snapshot {
 	return supervisor.Snapshot{
 		Version: "v0.1.0", Commit: "abc1234", Machine: "examplemac",
 		Slots: 2, InUse: 1, Busy: 1, Docker: true,
+		Budget: budget.State{State: "wedged", Error: "state", OldestWaitS: 42},
 		Projects: []supervisor.ProjectHealth{
-			{Repo: "example/alpha", Identity: "alpha", Image: "example.invalid/alpha@sha256:0", Healthy: true},
+			{Repo: "example/alpha", Identity: "alpha", Image: "example.invalid/alpha@sha256:0", Healthy: true,
+				Waiting: 2, Admitted: supervisor.AdmittedHealth{Queued: 1, Adopted: 1, FailOpen: 1}},
 			{Repo: "example/beta", Identity: "beta", Reason: "preflight failed: no CA bundle"},
 		},
 	}
@@ -49,13 +52,13 @@ func TestHealthzStatusAndShape(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &fields); err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []string{"version", "commit", "machine", "slots", "in_use", "busy", "docker", "probe", "projects"} {
+	for _, k := range []string{"version", "commit", "machine", "slots", "in_use", "busy", "docker", "probe", "budget", "projects"} {
 		if _, ok := fields[k]; !ok {
 			t.Errorf("no %q field in %s", k, rec.Body.String())
 		}
 	}
-	if len(fields) != 9 {
-		t.Errorf("%d fields, want 9: %s", len(fields), rec.Body.String())
+	if len(fields) != 10 {
+		t.Errorf("%d fields, want 10: %s", len(fields), rec.Body.String())
 	}
 	var back supervisor.Snapshot
 	if err := json.Unmarshal(rec.Body.Bytes(), &back); err != nil {
@@ -66,6 +69,26 @@ func TestHealthzStatusAndShape(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"slots":2`) {
 		t.Errorf("body %s lacks \"slots\":2", rec.Body.String())
+	}
+}
+
+// The budget object and the per-project counts have exactly these shapes;
+// an error class is omitted when there is none.
+func TestHealthzBudgetShape(t *testing.T) {
+	snap := sample()
+	body := get(t, Handler(func() supervisor.Snapshot { return snap }), http.MethodGet, "/healthz").Body.String()
+	for _, want := range []string{
+		`"budget":{"state":"wedged","error":"state","oldest_wait_s":42}`,
+		`"waiting":2,"admitted":{"queued":1,"adopted":1,"fail_open":1}`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body %s lacks %s", body, want)
+		}
+	}
+	snap.Budget = budget.State{State: "off"}
+	body = get(t, Handler(func() supervisor.Snapshot { return snap }), http.MethodGet, "/healthz").Body.String()
+	if want := `"budget":{"state":"off","oldest_wait_s":0}`; !strings.Contains(body, want) {
+		t.Errorf("body %s lacks %s", body, want)
 	}
 }
 

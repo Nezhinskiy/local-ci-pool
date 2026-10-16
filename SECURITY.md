@@ -33,6 +33,11 @@ address reaches every port bound to `127.0.0.1` on the Mac. That includes the po
 which answers a forged loopback `Host` header and lists the repositories the pool serves, and any
 other development service you run on loopback.
 
+With the core budget, `/healthz` also shows a top-level `budget` object (`state`, an `error` class,
+`oldest_wait_s`) and, per project, `waiting` and `admitted` counts. These carry only the pool's own
+data: its budget state, an error class (`config`, `open` or `state`), its oldest wait in seconds and
+its per-project counts. They never name another workload's label, a path or a library message.
+
 Mitigation is owner discipline: run on the Mac only loopback services you would let your own
 repositories' jobs use, and give the ones that matter their own authentication. Real egress
 filtering would need root inside the job container (or a firewall in the Docker VM) and is out of

@@ -8,6 +8,7 @@ import (
 
 	"github.com/moby/moby/client"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
 	"github.com/Nezhinskiy/local-ci-pool/internal/ghauth"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
 	"github.com/Nezhinskiy/local-ci-pool/internal/health"
@@ -46,8 +47,20 @@ func newRealPool(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, erro
 		Mirror: mirror.Mirror{Root: filepath.Join(cache, "local-ci-pool", "mirror")},
 		Log:    log,
 		Serve:  health.Serve(func() supervisor.Snapshot { return sup.Snapshot() }, log),
+		// The settings file's path by the default rule. New reads nothing
+		// and opens nothing: coreslot opens at the first admission.
+		Budget: budgetDep(budget.New(budget.Config{Log: log})),
 	})
 	return sup, gh, nil
+}
+
+// budgetDep is the gate as the supervisor's Budget: a nil interface for a
+// nil gate, never a typed nil inside it.
+func budgetDep(g *budget.Gate) supervisor.Budget {
+	if g == nil {
+		return nil
+	}
+	return g
 }
 
 func newRealForgetter(*slog.Logger) (forgetter, error) {

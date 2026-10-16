@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
 	"github.com/Nezhinskiy/local-ci-pool/internal/ghauth"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
 	"github.com/Nezhinskiy/local-ci-pool/internal/supervisor"
@@ -163,6 +164,21 @@ func TestHeartbeatWritesOnlyHealthy(t *testing.T) {
 	}
 	if got := len(vars.all()); got < 1 {
 		t.Fatalf("%d writes", got)
+	}
+}
+
+// The heartbeat publishes the slots, whatever the budget: runners waiting
+// for it, or a long wait, change nothing in what the routing reads.
+func TestHeartbeatPublishesCapWithBudget(t *testing.T) {
+	s := snapshot(4, supervisor.ProjectHealth{Repo: "example/alpha", Healthy: true, Waiting: 4})
+	s.Budget = budget.State{State: "on", OldestWaitS: 86400}
+	snap := &fakeSnap{snap: s}
+	vars := &fakeVars{}
+	stop := start(t, Config{Every: time.Hour, Snapshot: snap.get, Vars: vars})
+	waitFor(t, "the first beat", func() bool { return len(vars.all()) >= 1 })
+	stop()
+	if got := vars.all(); len(got) != 1 || got[0].value != "1800000000 4" {
+		t.Fatalf("writes = %+v, want one with value \"1800000000 4\"", got)
 	}
 }
 
