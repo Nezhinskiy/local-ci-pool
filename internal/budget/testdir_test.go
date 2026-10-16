@@ -3,10 +3,13 @@
 package budget
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -73,6 +76,8 @@ type countingClient struct {
 	openErr    error // what a failing open returns
 	enqueueErr error // returned once by the next Enqueue, then cleared
 	wrapWaiter func(waiter) waiter
+	// report, when set, rewrites every successful Snapshot's report.
+	report func(coreslot.Report) coreslot.Report
 }
 
 func newCountingClient() *countingClient {
@@ -126,6 +131,11 @@ func (c *countingClient) Adopt(ctx context.Context, r coreslot.Request) (*coresl
 
 func (c *countingClient) Snapshot() (coreslot.Report, error) {
 	rep, err := c.innerClient().Snapshot()
+	c.mu.Lock()
+	if c.report != nil && err == nil {
+		rep = c.report(rep)
+	}
+	c.mu.Unlock()
 	c.snapshots.Add(1)
 	select {
 	case c.snapped <- struct{}{}:
@@ -356,4 +366,65 @@ func holdSection(t *testing.T, dir string, pid int) (rewrite func(pid int), unlo
 	unlock = func() { once.Do(func() { f.Close() }) }
 	t.Cleanup(unlock)
 	return rewrite, unlock
+}
+
+// holderEnv names the admit.lock a test binary run as a section holder flocks; see TestMain.
+const holderEnv = "LOCAL_CI_POOL_TEST_HOLD_SECTION"
+
+// TestMain runs the test binary as a section holder when holderEnv is set, and the tests
+// otherwise.
+func TestMain(m *testing.M) {
+	if path := os.Getenv(holderEnv); path != "" {
+		os.Exit(holdSectionAsChild(path))
+	}
+	os.Exit(m.Run())
+}
+
+// holdSectionAsChild flocks path, as a client that does not rewrite admit.lock's body would,
+// prints "locked", and keeps the lock until its stdin closes.
+func holdSectionAsChild(path string) int {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return 2
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+		return 3
+	}
+	if _, err := os.Stdout.WriteString("locked\n"); err != nil {
+		return 4
+	}
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	return 0
+}
+
+// holdSectionInChild starts a child process that holds dir's admission section without rewriting
+// admit.lock's body, and returns once it holds it. The child leaves the section when the test
+// ends.
+func holdSectionInChild(t *testing.T, dir string) {
+	t.Helper()
+	openClient(t, dir) // creates the layout, admit.lock included
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), holderEnv+"="+filepath.Join(dir, "admit.lock"))
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		stdin.Close()
+		if err := cmd.Wait(); err != nil {
+			t.Errorf("the section holder: %v", err)
+		}
+	})
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil || line != "locked\n" {
+		t.Fatalf("the section holder said %q, %v; want locked", line, err)
+	}
 }

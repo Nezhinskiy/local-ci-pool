@@ -6,10 +6,12 @@ import (
 	"context"
 	"errors"
 	"math"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/core-slot/coreslot"
 
@@ -63,7 +65,7 @@ func TestWedgeFailsOpenAndClears(t *testing.T) {
 	if steps != 25 {
 		t.Fatalf("wedged after %d ticks; want 25", steps)
 	}
-	if got, want := h.log.lines("budget wedged"), []string{"pid=4242"}; !slices.Equal(got, want) {
+	if got, want := h.log.lines("budget wedged"), []string{"recorded_pid=4242 self=false"}; !slices.Equal(got, want) {
 		t.Fatalf("budget wedged lines = %q; want %q", got, want)
 	}
 	if got := lastLine(h, "runner admitted"); !strings.HasSuffix(got, "mode=fail_open need=3 granted=0 shortfall=0 wait_s=125.0 class=wedged") {
@@ -87,7 +89,7 @@ func TestWedgeFailsOpenAndClears(t *testing.T) {
 	if got := h.g.State().State; got != "on" {
 		t.Fatalf("State().State = %q after the section was freed; want on", got)
 	}
-	if got, want := h.log.lines("budget unwedged"), []string{"pid=4242"}; !slices.Equal(got, want) {
+	if got, want := h.log.lines("budget unwedged"), []string{"recorded_pid=4242 self=false"}; !slices.Equal(got, want) {
 		t.Fatalf("budget unwedged lines = %q; want %q", got, want)
 	}
 }
@@ -124,7 +126,7 @@ func TestWedgeClearsOnAnotherHolder(t *testing.T) {
 	if got := h.g.State().State; got != "on" {
 		t.Fatalf("State().State = %q with another holder in the section; want on", got)
 	}
-	if got, want := h.log.lines("budget unwedged"), []string{"pid=4242"}; !slices.Equal(got, want) {
+	if got, want := h.log.lines("budget unwedged"), []string{"recorded_pid=4242 self=false"}; !slices.Equal(got, want) {
 		t.Fatalf("budget unwedged lines = %q; want %q", got, want)
 	}
 
@@ -133,7 +135,7 @@ func TestWedgeClearsOnAnotherHolder(t *testing.T) {
 	ch := admitAsync(context.Background(), h, alpha("r2"))
 	eventually(t, "r2's Enqueue", func() bool { return h.cc.enqueues.Load() > enqueues })
 	stepUntilWedged(t, h)
-	if got, want := h.log.lines("budget wedged"), []string{"pid=4242", "pid=4343"}; !slices.Equal(got, want) {
+	if got, want := h.log.lines("budget wedged"), []string{"recorded_pid=4242 self=false", "recorded_pid=4343 self=false"}; !slices.Equal(got, want) {
 		t.Fatalf("budget wedged lines = %q; want %q", got, want)
 	}
 	if r := waitResult(t, ch); r.err != nil || r.ad.Mode != runner.ModeFailOpen {
@@ -270,5 +272,139 @@ func TestWedgeAfterAStateError(t *testing.T) {
 				t.Fatalf("State().State = %q; want wedged", got)
 			}
 		})
+	}
+}
+
+// A holder that enters the section without rewriting admit.lock's body (a token-only client)
+// leaves the last body in place, here the one this process's own client wrote. The wedge is still
+// found, and its line names the recorded pid as recorded, marked as this process's own.
+func TestWedgeBehindAStaleBody(t *testing.T) {
+	t.Parallel()
+	h := newGate(t, stateDir(t, cpu4), on3)
+	hold(t, h.dir, "holder:x", 4)
+	ch := admitAsync(context.Background(), h, alpha("r1"))
+	waitTickets(t, h.dir, 3)
+	holdSectionInChild(t, h.dir)
+	stepUntilWedged(t, h)
+	if r := waitResult(t, ch); r.err != nil || r.ad.Mode != runner.ModeFailOpen {
+		t.Fatalf("the waiting Admit = %+v, %v; want fail_open", r.ad, r.err)
+	}
+	want := []string{"recorded_pid=" + strconv.Itoa(os.Getpid()) + " self=true"}
+	if got := h.log.lines("budget wedged"); !slices.Equal(got, want) {
+		t.Fatalf("budget wedged lines = %q; want %q", got, want)
+	}
+}
+
+// Traffic through the section behind a body nobody rewrites: every snapshot finds the section
+// held under the same body, but gen moves, which only a section can do, so no one holder keeps
+// it. That is no wedge. Once gen stops moving, the same snapshots wedge the gate.
+func TestTrafficBehindAStaleBodyIsNoWedge(t *testing.T) {
+	t.Parallel()
+	h := newGate(t, stateDir(t, cpu4), on3)
+	hold(t, h.dir, "holder:x", 4)
+	ch := admitAsync(context.Background(), h, alpha("r1"))
+	waitTickets(t, h.dir, 3)
+
+	entered := time.Unix(1_700_000_000, 0)
+	var gen int64
+	moving := true
+	h.cc.mu.Lock()
+	h.cc.report = func(rep coreslot.Report) coreslot.Report {
+		if moving {
+			gen++
+		}
+		rep.Gen = gen
+		rep.Section = coreslot.SectionInfo{Held: true, PID: 4242, Entered: entered}
+		return rep
+	}
+	h.cc.mu.Unlock()
+	for range 30 { // past WedgeAfter (24 ticks)
+		h.step(t)
+	}
+	if got := h.g.State().State; got != "on" {
+		t.Fatalf("State().State = %q with gen moving behind one body; want on", got)
+	}
+	if n := len(h.log.lines("budget wedged")); n != 0 {
+		t.Fatalf("%d budget wedged lines with gen moving", n)
+	}
+	select {
+	case r := <-ch:
+		t.Fatalf("Admit returned while gen moved: %+v, %v", r.ad, r.err)
+	default:
+	}
+
+	h.cc.mu.Lock()
+	moving = false
+	h.cc.mu.Unlock()
+	// The last snapshot with gen moving began the count: WedgeAfter is 24 ticks from it.
+	if steps := stepUntilWedged(t, h); steps != 24 {
+		t.Fatalf("wedged %d ticks after gen stopped; want 24", steps)
+	}
+	if got, want := h.log.lines("budget wedged"), []string{"recorded_pid=4242 self=false"}; !slices.Equal(got, want) {
+		t.Fatalf("budget wedged lines = %q; want %q", got, want)
+	}
+	waitResult(t, ch)
+}
+
+// unreadableAfterWedge wedges the gate, frees the section and makes the state directory
+// unreadable, so that every snapshot fails on coreslot's state.
+func unreadableAfterWedge(t *testing.T) *harness {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a directory of mode 000")
+	}
+	h := newGate(t, stateDir(t, cpu4), on3)
+	unlock, _, _ := wedge(t, h, 4242)
+	unlock() // the holder is gone: the section is free
+	if err := os.Chmod(h.dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(h.dir, 0o700) })
+	return h
+}
+
+func (g *Gate) isStale() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.stale
+}
+
+// While wedged, a new Admit's snapshot fails on coreslot's state (its directory unreadable): the
+// Admit fails open as state, not wedged, the client is marked stale, and /healthz says state.
+func TestWedgedSnapshotStateErrorFailsOpenAsState(t *testing.T) {
+	t.Parallel()
+	h := unreadableAfterWedge(t)
+	ad, err := h.g.Admit(context.Background(), alpha("r9"))
+	if err != nil || ad.Mode != runner.ModeFailOpen {
+		t.Fatalf("Admit = %+v, %v; want fail_open", ad, err)
+	}
+	if got := lastLine(h, "runner admitted"); !strings.HasPrefix(got, "runner=r9 ") || !strings.HasSuffix(got, "class=state") {
+		t.Fatalf("runner admitted = %q; want r9 failing open as state", got)
+	}
+	if got := h.g.State().Error; got != "state" {
+		t.Fatalf("State().Error = %q; want state", got)
+	}
+	if !h.g.isStale() {
+		t.Fatal("the client is not marked stale")
+	}
+}
+
+// A monitor tick whose snapshot fails on coreslot's state marks the client stale, so the next
+// call opens coreslot again; here that Open fails too, and /healthz says open rather than no
+// error at all.
+func TestMonitorSnapshotStateErrorMarksStale(t *testing.T) {
+	t.Parallel()
+	h := unreadableAfterWedge(t)
+	opens := h.cc.opens.Load()
+	h.step(t)
+	if !h.g.isStale() {
+		t.Fatal("the client is not marked stale after the monitor's snapshot failed")
+	}
+	h.step(t)
+	if n := h.cc.opens.Load() - opens; n != 1 {
+		t.Fatalf("%d opens on the tick after the client went stale; want 1", n)
+	}
+	if got := h.g.State(); got.Error != "open" {
+		t.Fatalf("State() = %+v; want error open", got)
 	}
 }

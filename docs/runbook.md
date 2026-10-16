@@ -373,11 +373,16 @@ To get CI moving:
    `coreslot cancel <ticket-id>`.
 
 **Wedged.** `budget.state` is `wedged` when one process has held coreslot's admission section for 2
-minutes. A healthy client holds it for milliseconds, so the holder is stopped (for example by
-Ctrl-Z) or stuck, and nobody can be admitted, local gates included. `pool.log` warns
-`budget wedged` with the holder's `pid`. Meanwhile the pool's runners start without a grant: resume
-the process (`kill -CONT <pid>`) or end it. The wedge clears at the next check that finds the
-section free, and `pool.log` logs `budget unwedged`.
+minutes, with no admission going through it meanwhile. A healthy client holds it for milliseconds,
+so the holder is stopped (for example by Ctrl-Z) or stuck, and nobody can be admitted, local gates
+included. `pool.log` warns `budget wedged` with `recorded_pid`, the pid in `admit.lock`'s
+informational body, and `self=true` when that pid is the pool's own (`recorded_pid=0`: the body
+could not be read). The body may be stale: a client that does not rewrite it leaves the previous
+holder's in place, often the pool's own. Before stopping anything, find the real holder with
+`lsof "<state directory>/admit.lock"`; `coreslot status` prints the state directory, and its
+`admission section` line comes from the same body. Meanwhile the pool's runners start without a
+grant: resume the holder (`kill -CONT <pid>`) or end it. The wedge clears at the next check that
+finds the section free or held by another, and `pool.log` logs `budget unwedged`.
 
 **Started without a grant.** When coreslot itself fails (it cannot be opened, its state fails, or it
 is wedged), a runner starts anyway rather than block CI: `pool.log` warns `runner admitted` with

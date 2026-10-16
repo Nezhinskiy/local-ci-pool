@@ -65,7 +65,7 @@ type Gate struct {
 
 	mu          sync.Mutex
 	cl          client // nil until an Open succeeds, never nil again; read and written by client only
-	stale       bool   // a call failed open on a *StateError since cl was opened: client opens again
+	stale       bool   // a call or a snapshot failed on a *StateError since cl was opened: client opens again
 	openFailed  bool   // the last Open failed: class open
 	openBackoff time.Duration
 	nextOpen    time.Time               // no Open before then while openFailed
@@ -188,8 +188,8 @@ func (g *Gate) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, 
 	if err != nil {
 		return failOpen(g.since(ad), "open", err)
 	}
-	if !g.proceedWhenWedged(cl) {
-		return failOpen(g.since(ad), "wedged", errWedged)
+	if err := g.proceedWhenWedged(cl); err != nil {
+		return failOpen(g.since(ad), failClass(err, errors.Is(err, errWedged)), err)
 	}
 	var w waiter
 	for backoff := busyBackoffFirst; ; backoff = min(2*backoff, busyBackoffMax) {
@@ -259,8 +259,8 @@ func (g *Gate) Adopt(ctx context.Context, a runner.Admission) runner.Admitted {
 	if err != nil {
 		return failOpen("open", err)
 	}
-	if !g.proceedWhenWedged(cl) {
-		return failOpen("wedged", errWedged)
+	if err := g.proceedWhenWedged(cl); err != nil {
+		return failOpen(failClass(err, errors.Is(err, errWedged)), err)
 	}
 	actx, cancel := context.WithTimeout(ctx, g.adoptTimeout)
 	defer cancel()
