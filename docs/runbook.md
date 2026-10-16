@@ -65,7 +65,8 @@ Run `./install.sh --dry-run` first if you want to see what it would do. The inst
    start downloads the runner and builds images, so a pool that has not answered within a minute is
    only reported, not treated as a failure.
 
-It writes no configuration. The pool keeps derived state only: its git mirrors under
+The pool writes no configuration. `config.toml` is yours; the installer creates it only when asked.
+The pool keeps derived state only: its git mirrors under
 `~/Library/Caches/local-ci-pool`, and the Docker images `local-ci/runner:<version>` and
 `local-ci/<identity>:<digest>`. Deleting any of it costs a fetch or a build.
 

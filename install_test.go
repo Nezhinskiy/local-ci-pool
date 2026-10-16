@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -149,14 +151,21 @@ exit 0
 	// Before the agent is loaded, curl reaches the old pool for
 	// STUB_PORT_BUSY calls, then nothing listens (exit 7). Once it is loaded,
 	// /healthz reports STUB_NEW_VERSION, and STUB_KICKED_VERSION after a
-	// kickstart; "none" means nothing listens.
+	// kickstart; "none" means nothing listens. STUB_BUDGET picks the body's
+	// budget object: "none" (the default) leaves it out, as a release before
+	// the budget does; "off" and "on" set its state.
 	"curl": `#!/bin/sh
 echo "curl $*" >> "$STUB_LOG"
 if [ -e "$STUB_LOG.loaded" ]; then
 	v="${STUB_NEW_VERSION:-v0.1.0}"
 	if [ -e "$STUB_LOG.kicked" ] && [ -n "${STUB_KICKED_VERSION:-}" ]; then v="$STUB_KICKED_VERSION"; fi
 	[ "$v" != none ] || exit 7
-	echo "{\"version\":\"$v\",\"commit\":\"abc1234\",\"machine\":\"examplemacbo\",\"slots\":4,\"projects\":[]}"
+	b=""
+	case "${STUB_BUDGET:-none}" in
+	off) b="\"budget\":{\"state\":\"off\",\"oldest_wait_s\":0}," ;;
+	on) b="\"budget\":{\"state\":\"on\",\"oldest_wait_s\":0}," ;;
+	esac
+	echo "{\"version\":\"$v\",\"commit\":\"abc1234\",\"machine\":\"examplemacbo\",\"slots\":4,$b\"projects\":[]}"
 	exit 0
 fi
 f="$STUB_LOG.busy"
@@ -1789,5 +1798,357 @@ func TestStopKeepsWaitingThroughAFailedPrint(t *testing.T) {
 	// The failing prints were all reached, so the wait went through them.
 	if b, _ := os.ReadFile(e.log + ".pidprints"); func() int { n, _ := strconv.Atoi(strings.TrimSpace(string(b))); return n }() < 8 {
 		t.Errorf("only %q prints before the bootout; the failing ones were not reached", b)
+	}
+}
+
+// settingsXDG is the budget settings file the installed pool reads under
+// launchd, and the one the installer writes.
+func (e *env) settingsXDG() string {
+	return filepath.Join(e.home, ".config", "local-ci-pool", "config.toml")
+}
+
+// settingsMac is the macOS fallback, beside the installer's bin directory.
+func (e *env) settingsMac() string {
+	return filepath.Join(e.home, "Library", "Application Support", "local-ci-pool", "config.toml")
+}
+
+// exitCode is the exit status of a finished install, 0 for success.
+func exitCode(t *testing.T, err error) int {
+	t.Helper()
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("the installer did not run: %v", err)
+	}
+	return ee.ExitCode()
+}
+
+// lexists reports whether anything, a dangling symlink included, is at path.
+func lexists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
+const budgetFile = "[budget]\nenabled = true\ncpu = 3\n"
+
+// --budget-cpu takes a decimal from 1 to 256 without a leading zero, which TOML
+// would refuse; anything else exits 1 before anything is downloaded or written.
+// It does not apply to --uninstall.
+func TestInstallBudgetCPUValidation(t *testing.T) {
+	for _, args := range [][]string{
+		{"--budget-cpu", "0"}, {"--budget-cpu", "257"}, {"--budget-cpu", "x"}, {"--budget-cpu", "-1"},
+		{"--budget-cpu", "3.5"}, {"--budget-cpu", "03"}, {"--budget-cpu", ""}, {"--budget-cpu=0"},
+		{"--budget-cpu", "99999999999999999999"}, {"--budget-cpu"},
+		{"--uninstall", "--budget-cpu", "3"}, {"--budget-cpu", "3", "--uninstall"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			e := newEnv(t)
+			out, err := e.install(args...)
+			if code := exitCode(t, err); code != 1 {
+				t.Fatalf("exit %d, want 1:\n%s", code, out)
+			}
+			if !strings.Contains(out, "install.sh: --budget-cpu") {
+				t.Errorf("the refusal does not name --budget-cpu:\n%s", out)
+			}
+			if len(e.calls()) != 0 {
+				t.Errorf("tools ran: %v", e.calls())
+			}
+			if lexists(filepath.Join(e.home, ".config")) || lexists(filepath.Join(e.home, "Library")) {
+				t.Error("something was written")
+			}
+		})
+	}
+	for _, n := range []string{"1", "256"} {
+		e := newEnv(t)
+		if out, err := e.install("--dry-run", "--budget-cpu", n); err != nil {
+			t.Errorf("--budget-cpu %s refused: %v\n%s", n, err, out)
+		}
+	}
+	e := newEnv(t)
+	if out, err := e.install("--budget-cpu=7"); err != nil {
+		t.Fatalf("--budget-cpu=7: %v\n%s", err, out)
+	}
+	if b, _ := os.ReadFile(e.settingsXDG()); string(b) != "[budget]\nenabled = true\ncpu = 7\n" {
+		t.Errorf("--budget-cpu=7 wrote %q", b)
+	}
+	// An unknown flag keeps its own exit status.
+	if out, err := newEnv(t).install("--budget"); exitCode(t, err) != 2 {
+		t.Errorf("an unknown flag: %v\n%s", err, out)
+	}
+}
+
+// With no settings file, --budget-cpu creates ~/.config/local-ci-pool/config.toml
+// readable by its owner only, once the release has verified; a failed install
+// writes nothing.
+func TestInstallBudgetCPUWritesWhenAbsent(t *testing.T) {
+	e := newEnv(t)
+	out, err := e.install("--budget-cpu", "3")
+	if err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	b, err := os.ReadFile(e.settingsXDG())
+	if err != nil {
+		t.Fatalf("no settings file: %v\n%s", err, out)
+	}
+	if string(b) != budgetFile {
+		t.Errorf("the settings file holds %q, want %q", b, budgetFile)
+	}
+	if fi, err := os.Stat(e.settingsXDG()); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("the settings file's mode: %v %v, want 0600", fi.Mode().Perm(), err)
+	}
+	if fi, err := os.Stat(filepath.Dir(e.settingsXDG())); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Errorf("its directory's mode: %v %v, want 0700", fi.Mode().Perm(), err)
+	}
+	if !strings.Contains(out, "write "+e.settingsXDG()) {
+		t.Errorf("the output does not name the file it wrote:\n%s", out)
+	}
+	if lexists(e.settingsMac()) {
+		t.Error("the macOS fallback was written")
+	}
+
+	e = newEnv(t)
+	e.vars["STUB_VERIFY_EXIT"] = "1"
+	if out, err := e.install("--budget-cpu", "3"); err == nil {
+		t.Fatalf("the install succeeded although the attestation failed:\n%s", out)
+	}
+	if lexists(filepath.Join(e.home, ".config")) {
+		t.Error("a failed install wrote the budget settings")
+	}
+}
+
+// An existing settings file, at either path, is the user's: the installer
+// changes nothing and names it.
+func TestInstallBudgetCPUKeepsExisting(t *testing.T) {
+	const theirs = "[budget]\nenabled = true\ncpu = 5\n"
+	t.Run("config", func(t *testing.T) {
+		e := newEnv(t)
+		write(t, e.settingsXDG(), theirs, 0o644)
+		out, err := e.install("--budget-cpu", "3")
+		if err != nil {
+			t.Fatalf("install failed: %v\n%s", err, out)
+		}
+		if b, _ := os.ReadFile(e.settingsXDG()); string(b) != theirs {
+			t.Errorf("the settings file changed to %q", b)
+		}
+		if !strings.Contains(out, "the budget settings exist; edit "+e.settingsXDG()) {
+			t.Errorf("the output does not name the existing file:\n%s", out)
+		}
+	})
+	t.Run("application support only", func(t *testing.T) {
+		e := newEnv(t)
+		write(t, e.settingsMac(), theirs, 0o644)
+		out, err := e.install("--budget-cpu", "3")
+		if err != nil {
+			t.Fatalf("install failed: %v\n%s", err, out)
+		}
+		if b, _ := os.ReadFile(e.settingsMac()); string(b) != theirs {
+			t.Errorf("the settings file changed to %q", b)
+		}
+		if !strings.Contains(out, "the budget settings exist; edit "+e.settingsMac()) {
+			t.Errorf("the output does not name the existing file:\n%s", out)
+		}
+		if lexists(e.settingsXDG()) {
+			t.Error("a second settings file was created under ~/.config")
+		}
+	})
+}
+
+// A symlink at the path whose target is missing counts as a file: nothing is
+// written through it.
+func TestInstallBudgetCPURefusesDanglingSymlink(t *testing.T) {
+	e := newEnv(t)
+	target := filepath.Join(e.home, "elsewhere.toml")
+	if err := os.MkdirAll(filepath.Dir(e.settingsXDG()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, e.settingsXDG()); err != nil {
+		t.Fatal(err)
+	}
+	out, err := e.install("--budget-cpu", "3")
+	if err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	if lexists(target) {
+		t.Error("the settings were written through the symlink")
+	}
+	if !strings.Contains(out, "the budget settings exist; edit "+e.settingsXDG()) {
+		t.Errorf("the output does not say the settings exist:\n%s", out)
+	}
+}
+
+func TestInstallBudgetCPUDryRun(t *testing.T) {
+	e := newEnv(t)
+	out, err := e.install("--dry-run", "--budget-cpu", "3")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if !strings.Contains(out, "would: write "+e.settingsXDG()) {
+		t.Errorf("the dry run does not announce the settings file:\n%s", out)
+	}
+	if lexists(filepath.Join(e.home, ".config")) || lexists(filepath.Join(e.home, "Library")) {
+		t.Error("a dry run wrote files")
+	}
+}
+
+// The launchd pool never sees the shell's XDG_CONFIG_HOME, so the installer
+// writes ~/.config and says that a different XDG_CONFIG_HOME is not read.
+func TestInstallWarnsOnForeignXDG(t *testing.T) {
+	const warning = "the installed pool reads "
+	e := newEnv(t)
+	other := filepath.Join(e.home, "elsewhere")
+	e.vars["XDG_CONFIG_HOME"] = other
+	out, err := e.install("--budget-cpu", "3")
+	if err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, warning+e.settingsXDG()+", not "+filepath.Join(other, "local-ci-pool", "config.toml")) {
+		t.Errorf("no warning about XDG_CONFIG_HOME:\n%s", out)
+	}
+	if !lexists(e.settingsXDG()) || lexists(other) {
+		t.Errorf("want the settings under ~/.config only: ~/.config %v, XDG_CONFIG_HOME %v", lexists(e.settingsXDG()), lexists(other))
+	}
+	for name, xdg := range map[string]string{"unset": "", "home config": "HOME/.config", "relative": "rel/config"} {
+		e := newEnv(t)
+		switch xdg {
+		case "":
+		case "HOME/.config":
+			e.vars["XDG_CONFIG_HOME"] = filepath.Join(e.home, ".config")
+		default:
+			e.vars["XDG_CONFIG_HOME"] = xdg
+		}
+		out, err := e.install("--budget-cpu", "3")
+		if err != nil {
+			t.Fatalf("%s: install failed: %v\n%s", name, err, out)
+		}
+		if strings.Contains(out, warning) {
+			t.Errorf("%s: an XDG_CONFIG_HOME warning:\n%s", name, out)
+		}
+	}
+	// A relative XDG_CONFIG_HOME is ignored, never written under (it would
+	// land in the installer's working directory, this checkout).
+	if lexists("rel") {
+		_ = os.RemoveAll("rel")
+		t.Error("the settings were written under a relative XDG_CONFIG_HOME")
+	}
+}
+
+// When the settings enable the budget but the new pool reports it off, or
+// reports no budget at all (a release before it), the installer says so.
+func TestInstallWarnsWhenBudgetNotApplied(t *testing.T) {
+	const warning = "the pool does not apply "
+	for _, tc := range []struct {
+		name, settings, budget string
+		mode                   os.FileMode
+		fifo                   bool
+		warn                   bool
+	}{
+		{name: "enabled, no budget field", settings: budgetFile, budget: "none", warn: true},
+		{name: "enabled, off", settings: budgetFile, budget: "off", warn: true},
+		{name: "enabled with spaces, off", settings: "[budget]\n  enabled\t=  true\ncpu = 3\n", budget: "off", warn: true},
+		{name: "enabled, on", settings: budgetFile, budget: "on"},
+		{name: "absent, off", budget: "off"},
+		{name: "disabled, off", settings: "[budget]\nenabled = false\ncpu = 3\n", budget: "off"},
+		{name: "commented out, off", settings: "[budget]\n# enabled = true\ncpu = 3\n", budget: "off"},
+		{name: "unreadable, off", settings: budgetFile, mode: 0o000, budget: "off", warn: true},
+		{name: "fifo, off", fifo: true, budget: "off", warn: true},
+		{name: "fifo, on", fifo: true, budget: "on"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.vars["STUB_BUDGET"] = tc.budget
+			switch {
+			case tc.fifo:
+				if err := os.MkdirAll(filepath.Dir(e.settingsXDG()), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := syscall.Mkfifo(e.settingsXDG(), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				// A reader of the FIFO would wait for a writer forever. This
+				// writer lets such a reader finish, so that the test fails
+				// instead of hanging, and records that it was opened.
+				var opened atomic.Bool
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					f, err := os.OpenFile(e.settingsXDG(), os.O_WRONLY, 0)
+					if err == nil {
+						opened.Store(true)
+						f.Close()
+					}
+				}()
+				t.Cleanup(func() {
+					was := opened.Load()
+					// Unblock the writer if nothing opened the FIFO.
+					if r, err := os.OpenFile(e.settingsXDG(), os.O_RDONLY|syscall.O_NONBLOCK, 0); err == nil {
+						<-done
+						r.Close()
+					}
+					if was {
+						t.Error("the installer opened the FIFO")
+					}
+				})
+			case tc.settings != "":
+				mode := tc.mode
+				if mode == 0 {
+					mode = 0o600
+				}
+				write(t, e.settingsXDG(), tc.settings, 0o600)
+				if err := os.Chmod(e.settingsXDG(), mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, err := e.install()
+			if err != nil {
+				t.Fatalf("install failed: %v\n%s", err, out)
+			}
+			got := strings.Contains(out, warning+e.settingsXDG()+"; the budget is off")
+			if got != tc.warn {
+				t.Errorf("warned %v, want %v:\n%s", got, tc.warn, out)
+			}
+		})
+	}
+	// The macOS fallback is checked the same way when it is the file in use.
+	e := newEnv(t)
+	e.vars["STUB_BUDGET"] = "off"
+	write(t, e.settingsMac(), budgetFile, 0o600)
+	out, err := e.install()
+	if err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, warning+e.settingsMac()+"; the budget is off") {
+		t.Errorf("no warning for the fallback file:\n%s", out)
+	}
+}
+
+// --uninstall leaves the settings file, at either path, and names it.
+func TestUninstallKeepsSettings(t *testing.T) {
+	for name, path := range map[string]func(*env) string{"config": (*env).settingsXDG, "application support": (*env).settingsMac} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.placeInstalled()
+			write(t, path(e), budgetFile, 0o600)
+			out, err := e.install("--uninstall")
+			if err != nil {
+				t.Fatalf("uninstall failed: %v\n%s", err, out)
+			}
+			if b, _ := os.ReadFile(path(e)); string(b) != budgetFile {
+				t.Errorf("the settings file is gone or changed: %q", b)
+			}
+			if !strings.Contains(out, "kept "+path(e)) {
+				t.Errorf("the output does not name the kept file:\n%s", out)
+			}
+			if exists(e.binPath()) || exists(e.plistPath()) {
+				t.Error("the uninstall left the binary or the plist")
+			}
+		})
+	}
+	e := newEnv(t)
+	e.placeInstalled()
+	out, err := e.install("--uninstall")
+	if err != nil || strings.Contains(out, "kept ") {
+		t.Errorf("without a settings file: %v\n%s", err, out)
 	}
 }
