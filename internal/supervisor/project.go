@@ -60,6 +60,10 @@ type project struct {
 	// finds no open session reopens one to delete the scale set only when
 	// opened and never refused.
 	opened, refused bool
+
+	// joinOnce runs stopWaiters once, for the drain or for Run's stop,
+	// whichever comes first; the other waits for it.
+	joinOnce sync.Once
 }
 
 // errLeft stops a project's run when it asked for its own drain.
@@ -573,10 +577,7 @@ func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	post, cancel := context.WithTimeout(context.Background(), afterBound+max(deadline.Sub(clock.Now()), 0))
 	defer cancel()
 	if sc := pr.getScaler(); sc != nil && len(sc.Held()) > 0 {
-		sc.Abort()
-		if !sc.Join(joinBound) {
-			pr.log.Warn("waiter goroutines still running after the drain bound")
-		}
+		pr.stopWaiters(sc, joinBound)
 	}
 	pr.cancel()
 	select {
@@ -595,6 +596,20 @@ func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	}
 	pr.deleteScaleSet(life, post, deadline)
 	return true
+}
+
+// stopWaiters gives up sc's waiting runners, aborts its work in flight and
+// waits up to bound for its waiter goroutines, once per project: a second
+// call, from the drain or from Run's stop, waits for the first to end and
+// neither waits nor warns again.
+func (pr *project) stopWaiters(sc *runner.Scaler, bound time.Duration) {
+	pr.joinOnce.Do(func() {
+		sc.Drain()
+		sc.Abort()
+		if !sc.Join(bound) {
+			pr.log.Warn("waiter goroutines still running after the drain bound")
+		}
+	})
 }
 
 // mayReopen reports whether this process opened a session on the scale set

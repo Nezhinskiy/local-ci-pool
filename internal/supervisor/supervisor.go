@@ -95,8 +95,9 @@ const (
 var afterBound = DefaultAfterBound
 
 // joinBound bounds a drain's wait, after its abort, for the scaler's waiter
-// goroutines: a waiter whose Admit outlives the abort is waited for this long.
-const joinBound = 10 * time.Second
+// goroutines, and Run's own after a fatal error: a waiter whose Admit outlives
+// the abort is waited for this long. A variable so tests can shorten it.
+var joinBound = 10 * time.Second
 
 // Config configures a Supervisor. Zero durations take their defaults.
 type Config struct {
@@ -486,6 +487,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	err = s.loop(ctx, life, stopLife)
 
 	stopLife()
+	s.stopWaiters()
 	s.wg.Wait()
 	s.closeSessions()
 	_ = ln.Close()
@@ -569,6 +571,25 @@ func (s *Supervisor) shutdown(life context.Context, stopLife context.CancelFunc)
 		<-done
 		return err
 	}
+}
+
+// stopWaiters gives up every project's waiting runners and waits for their
+// waiter goroutines, which s.wg does not count: after a fatal error no drain
+// ran, and a runner the budget admitted after Run returned would start. The
+// projects join at once, each within joinBound; a project whose drain already
+// joined is not joined again, and one whose scaler was never built is
+// skipped.
+func (s *Supervisor) stopWaiters() {
+	s.mu.Lock()
+	prs := s.projectList()
+	s.mu.Unlock()
+	var wg sync.WaitGroup
+	for _, pr := range prs {
+		if sc := pr.getScaler(); sc != nil {
+			wg.Go(func() { pr.stopWaiters(sc, joinBound) })
+		}
+	}
+	wg.Wait()
 }
 
 // FailOnLoginLoss ends Run with a terminal error if err means the GitHub login

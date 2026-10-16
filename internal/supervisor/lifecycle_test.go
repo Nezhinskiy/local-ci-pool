@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -260,5 +261,96 @@ func TestDrainJoinsWaitersAfterAbort(t *testing.T) {
 	}
 	if n := b.releases(b.admitted()[0].Runner); n != 1 {
 		t.Fatalf("the late grant was released %d times, want once", n)
+	}
+}
+
+// A fatal error ends Run without a drain. A runner still waiting for the budget
+// is given up before Run returns: its wait ends, the grant that comes back
+// anyway is released, and its start is never attempted, then or later.
+func TestFatalStopGivesUpWaiters(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	b := newFakeBudget(true)
+	answer := make(chan struct{})
+	var once sync.Once
+	answered := func() { once.Do(func() { close(answer) }) }
+	t.Cleanup(answered)
+	b.admit = func(ctx context.Context, a runner.Admission) (runner.Admitted, error) {
+		select {
+		case <-answer:
+		case <-ctx.Done():
+		}
+		// The grant comes back either way, as one granted just as the wait
+		// ended would.
+		return b.grant(a.Runner, runner.ModeQueued, 2), nil
+	}
+	h.budget = b
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.actions.Assign(alphaSet, 1)
+	h.eventually("a runner waiting", func() bool { return len(b.admitted()) == 1 })
+	h.sup.fail(errors.New("boom"))
+	if err := h.wait(defaultWait); err == nil || err.Error() != "boom" {
+		t.Fatalf("Run returned %v, want boom", err)
+	}
+	name := b.admitted()[0].Runner
+	if n := b.releases(name); n != 1 {
+		t.Fatalf("the waiter's grant was released %d times when Run returned, want once", n)
+	}
+	answered()
+	img := h.imageOf("alpha")
+	if n := len(h.docker.runners(img)); n != 0 {
+		t.Fatalf("%d containers after Run returned, want none", n)
+	}
+	if n := h.actions.Count("JIT " + alphaSet); n != 0 {
+		t.Fatalf("%d JIT configurations minted, want none", n)
+	}
+	// Given up, not started and then aborted.
+	if h.logged("starting a runner") {
+		t.Fatal("the given-up runner's start was attempted")
+	}
+}
+
+// A fatal error that lands while a project's drain waits for a waiter that
+// ignores its context joins that waiter once: Run's stop waits for the same
+// join instead of starting another, and the warning is logged once.
+func TestFatalStopDuringADrainJoinsOnce(t *testing.T) {
+	old := joinBound
+	joinBound = 300 * time.Millisecond
+	t.Cleanup(func() { joinBound = old })
+	h := newHarness(t, 2, 1000, "alpha")
+	h.cfg.Drain = time.Minute // 60 ms
+	b := newFakeBudget(true)
+	answer := make(chan struct{})
+	t.Cleanup(func() { close(answer) })
+	b.admit = func(_ context.Context, a runner.Admission) (runner.Admitted, error) {
+		<-answer
+		return b.grant(a.Runner, runner.ModeQueued, 2), nil
+	}
+	h.budget = b
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.actions.Assign(alphaSet, 1)
+	h.eventually("a runner waiting", func() bool { return len(b.admitted()) == 1 })
+	h.gh.edit(func() { h.gh.repos[alphaRepo].marker = "" })
+	h.eventually("the drain bound passed", func() bool { return h.logged("the drain bound passed") })
+	h.sup.fail(errors.New("boom"))
+	if err := h.wait(defaultWait); err == nil || err.Error() != "boom" {
+		t.Fatalf("Run returned %v, want boom", err)
+	}
+	if n := strings.Count(h.logs.String(), "waiter goroutines still running"); n != 1 {
+		t.Fatalf("the join's warning was logged %d times, want once", n)
+	}
+}
+
+// A project whose setup failed never built a scaler: Run's stop after a fatal
+// error skips it.
+func TestFatalStopSkipsAProjectWithoutAScaler(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.setCheckErr(h.imageOf("alpha"), errors.New("preflight failed: NO_CA: the image has no CA bundle"))
+	h.start()
+	h.eventually("alpha failed", func() bool { return h.logged("cannot be served") })
+	h.sup.fail(errors.New("boom"))
+	if err := h.wait(defaultWait); err == nil || err.Error() != "boom" {
+		t.Fatalf("Run returned %v, want boom", err)
 	}
 }
