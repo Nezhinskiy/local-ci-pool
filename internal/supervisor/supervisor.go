@@ -22,6 +22,7 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/moby/moby/client"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
 	"github.com/Nezhinskiy/local-ci-pool/internal/image"
@@ -92,6 +93,10 @@ const (
 // drains at once, so the drain bound plus afterBound is the longest a stop
 // takes. A variable so tests can shorten it.
 var afterBound = DefaultAfterBound
+
+// joinBound bounds a drain's wait, after its abort, for the scaler's waiter
+// goroutines: a waiter whose Admit outlives the abort is waited for this long.
+const joinBound = 10 * time.Second
 
 // Config configures a Supervisor. Zero durations take their defaults.
 type Config struct {
@@ -196,6 +201,12 @@ type realClock struct{}
 func (realClock) Now() time.Time                         { return time.Now() }
 func (realClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
+// Budget is the machine-wide gate and its health. *budget.Gate satisfies it.
+type Budget interface {
+	runner.Gate
+	State() budget.State
+}
+
 // Image is a project's job image and the user its jobs run as.
 type Image struct{ Ref, User string }
 
@@ -229,6 +240,9 @@ type Deps struct {
 	// Serve, if set, serves the health endpoint on the bound listener until
 	// ctx is cancelled.
 	Serve func(ctx context.Context, ln net.Listener)
+	// Budget admits the runners into the machine's budget, and adopts the
+	// survivors of a previous run into it. Nil: the budget is off.
+	Budget Budget
 }
 
 // Snapshot is the pool's state for the health endpoint and the heartbeat.
@@ -274,8 +288,8 @@ type Supervisor struct {
 	dockerOK bool
 	projects map[string]*project // by owner/name
 	// survivors are the runners of a previous run still running at start, by
-	// runner name; true when one of the slots is held for it (survivors.go).
-	survivors map[string]bool
+	// runner name (survivors.go).
+	survivors map[string]*survivor
 	tokenGen  int
 	lastAuth  time.Time
 }
@@ -307,7 +321,7 @@ func New(cfg Config, deps Deps) *Supervisor {
 		fatal:     make(chan error, 1),
 		reconcile: make(chan struct{}, 1),
 		projects:  map[string]*project{},
-		survivors: map[string]bool{},
+		survivors: map[string]*survivor{},
 	}
 	if s.deps.Detect == nil {
 		s.deps.Detect = s.detect
@@ -408,7 +422,8 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	// first, so a second one kills it).
 	s.log.Info("pool starting", "pid", os.Getpid(), "machine", m.Name, "slots", m.Slots, "instance", instance, "runner", mount.Version, "probe", s.cfg.Probe)
 	s.prune(ctx)
-	if err := s.sweep(ctx); err != nil {
+	adopt, err := s.sweep(ctx)
+	if err != nil {
 		return err
 	}
 
@@ -430,8 +445,24 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if s.deps.Serve != nil {
 		start(func() { s.deps.Serve(life, ln) })
 	}
-	exits := subscribeHook{Docker: s.deps.Docker, onSubscribe: s.requestReconcile}
+	// The survivors are adopted once the exit watcher has subscribed, so a die
+	// event during an Adopt is not lost.
+	subscribed := make(chan struct{})
+	var once sync.Once
+	exits := subscribeHook{Docker: s.deps.Docker, onSubscribe: func() {
+		once.Do(func() { close(subscribed) })
+		s.requestReconcile()
+	}}
 	start(func() { runner.WatchExits(life, exits, instance, s.exited) })
+	if len(adopt) > 0 {
+		start(func() {
+			select {
+			case <-subscribed:
+				s.adoptSurvivors(life, adopt)
+			case <-life.Done():
+			}
+		})
+	}
 	start(func() { s.watchdog(life) })
 	start(func() { s.releases(life, arch) })
 	start(func() { s.caffeinate(life) })

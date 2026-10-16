@@ -169,6 +169,9 @@ func (pr *project) setup() error {
 		Registry:   clientRef{pr},
 		Docker:     s.deps.Docker,
 		Log:        pr.log,
+		// A nil Budget converts to a nil Gate: the budget is off.
+		Gate:    s.deps.Budget,
+		Project: pr.identity,
 	})
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
@@ -571,6 +574,9 @@ func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	defer cancel()
 	if sc := pr.getScaler(); sc != nil && len(sc.Held()) > 0 {
 		sc.Abort()
+		if !sc.Join(joinBound) {
+			pr.log.Warn("waiter goroutines still running after the drain bound")
+		}
 	}
 	pr.cancel()
 	select {

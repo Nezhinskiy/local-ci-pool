@@ -22,6 +22,7 @@ import (
 	"github.com/moby/moby/api/types/system"
 	"github.com/moby/moby/client"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
 	"github.com/Nezhinskiy/local-ci-pool/internal/fakeactions"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
@@ -86,6 +87,8 @@ type fakeDocker struct {
 	createErr   error  // every ContainerCreate fails with it
 	// removeHang makes every ContainerRemove wait for its context to end.
 	removeHang bool
+	// subscriptions counts the Events calls.
+	subscriptions int
 }
 
 func newFakeDocker() *fakeDocker {
@@ -164,11 +167,19 @@ func (f *fakeDocker) ContainerRemove(ctx context.Context, id string, _ client.Co
 func (f *fakeDocker) Events(context.Context, client.EventsListOptions) client.EventsResult {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.subscriptions++
 	ch := make(chan events.Message, 64)
 	errs := make(chan error, 1)
 	f.subs = append(f.subs, ch)
 	f.subErrs = append(f.subErrs, errs)
 	return client.EventsResult{Messages: ch, Err: errs}
+}
+
+// subscribed is the number of Events calls so far.
+func (f *fakeDocker) subscribed() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.subscriptions
 }
 
 // breakEvents ends every events stream with an error, as a Docker restart
@@ -543,6 +554,91 @@ func (c *fakeCaffeinate) state() (starts, stops int, running bool) {
 	return c.starts, c.stops, c.running
 }
 
+// ---- fake budget ----
+
+// fakeBudget is a budget gate the test scripts. Admit and Adopt call the
+// test's functions when set; by default Admit admits at once (queued, need 2)
+// and Adopt adopts with the need asked. Every Release it hands out counts its
+// calls by runner name.
+type fakeBudget struct {
+	mu       sync.Mutex
+	enabled  bool
+	state    budget.State
+	admit    func(ctx context.Context, a runner.Admission) (runner.Admitted, error)
+	adopt    func(a runner.Admission) runner.Admitted
+	admits   []runner.Admission
+	adopts   []runner.Admission
+	released map[string]int
+}
+
+func newFakeBudget(enabled bool) *fakeBudget {
+	return &fakeBudget{enabled: enabled, state: budget.State{State: "on"}, released: map[string]int{}}
+}
+
+func (b *fakeBudget) Enabled() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.enabled
+}
+
+func (b *fakeBudget) State() budget.State {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.state
+}
+
+func (b *fakeBudget) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, error) {
+	b.mu.Lock()
+	b.admits = append(b.admits, a)
+	f := b.admit
+	b.mu.Unlock()
+	if f == nil {
+		return b.grant(a.Runner, runner.ModeQueued, 2), nil
+	}
+	return f(ctx, a)
+}
+
+func (b *fakeBudget) Adopt(_ context.Context, a runner.Admission) runner.Admitted {
+	b.mu.Lock()
+	b.adopts = append(b.adopts, a)
+	f := b.adopt
+	b.mu.Unlock()
+	if f == nil {
+		return b.grant(a.Runner, runner.ModeAdopted, a.Need)
+	}
+	return f(a)
+}
+
+// grant is an admission whose Release counts its calls.
+func (b *fakeBudget) grant(name string, mode runner.Mode, need int) runner.Admitted {
+	return runner.Admitted{Mode: mode, Need: need, Release: func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.released[name]++
+	}}
+}
+
+func (b *fakeBudget) releases(name string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.released[name]
+}
+
+func (b *fakeBudget) admitted() []runner.Admission {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.admits)
+}
+
+// adopted lists the Adopt calls, sorted by runner name.
+func (b *fakeBudget) adopted() []runner.Admission {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := slices.Clone(b.adopts)
+	slices.SortFunc(out, func(x, y runner.Admission) int { return strings.Compare(x.Runner, y.Runner) })
+	return out
+}
+
 // ---- log ----
 
 type syncBuffer struct {
@@ -575,6 +671,8 @@ type harness struct {
 	cfg     Config
 	slots   int
 	logs    *syncBuffer
+	// budget is Deps.Budget; nil leaves the budget off.
+	budget Budget
 
 	mu       sync.Mutex
 	images   map[string]string // identity -> image reference
@@ -727,6 +825,7 @@ func (h *harness) deps() Deps {
 			return nil
 		},
 		Caffeinate: h.caff.start,
+		Budget:     h.budget,
 	}
 }
 
@@ -835,4 +934,16 @@ func labelNames(ss *scaleset.RunnerScaleSet) []string {
 
 func instanceLabels(instance, name string) map[string]string {
 	return map[string]string{runner.LabelInstance: instance, runner.LabelRunner: name}
+}
+
+// survivorOf is the survivor entry recorded for name, if any, copied under
+// the supervisor's lock.
+func (h *harness) survivorOf(name string) (survivor, bool) {
+	h.sup.mu.Lock()
+	defer h.sup.mu.Unlock()
+	e, ok := h.sup.survivors[name]
+	if !ok {
+		return survivor{}, false
+	}
+	return *e, true
 }

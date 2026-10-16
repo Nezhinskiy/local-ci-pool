@@ -1,10 +1,14 @@
 package supervisor
 
 import (
+	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/Nezhinskiy/local-ci-pool/internal/runner"
 )
 
 // A drain tells the service the scale set takes no more jobs: the listener's
@@ -170,5 +174,91 @@ func TestFirstFailedDiscoveryIsRetriedSooner(t *testing.T) {
 	time.Sleep(time.Second)
 	if got := h.gh.listings(); got != n {
 		t.Fatalf("%d listings within a second after a successful pass, want none", got-n)
+	}
+}
+
+// waitOnCtx is an Admit that blocks until its context ends.
+func waitOnCtx(ctx context.Context, _ runner.Admission) (runner.Admitted, error) {
+	<-ctx.Done()
+	return runner.Admitted{}, ctx.Err()
+}
+
+// A runner waiting for the budget has no container yet: the watchdog's
+// reconcile leaves it alone, and it keeps its slot.
+func TestWaitingSurvivesReconcile(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha") // a watchdog reconcile every 30 ms
+	b := newFakeBudget(true)
+	b.admit = waitOnCtx
+	h.budget = b
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.actions.Assign(alphaSet, 1)
+	h.eventually("a runner waiting", func() bool { return len(b.admitted()) == 1 })
+	time.Sleep(100 * time.Millisecond) // about three reconciles
+	if h.logged("gone without an exit event") {
+		t.Fatal("a reconcile released the waiting runner")
+	}
+	if got := h.sup.Snapshot().InUse; got != 1 {
+		t.Fatalf("in use %d, want 1: the waiting runner holds its slot", got)
+	}
+}
+
+// A drain gives a waiting runner up at once: the pool drains without
+// waiting for the drain bound.
+func TestDrainWithWaitersLogsDrained(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha") // the drain bound is 2.4 s
+	b := newFakeBudget(true)
+	b.admit = waitOnCtx
+	h.budget = b
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.actions.Assign(alphaSet, 1)
+	h.eventually("a runner waiting", func() bool { return len(b.admitted()) == 1 })
+	h.cancel()
+	if err := h.wait(defaultWait); err != nil {
+		t.Fatal(err)
+	}
+	if !h.logged(`msg=drained`) {
+		t.Fatal("drained is not logged")
+	}
+	if h.logged("the drain bound passed") {
+		t.Fatal("the drain waited for its bound with only a waiting runner left")
+	}
+}
+
+// A waiter whose Admit ignores its context outlives the drain bound. The
+// drain joins it after the abort, so the pool reports drained only once it
+// has returned.
+func TestDrainJoinsWaitersAfterAbort(t *testing.T) {
+	const returned = "the fake Admit returned"
+	h := newHarness(t, 2, 1000, "alpha")
+	h.cfg.Drain = time.Minute // 60 ms
+	b := newFakeBudget(true)
+	answer := make(chan struct{})
+	b.admit = func(_ context.Context, a runner.Admission) (runner.Admitted, error) {
+		<-answer
+		_, _ = h.logs.Write([]byte(returned + "\n"))
+		return b.grant(a.Runner, runner.ModeQueued, 2), nil
+	}
+	h.budget = b
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.actions.Assign(alphaSet, 1)
+	h.eventually("a runner waiting", func() bool { return len(b.admitted()) == 1 })
+	h.cancel()
+	h.eventually("the drain bound passed", func() bool { return h.logged("the drain bound passed") })
+	time.Sleep(200 * time.Millisecond)
+	close(answer)
+	if err := h.wait(defaultWait); err != nil {
+		t.Fatal(err)
+	}
+	h.eventually("the fake Admit returned", func() bool { return h.logged(returned) })
+	logs := h.logs.String()
+	bound, ret, drained := strings.Index(logs, "the drain bound passed"), strings.Index(logs, returned), strings.Index(logs, "msg=drained")
+	if bound < 0 || ret < 0 || drained < 0 || bound >= ret || ret >= drained {
+		t.Fatalf("want the drain bound (%d), then the Admit's return (%d), then drained (%d)", bound, ret, drained)
+	}
+	if n := b.releases(b.admitted()[0].Runner); n != 1 {
+		t.Fatalf("the late grant was released %d times, want once", n)
 	}
 }
