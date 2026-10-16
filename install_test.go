@@ -153,7 +153,9 @@ exit 0
 	// /healthz reports STUB_NEW_VERSION, and STUB_KICKED_VERSION after a
 	// kickstart; "none" means nothing listens. STUB_BUDGET picks the body's
 	// budget object: "none" (the default) leaves it out, as a release before
-	// the budget does; "off" and "on" set its state.
+	// the budget does; "off" and "on" set its state; "config" is off with the
+	// error class config (an invalid file), and "on-config" is on with it (an
+	// invalid file after a valid one).
 	"curl": `#!/bin/sh
 echo "curl $*" >> "$STUB_LOG"
 if [ -e "$STUB_LOG.loaded" ]; then
@@ -164,6 +166,8 @@ if [ -e "$STUB_LOG.loaded" ]; then
 	case "${STUB_BUDGET:-none}" in
 	off) b="\"budget\":{\"state\":\"off\",\"oldest_wait_s\":0}," ;;
 	on) b="\"budget\":{\"state\":\"on\",\"oldest_wait_s\":0}," ;;
+	config) b="\"budget\":{\"state\":\"off\",\"error\":\"config\",\"oldest_wait_s\":0}," ;;
+	on-config) b="\"budget\":{\"state\":\"on\",\"error\":\"config\",\"oldest_wait_s\":0}," ;;
 	esac
 	echo "{\"version\":\"$v\",\"commit\":\"abc1234\",\"machine\":\"examplemacbo\",\"slots\":4,$b\"projects\":[]}"
 	exit 0
@@ -2119,6 +2123,13 @@ func TestInstallWarnsWhenBudgetNotApplied(t *testing.T) {
 		{name: "enabled, off", settings: budgetFile, budget: "off", warn: true},
 		{name: "enabled with spaces, off", settings: "[budget]\n  enabled\t=  true\ncpu = 3\n", budget: "off", warn: true},
 		{name: "enabled, on", settings: budgetFile, budget: "on"},
+		{name: "dotted key, off", settings: "budget.enabled = true\nbudget.cpu = 3\n", budget: "off", warn: true},
+		{name: "dotted key, no budget field", settings: "budget.enabled = true\nbudget.cpu = 3\n", budget: "none", warn: true},
+		{name: "inline table, off", settings: "budget = { enabled = true, cpu = 3 }\n", budget: "off", warn: true},
+		{name: "dotted key, on", settings: "budget.enabled = true\nbudget.cpu = 3\n", budget: "on"},
+		{name: "miscased key, invalid", settings: "[budget]\nEnabled = true\ncpu = 3\n", budget: "config", warn: true},
+		{name: "miscased table, invalid", settings: "[Budget]\nenabled = true\ncpu = 3\n", budget: "config", warn: true},
+		{name: "disabled, invalid", settings: "[budget]\nenabled = false\ncpu = 0\n", budget: "config", warn: true},
 		{name: "absent, off", budget: "off"},
 		{name: "disabled, off", settings: "[budget]\nenabled = false\ncpu = 3\n", budget: "off"},
 		{name: "commented out, off", settings: "[budget]\n# enabled = true\ncpu = 3\n", budget: "off"},
@@ -2191,6 +2202,19 @@ func TestInstallWarnsWhenBudgetNotApplied(t *testing.T) {
 	}
 	if !strings.Contains(out, warning+e.settingsMac()+"; the budget is off") {
 		t.Errorf("no warning for the fallback file:\n%s", out)
+	}
+
+	// An invalid file after a valid one leaves the last valid settings on: the
+	// warning says so rather than that the budget is off.
+	e = newEnv(t)
+	e.vars["STUB_BUDGET"] = "on-config"
+	write(t, e.settingsXDG(), "[budget]\nEnabled = true\ncpu = 3\n", 0o600)
+	out, err = e.install()
+	if err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	if want := warning + e.settingsXDG() + " as it is now: the file is invalid"; !strings.Contains(out, want) || strings.Contains(out, "the budget is off") {
+		t.Errorf("want a warning containing %q and not that the budget is off:\n%s", want, out)
 	}
 }
 

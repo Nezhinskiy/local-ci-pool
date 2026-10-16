@@ -642,18 +642,30 @@ warn_foreign_xdg() {
   fi
 }
 
-# check_budget_applied warns when the settings file in use turns the budget on,
-# or cannot be read as a regular file (the pool then reports it invalid), and
-# the new pool's /healthz has no budget (a release before it) or shows it off.
-# A FIFO is never opened.
+# check_budget_applied warns when the new pool's /healthz says the settings file
+# in use is invalid (the pool has judged it: the shell parses no TOML). It also
+# warns when the file seems to turn the budget on (a line setting enabled =
+# true, as a key of its own, a dotted key or in an inline table), or cannot be
+# read as a regular file (the pool then reports it invalid), and /healthz has
+# no budget (a release before it) or shows it off. A FIFO is never opened.
 check_budget_applied() {
   local p budget
   p="$(settings_in_use)"
   [ -n "$p" ] || return 0
-  if [ -f "$p" ] && [ -r "$p" ]; then
-    grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true' "$p" 2> /dev/null || return 0
-  fi
   budget="$(printf '%s' "$1" | sed -n 's/.*"budget":{\([^}]*\)}.*/\1/p')"
+  case "$budget" in
+    *'"error":"config"'*'"state":"off"'* | *'"state":"off"'*'"error":"config"'*)
+      warn "the pool does not apply $p; the budget is off: the file is invalid. See the 'budget settings invalid' lines in $LOG_DIR/pool.log and the runbook's section on the budget settings"
+      return 0
+      ;;
+    *'"error":"config"'*)
+      warn "the pool does not apply $p as it is now: the file is invalid, and the last valid settings stay in force. See the 'budget settings invalid' lines in $LOG_DIR/pool.log and the runbook's section on the budget settings"
+      return 0
+      ;;
+  esac
+  if [ -f "$p" ] && [ -r "$p" ]; then
+    grep -Eq '^([^#]*[[:space:].{,])?enabled[[:space:]]*=[[:space:]]*true' "$p" 2> /dev/null || return 0
+  fi
   case "$budget" in
     '') warn "the pool does not apply $p; the budget is off: this release reports no budget in /healthz, so it predates the core budget and ignores the file" ;;
     *'"state":"off"'*) warn "the pool does not apply $p; the budget is off: the file is invalid, or not the one the pool reads. See the 'budget settings' lines in $LOG_DIR/pool.log and the runbook's section on the budget settings" ;;

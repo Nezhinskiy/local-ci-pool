@@ -283,8 +283,9 @@ shortfall.
 missing file at the `~/.config` path is refused too, never written through). It warns when its own
 `XDG_CONFIG_HOME` names another directory, which the installed pool does not read, if you passed
 `--budget-cpu` or a settings file sits under that directory. `--dry-run` prints what it would write.
-After any install, when the file turns the budget on but the new pool's `/healthz` shows it off (an
-invalid file, or a release before the budget, which ignores the file), the installer warns.
+After any install, the installer warns when the new pool's `/healthz` reports the file invalid
+(`budget.error = "config"`), and when the file turns the budget on but `/healthz` shows it off (a
+path the pool does not read, or a release before the budget, which ignores the file).
 `--uninstall` leaves the file and prints its path.
 
 **Edits apply without a restart.** The pool reads the file on every decision, with no cache. A new
