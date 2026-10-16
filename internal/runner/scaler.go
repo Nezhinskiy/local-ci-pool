@@ -109,7 +109,9 @@ type record struct {
 }
 
 // Scaler keeps one scale set's runners. Every runner it knows holds one slot,
-// and Exited is the only place a slot is given back.
+// given back exactly once, when the runner is forgotten: by release (Exited, a
+// failed start, a reaped runner, an Admit error), or by admit, for a runner
+// given up while it waited whose Admit then returned.
 type Scaler struct {
 	scaleSetID int
 	slots      *Slots
@@ -548,8 +550,8 @@ func (s *Scaler) Completed(name string) {
 }
 
 // Exited forgets a runner whose container is gone and releases its slot. It is
-// the only release point and is idempotent per name: every Scaler on the
-// machine hears every exit, and a name it does not hold is logged and ignored.
+// idempotent per name: every Scaler on the machine hears every exit, and a name
+// it does not hold is logged and ignored.
 // A runner that exits after its start and before any job report counts
 // towards NoJobExits.
 func (s *Scaler) Exited(name string) { s.release(name, false) }
@@ -612,7 +614,8 @@ func (s *Scaler) Abort() { s.aborted() }
 // Join waits up to timeout for every waiter goroutine to return, and reports
 // whether all did. A waiter goroutine admits its runner and then launches it,
 // so one in a failed start's forget can outlast a short timeout. Call it after
-// Drain or Abort, once no new runner can start waiting.
+// Drain, once no new runner can start waiting: after Abort alone, Desired can
+// still add a waiter goroutine while Join waits.
 func (s *Scaler) Join(timeout time.Duration) bool {
 	done := make(chan struct{})
 	go func() {

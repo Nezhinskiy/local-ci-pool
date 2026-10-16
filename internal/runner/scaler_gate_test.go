@@ -480,3 +480,33 @@ func TestJoinWaitsAbortDoesNot(t *testing.T) {
 		t.Fatalf("%d Admit calls returned after Join, want 2", got)
 	}
 }
+
+// Turning the settings off (or deleting the file) while a runner waits leaves it waiting: it
+// keeps its ticket, and the next Desired neither gives it up, nor admits it again, nor starts
+// another runner in its place.
+func TestGateOffWhileWaitingKeepsTheTicket(t *testing.T) {
+	h := newGateHarness(t, NewSlots(4))
+	desired(t, h.scaler, 1)
+	r := h.gate.next(t)
+	inUse := h.scaler.slots.InUse()
+
+	h.gate.enabled.Store(false)
+	if got := desired(t, h.scaler, 1); got != 1 {
+		t.Fatalf("Desired(1) = %d with the gate off, want 1", got)
+	}
+	if st := stateOf(h.scaler, r.name); st != stateWaiting {
+		t.Fatalf("state %d after the gate turned off, want waiting", st)
+	}
+	if ended(r.ctx) {
+		t.Fatal("the waiter's ctx ended after the gate turned off")
+	}
+	if got := h.gate.admitCalls(); got != 1 {
+		t.Fatalf("%d Admit calls, want 1", got)
+	}
+	if got := h.scaler.slots.InUse(); got != inUse {
+		t.Fatalf("InUse %d after the gate turned off, want %d", got, inUse)
+	}
+	if got := h.starter.started(); len(got) != 0 {
+		t.Fatalf("started %v, want nothing", got)
+	}
+}
