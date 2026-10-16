@@ -565,7 +565,7 @@ type fakeBudget struct {
 	enabled  bool
 	state    budget.State
 	admit    func(ctx context.Context, a runner.Admission) (runner.Admitted, error)
-	adopt    func(a runner.Admission) runner.Admitted
+	adopt    func(ctx context.Context, a runner.Admission) runner.Admitted
 	admits   []runner.Admission
 	adopts   []runner.Admission
 	released map[string]int
@@ -598,7 +598,7 @@ func (b *fakeBudget) Admit(ctx context.Context, a runner.Admission) (runner.Admi
 	return f(ctx, a)
 }
 
-func (b *fakeBudget) Adopt(_ context.Context, a runner.Admission) runner.Admitted {
+func (b *fakeBudget) Adopt(ctx context.Context, a runner.Admission) runner.Admitted {
 	b.mu.Lock()
 	b.adopts = append(b.adopts, a)
 	f := b.adopt
@@ -606,7 +606,7 @@ func (b *fakeBudget) Adopt(_ context.Context, a runner.Admission) runner.Admitte
 	if f == nil {
 		return b.grant(a.Runner, runner.ModeAdopted, a.Need)
 	}
-	return f(a)
+	return f(ctx, a)
 }
 
 // grant is an admission whose Release counts its calls.

@@ -30,18 +30,13 @@ import (
 // runner per survivor, within the slots left. Such a runner takes no job,
 // holds its slot like any other, and is reaped when the count drops.
 
-const (
-	// unlabelledProject is the project of a survivor whose container names
-	// none: a runner of an older pool.
-	unlabelledProject = "local-ci-pool"
-	// maxNeed is the largest need a need label may name.
-	maxNeed = 256
-)
+// maxNeed is the largest need a need label may name.
+const maxNeed = 256
 
 // survivor is one runner of a previous run kept at start.
 type survivor struct {
 	held    bool        // a slot was taken for it
-	project string      // its project label, or "local-ci-pool"
+	project string      // its project label; empty for a runner of an older pool
 	need    int         // its need label in 1..256, else 0
 	mode    runner.Mode // set by its adoption
 	release func()      // set by its adoption; nil before
@@ -66,7 +61,10 @@ func (s *Supervisor) sweep(ctx context.Context) ([]string, error) {
 		}
 		name := c.Labels[runner.LabelRunner]
 		if name != "" && !sweepable(c.State) {
-			if s.keepSurvivor(name, survivorProject(c.Labels), survivorNeed(c.Labels)) {
+			// A survivor of an older pool names no project: it is adopted
+			// with none (the gate labels it as the pool's own) and counts
+			// under no project in the health.
+			if s.keepSurvivor(name, c.Labels[runner.LabelProject], survivorNeed(c.Labels)) {
 				kept = append(kept, name)
 			}
 			continue
@@ -84,15 +82,6 @@ func (s *Supervisor) sweep(ctx context.Context) ([]string, error) {
 		return nil, nil
 	}
 	return kept, nil
-}
-
-// survivorProject is the project a survivor's labels name; a survivor of an
-// older pool names none and counts as the pool's own.
-func survivorProject(labels map[string]string) string {
-	if p := labels[runner.LabelProject]; p != "" {
-		return p
-	}
-	return unlabelledProject
 }
 
 // survivorNeed is the need a survivor's labels name, when it is a number in
@@ -142,6 +131,11 @@ func (s *Supervisor) keepSurvivor(name, project string, need int) bool {
 // A survivor whose adoption failed open runs on, unbudgeted.
 func (s *Supervisor) adoptSurvivors(ctx context.Context, names []string) {
 	for _, name := range names {
+		// After the pool's life ended an Adopt could only fail open: the
+		// survivors left keep running unbudgeted, as before adoption.
+		if ctx.Err() != nil {
+			return
+		}
 		s.mu.Lock()
 		e, ok := s.survivors[name]
 		var a runner.Admission
@@ -191,7 +185,9 @@ func (s *Supervisor) releaseSurvivor(name string) bool {
 
 // survivorCountsLocked counts the survivors admitted into the budget, by the
 // project their labels name and by the mode of their adoption: adopted or
-// fail_open. s.mu is held.
+// fail_open. A survivor of an older pool names no project: it is counted
+// under "", which no served project's identity is (discovery skips an empty
+// one), so it counts under none. s.mu is held.
 func (s *Supervisor) survivorCountsLocked() map[string]AdmittedHealth {
 	out := map[string]AdmittedHealth{}
 	for _, e := range s.survivors {

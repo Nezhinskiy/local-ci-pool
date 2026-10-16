@@ -227,9 +227,9 @@ func TestSurvivorAdoptedUnderItsProject(t *testing.T) {
 	}
 }
 
-// A survivor of an older pool has no labels: it is adopted under the pool's
-// own name with the configured need (0). A need label outside 1..256, or not
-// a number, is the configured need too.
+// A survivor of an older pool has no labels: it is adopted with no project
+// (the gate labels it as the pool's own) and the configured need (0). A need
+// label outside 1..256, or not a number, is the configured need too.
 func TestUnlabelledSurvivorAdoptedAsPool(t *testing.T) {
 	const survivorC, survivorD = "local-ci-uuuuuuuuuuuu", "local-ci-vvvvvvvvvvvv"
 	h := newHarness(t, 4, 1, "alpha")
@@ -242,7 +242,7 @@ func TestUnlabelledSurvivorAdoptedAsPool(t *testing.T) {
 	h.start()
 	h.eventually("every survivor adopted", func() bool { return len(b.adopted()) == 4 })
 	want := []runner.Admission{
-		{Runner: survivorA, Project: "local-ci-pool", Need: 0},
+		{Runner: survivorA, Project: "", Need: 0},
 		{Runner: survivorB, Project: "alpha", Need: 0},
 		{Runner: survivorC, Project: "alpha", Need: 0},
 		{Runner: survivorD, Project: "alpha", Need: 0},
@@ -273,7 +273,7 @@ func TestAdoptionStartsAfterSubscribe(t *testing.T) {
 	b := newFakeBudget(true)
 	var mu sync.Mutex
 	var seen []int
-	b.adopt = func(a runner.Admission) runner.Admitted {
+	b.adopt = func(_ context.Context, a runner.Admission) runner.Admitted {
 		mu.Lock()
 		seen = append(seen, h.docker.subscribed())
 		mu.Unlock()
@@ -300,7 +300,7 @@ func TestSurvivorDiesDuringAdopt(t *testing.T) {
 	h := newHarness(t, 2, 1, "alpha")
 	b := newFakeBudget(true)
 	entered, proceed := make(chan struct{}), make(chan struct{})
-	b.adopt = func(a runner.Admission) runner.Admitted {
+	b.adopt = func(_ context.Context, a runner.Admission) runner.Admitted {
 		close(entered)
 		<-proceed
 		return b.grant(a.Runner, runner.ModeAdopted, a.Need)
@@ -337,7 +337,7 @@ func TestSurvivorDiesDuringAdopt(t *testing.T) {
 func TestSurvivorAdoptFailsOpenRunsOn(t *testing.T) {
 	h := newHarness(t, 2, 1000, "alpha") // a watchdog reconcile every 30 ms
 	b := newFakeBudget(true)
-	b.adopt = func(a runner.Admission) runner.Admitted {
+	b.adopt = func(_ context.Context, a runner.Admission) runner.Admitted {
 		return b.grant(a.Runner, runner.ModeFailOpen, a.Need)
 	}
 	h.budget = b
@@ -410,5 +410,52 @@ func TestBudgetOffAdoptsNothing(t *testing.T) {
 			h.docker.exit(survivorA)
 			h.eventually("the survivor's slot released", func() bool { return h.sup.Snapshot().InUse == 0 })
 		})
+	}
+}
+
+// An unlabelled survivor of an older pool counts under no project, not even
+// one whose identity is the pool's own name; a survivor labelled with that
+// project counts under it.
+func TestUnlabelledSurvivorCountsUnderNoProject(t *testing.T) {
+	const repo = "example/local-ci-pool"
+	h := newHarness(t, 3, 1, "local-ci-pool")
+	b := newFakeBudget(true)
+	h.budget = b
+	h.docker.add(survivorA, labelled(survivorA, "", ""))
+	h.docker.add(survivorB, labelled(survivorB, "local-ci-pool", "2"))
+	h.start()
+	h.eventually("local-ci-pool healthy", func() bool { return h.healthy(repo) })
+	h.eventually("both survivors adopted", func() bool {
+		a, okA := h.survivorOf(survivorA)
+		b, okB := h.survivorOf(survivorB)
+		return okA && okB && a.mode == runner.ModeAdopted && b.mode == runner.ModeAdopted
+	})
+	got, _ := h.health(repo)
+	if want := (AdmittedHealth{Adopted: 1}); got.Admitted != want {
+		t.Fatalf("local-ci-pool admitted %+v, want %+v: only the labelled survivor counts", got.Admitted, want)
+	}
+}
+
+// Once the pool's life ends, the survivors not adopted yet are not adopted:
+// an Adopt on an ended context would only fail open.
+func TestAdoptionStopsAtShutdown(t *testing.T) {
+	h := newHarness(t, 2, 1, "alpha")
+	b := newFakeBudget(true)
+	b.adopt = func(ctx context.Context, a runner.Admission) runner.Admitted {
+		<-ctx.Done() // the first Adopt returns only once the pool's life ended
+		return b.grant(a.Runner, runner.ModeFailOpen, a.Need)
+	}
+	h.budget = b
+	h.docker.add(survivorA, labelled(survivorA, "alpha", "2"))
+	h.docker.add(survivorB, labelled(survivorB, "alpha", "2"))
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.eventually("an Adopt in progress", func() bool { return len(b.adopted()) == 1 })
+	h.cancel()
+	if err := h.wait(defaultWait); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.adopted(); len(got) != 1 {
+		t.Fatalf("Adopt got %+v after the pool's life ended, want only the first", got)
 	}
 }

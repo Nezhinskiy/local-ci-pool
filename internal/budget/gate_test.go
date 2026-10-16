@@ -573,3 +573,14 @@ func TestReleaseNeverBlocks(t *testing.T) {
 		t.Fatalf("holds after Release = %+v; want none", hs)
 	}
 }
+
+// A survivor of an older pool names no project: its request is labelled as
+// the pool's own; any other project labels its own.
+func TestRequestLabelOfAnUnlabelledSurvivor(t *testing.T) {
+	for project, want := range map[string]string{"": "local-ci-pool:ci", "alpha": "alpha:ci"} {
+		req, label, _ := request(runner.Admission{Runner: "local-ci-ssssssssssss", Project: project}, Settings{Enabled: true, CPU: 3})
+		if label != want || req.Label != want {
+			t.Errorf("project %q: label %q, request label %q; want %q", project, label, req.Label, want)
+		}
+	}
+}
