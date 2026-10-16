@@ -278,9 +278,11 @@ clamped: the job waits for the whole budget and runs alone with it, and `pool.lo
 shortfall.
 
 **Creating it.** `./install.sh --budget-cpu 2` creates `~/.config/local-ci-pool/config.toml` (mode
-0600) when no file exists at either path, and never changes one that exists: it prints
-`the budget settings exist; edit <path>` instead. It warns when its own `XDG_CONFIG_HOME` names
-another directory, which the installed pool does not read. `--dry-run` prints what it would write.
+0600) when the installed pool would read no file, and never changes one that exists: it prints
+`the budget settings exist; edit <path>` instead, naming the file the pool reads (a symlink to a
+missing file at the `~/.config` path is refused too, never written through). It warns when its own
+`XDG_CONFIG_HOME` names another directory, which the installed pool does not read, if you passed
+`--budget-cpu` or a settings file sits under that directory. `--dry-run` prints what it would write.
 After any install, when the file turns the budget on but the new pool's `/healthz` shows it off (an
 invalid file, or a release before the budget, which ignores the file), the installer warns.
 `--uninstall` leaves the file and prints its path.
@@ -306,15 +308,16 @@ does not apply to these labels.
 
 **Inside `coreslot run`.** A pool started by hand inside `coreslot run` would inherit that run's
 grant. It drops it first, before it opens anything, budget on or off: it closes the grant's
-descriptors and unsets the `CORESLOT_*` variables, then queues as itself.
+descriptors and unsets the grant's variables (`CORESLOT_HELD_FD`, `CORESLOT_TOKEN_FDS`,
+`CORESLOT_UNBUDGETED` and every `CORESLOT_GRANTED_*`), then queues as itself.
 
 **Survivors.** A job container the previous pool left running (see
 [launchd's 60-second limit](#launchds-60-second-limit)) carries its project and its need as labels.
 With the budget on, the new pool takes a hold in the budget for each one shortly after it starts,
 and `pool.log` logs `runner admitted` with `mode=adopted`. A survivor that does not fit is not
 stopped, since a running job cannot be paused: `pool.log` warns `survivor oversubscribed` with the
-shortfall, and the hold is kept. A survivor of a release before the budget carries no labels and is
-adopted as `local-ci-pool:ci` with the configured `cpu`. From the old pool's exit until the
+shortfall, and the hold is kept. A survivor of a release before the budget carries no project or need
+label and is adopted as `local-ci-pool:ci` with the configured `cpu`. From the old pool's exit until the
 adoption, survivors run outside the budget.
 
 **Rolling back.** Set `enabled = false`, or delete the file: the next runner starts without the
@@ -349,9 +352,12 @@ To get CI moving:
    line names the largest holds.
 2. End the holder, or let it finish.
 3. Or set `enabled = false` in the settings file: the next runner starts without the budget. A
-   runner already waiting keeps its ticket; `coreslot cancel --label <identity>:ci` withdraws it,
-   the runner is given up without starting (`reason=coreslot_cancel`), and the pool starts another
-   for the job, which now runs without the budget.
+   runner already waiting keeps its ticket; withdraw it with coreslot, and the runner is given up
+   without starting (`reason=coreslot_cancel`) and the pool starts another for the job, which now
+   runs without the budget. `coreslot cancel --label <identity>:ci` works when that runner is the
+   project's only waiting one. All of a project's runners share the label, so with several waiting
+   it refuses and names their ticket ids (the `id` column of `coreslot status`); cancel each with
+   `coreslot cancel <ticket-id>`.
 
 **Wedged.** `budget.state` is `wedged` when one process has held coreslot's admission section for 2
 minutes. A healthy client holds it for milliseconds, so the holder is stopped (for example by
