@@ -128,7 +128,7 @@ func TestStartRunnerLabels(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			d := newFakeDocker()
 			s := testSpec()
-			s.Project, s.Need = "alpha", c.need
+			s.Need = c.need
 			if _, err := StartRunner(context.Background(), d, s); err != nil {
 				t.Fatal(err)
 			}
