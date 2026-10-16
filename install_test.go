@@ -1993,9 +1993,10 @@ func TestInstallBudgetCPUDryRun(t *testing.T) {
 }
 
 // The launchd pool never sees the shell's XDG_CONFIG_HOME, so the installer
-// writes ~/.config and says that a different XDG_CONFIG_HOME is not read.
+// writes ~/.config and says that a different XDG_CONFIG_HOME is not read: with
+// --budget-cpu, or when a settings file sits under that XDG_CONFIG_HOME.
 func TestInstallWarnsOnForeignXDG(t *testing.T) {
-	const warning = "the installed pool reads "
+	const warning = "the installed pool reads the budget settings from "
 	e := newEnv(t)
 	other := filepath.Join(e.home, "elsewhere")
 	e.vars["XDG_CONFIG_HOME"] = other
@@ -2032,6 +2033,76 @@ func TestInstallWarnsOnForeignXDG(t *testing.T) {
 		_ = os.RemoveAll("rel")
 		t.Error("the settings were written under a relative XDG_CONFIG_HOME")
 	}
+
+	// Without --budget-cpu: a settings file under XDG_CONFIG_HOME, which the
+	// installed pool never reads, is worth the warning; nothing there is not.
+	e = newEnv(t)
+	e.vars["XDG_CONFIG_HOME"] = filepath.Join(e.home, "elsewhere")
+	theirs := filepath.Join(e.home, "elsewhere", "local-ci-pool", "config.toml")
+	write(t, theirs, budgetFile, 0o600)
+	out, err = e.install()
+	if err != nil {
+		t.Fatalf("install failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, warning+e.settingsXDG()+", not "+theirs) {
+		t.Errorf("no warning about the settings under XDG_CONFIG_HOME:\n%s", out)
+	}
+	e = newEnv(t)
+	e.vars["XDG_CONFIG_HOME"] = filepath.Join(e.home, "elsewhere")
+	if out, err := e.install(); err != nil || strings.Contains(out, "XDG_CONFIG_HOME") {
+		t.Errorf("no flag and no file under XDG_CONFIG_HOME, yet: %v\n%s", err, out)
+	}
+}
+
+// A dangling symlink at ~/.config/local-ci-pool/config.toml does not exist for
+// the pool, which then reads the macOS fallback: the installer's messages, its
+// check of the budget and the uninstall name the fallback, as the pool does.
+func TestInstallResolvesSettingsAsThePool(t *testing.T) {
+	setup := func(t *testing.T) *env {
+		e := newEnv(t)
+		if err := os.MkdirAll(filepath.Dir(e.settingsXDG()), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(e.home, "missing.toml"), e.settingsXDG()); err != nil {
+			t.Fatal(err)
+		}
+		write(t, e.settingsMac(), budgetFile, 0o600)
+		return e
+	}
+	t.Run("install", func(t *testing.T) {
+		e := setup(t)
+		e.vars["STUB_BUDGET"] = "off"
+		out, err := e.install("--budget-cpu", "3")
+		if err != nil {
+			t.Fatalf("install failed: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, "the budget settings exist; edit "+e.settingsMac()) {
+			t.Errorf("the output does not name the file the pool reads:\n%s", out)
+		}
+		if !strings.Contains(out, "the pool does not apply "+e.settingsMac()+"; the budget is off") {
+			t.Errorf("the fallback the pool reads was not checked:\n%s", out)
+		}
+		if strings.Contains(out, "edit "+e.settingsXDG()) || strings.Contains(out, "apply "+e.settingsXDG()) {
+			t.Errorf("the output names the dangling symlink:\n%s", out)
+		}
+		if lexists(filepath.Join(e.home, "missing.toml")) {
+			t.Error("the settings were written through the symlink")
+		}
+		if b, _ := os.ReadFile(e.settingsMac()); string(b) != budgetFile {
+			t.Errorf("the fallback changed: %q", b)
+		}
+	})
+	t.Run("uninstall", func(t *testing.T) {
+		e := setup(t)
+		e.placeInstalled()
+		out, err := e.install("--uninstall")
+		if err != nil {
+			t.Fatalf("uninstall failed: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, "kept "+e.settingsMac()) || strings.Contains(out, "kept "+e.settingsXDG()) {
+			t.Errorf("want kept %s:\n%s", e.settingsMac(), out)
+		}
+	})
 }
 
 // When the settings enable the budget but the new pool reports it off, or

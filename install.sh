@@ -575,14 +575,14 @@ wait_new_pool() {
   warn "the pool does not answer on http://$addr/healthz yet; read $LOG_DIR/pool.log"
 }
 
-# settings_in_use prints the budget settings file the installed pool reads:
-# SETTINGS_XDG when anything is there (a dangling symlink included, which is
-# never written through), else SETTINGS_MAC when anything is there, else
-# nothing.
+# settings_in_use prints the budget settings file the installed pool reads,
+# resolved as the pool does: SETTINGS_XDG when it exists, else SETTINGS_MAC
+# when it exists, else nothing. A dangling symlink does not exist (stat fails),
+# so a dangling SETTINGS_XDG leaves the pool reading SETTINGS_MAC.
 settings_in_use() {
-  if [ -e "$SETTINGS_XDG" ] || [ -L "$SETTINGS_XDG" ]; then
+  if [ -e "$SETTINGS_XDG" ]; then
     printf '%s' "$SETTINGS_XDG"
-  elif [ -e "$SETTINGS_MAC" ] || [ -L "$SETTINGS_MAC" ]; then
+  elif [ -e "$SETTINGS_MAC" ]; then
     printf '%s' "$SETTINGS_MAC"
   fi
 }
@@ -610,10 +610,14 @@ write_settings() {
 }
 
 # place_settings writes the budget settings for --budget-cpu when no file is in
-# use, and otherwise names the one that is.
+# use, and otherwise names the one that is. A dangling symlink at SETTINGS_XDG
+# is refused too: nothing is ever written through it.
 place_settings() {
   local p
   p="$(settings_in_use)"
+  if [ -z "$p" ] && [ -L "$SETTINGS_XDG" ]; then
+    p="$SETTINGS_XDG"
+  fi
   if [ -n "$p" ]; then
     say "the budget settings exist; edit $p"
     return 0
@@ -622,7 +626,9 @@ place_settings() {
 }
 
 # warn_foreign_xdg says that a shell's XDG_CONFIG_HOME other than ~/.config is
-# not where the installed pool looks: launchd does not pass it on.
+# not where the installed pool looks for its budget settings: launchd does not
+# pass it on. It matters only with --budget-cpu, or when a settings file sits
+# under that XDG_CONFIG_HOME, which the installed pool never reads.
 warn_foreign_xdg() {
   local xdg="${XDG_CONFIG_HOME:-}"
   case "$xdg" in
@@ -631,7 +637,9 @@ warn_foreign_xdg() {
   esac
   xdg="${xdg%/}"
   [ "$xdg" != "$HOME/.config" ] || return 0
-  warn "XDG_CONFIG_HOME is set, but launchd does not pass it to the pool: the installed pool reads $SETTINGS_XDG, not $xdg/local-ci-pool/config.toml"
+  if [ "$BUDGET_SET" = 1 ] || [ -e "$xdg/local-ci-pool/config.toml" ]; then
+    warn "XDG_CONFIG_HOME is set, but launchd does not pass it to the pool: the installed pool reads the budget settings from $SETTINGS_XDG, not $xdg/local-ci-pool/config.toml"
+  fi
 }
 
 # check_budget_applied warns when the settings file in use turns the budget on,
@@ -641,7 +649,7 @@ warn_foreign_xdg() {
 check_budget_applied() {
   local p budget
   p="$(settings_in_use)"
-  [ -n "$p" ] && [ -e "$p" ] || return 0
+  [ -n "$p" ] || return 0
   if [ -f "$p" ] && [ -r "$p" ]; then
     grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true' "$p" 2> /dev/null || return 0
   fi
