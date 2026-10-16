@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	cerrdefs "github.com/containerd/errdefs"
@@ -209,6 +210,31 @@ func TestIdleRunnerReapedWhenDesiredDrops(t *testing.T) {
 	}
 	if slots.InUse() != 0 {
 		t.Fatalf("InUse %d after the die events, want 0", slots.InUse())
+	}
+}
+
+// Desired counts the project's survivors against the assigned jobs: a
+// survivor's job gets no runner, the runner beyond the rest is reaped, and
+// once the survivor is gone the full count applies again.
+func TestSurvivorsCountAgainstDesired(t *testing.T) {
+	var survivors atomic.Int32
+	survivors.Store(1)
+	slots := NewSlots(3)
+	h := newHarnessWith(slots, func(c *ScalerConfig) {
+		c.Survivors = func() int { return int(survivors.Load()) }
+	})
+	if got := desired(t, h.scaler, 2); got != 1 {
+		t.Fatalf("Desired(2) with one survivor = %d, want 1", got)
+	}
+	if got := desired(t, h.scaler, 1); got != 0 || len(h.docker.removed()) != 1 {
+		t.Fatalf("Desired(1) with one survivor = %d after %d removes, want 0 and 1", got, len(h.docker.removed()))
+	}
+	if got := desired(t, h.scaler, 0); got != 0 {
+		t.Fatalf("Desired(0) with one survivor = %d, want 0", got)
+	}
+	survivors.Store(0)
+	if got := desired(t, h.scaler, 1); got != 1 {
+		t.Fatalf("Desired(1) once the survivor is gone = %d, want 1", got)
 	}
 }
 

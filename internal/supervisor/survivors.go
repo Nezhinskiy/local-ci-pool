@@ -26,9 +26,11 @@ import (
 // the budget off, survivors are kept as above and never adopted.
 //
 // A survivor's job still counts in its scale set's assigned jobs, so the
-// listener's desired count includes it and the scaler may start one idle
-// runner per survivor, within the slots left. Such a runner takes no job,
-// holds its slot like any other, and is reaped when the count drops.
+// listener's desired count includes it. Each project's scaler counts that
+// project's survivors against the count (survivorsOf), so it starts no idle
+// runner beside one. A survivor of an older pool names no project and counts
+// for none: its project's scaler may start one idle runner for its job, within
+// the slots left, which takes no job and is reaped when the count drops.
 
 // survivor is one runner of a previous run kept at start.
 type survivor struct {
@@ -184,6 +186,20 @@ func (s *Supervisor) forgetSurvivorLocked(name string) (release func(), ok bool)
 	}
 	release, e.release = e.release, runner.NoRelease
 	return release, true
+}
+
+// survivorsOf counts the survivors whose labels name project. A survivor of
+// an older pool names none, so it counts for no project.
+func (s *Supervisor) survivorsOf(project string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, e := range s.survivors {
+		if e.project == project {
+			n++
+		}
+	}
+	return n
 }
 
 // survivorCountsLocked counts the survivors admitted into the budget, by the

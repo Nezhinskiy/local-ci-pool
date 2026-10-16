@@ -891,7 +891,7 @@ func TestSnapshotBudgetFields(t *testing.T) {
 		e, ok := h.survivorOf(survivorA)
 		return ok && e.mode == runner.ModeAdopted
 	})
-	h.actions.Assign(alphaSet, 4)
+	h.actions.Assign(alphaSet, 5) // the survivor's job and four more
 	img := h.imageOf("alpha")
 	h.eventually("two runners admitted and two waiting", func() bool {
 		return len(b.admitted()) == 4 && len(h.docker.runners(img)) == 2
@@ -918,7 +918,7 @@ func TestSnapshotWithoutBudgetIsOff(t *testing.T) {
 	h.docker.add(survivorA, labelled(survivorA, "alpha", "2"))
 	h.start()
 	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
-	h.actions.Assign(alphaSet, 1)
+	h.actions.Assign(alphaSet, 2) // the survivor's job and one more
 	img := h.imageOf("alpha")
 	h.eventually("a runner", func() bool { return len(h.docker.runners(img)) == 1 })
 	snap := h.sup.Snapshot()

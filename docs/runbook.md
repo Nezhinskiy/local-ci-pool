@@ -335,6 +335,10 @@ stopped, since a running job cannot be paused: `pool.log` warns `survivor oversu
 shortfall, and the hold is kept. A survivor of a release before the budget carries no project or need
 label and is adopted as `local-ci-pool:ci` with the configured `cpu`; in `/healthz` it counts under no
 project's `admitted`. From the old pool's exit until the adoption, survivors run outside the budget.
+A survivor's job still counts among its repository's assigned jobs, and the pool counts the
+project's survivors against them, so it starts no runner beside a survivor for the job the survivor
+already runs. A survivor of a release before the budget names no project, so its project may get one
+idle runner until that job ends.
 
 **Rolling back.** Set `enabled = false`, or delete the file: the next runner starts without the
 budget, with no restart. To leave the feature entirely, install the release before it with

@@ -72,6 +72,11 @@ type ScalerConfig struct {
 	Gate Gate
 	// Project is the project's identity, passed to the gate.
 	Project string
+	// Survivors counts the project's runners of the previous run that still
+	// run. Their jobs count in the scale set's assigned jobs, but no runner of
+	// this Scaler takes them, so Desired subtracts them from the count. Nil
+	// means none.
+	Survivors func() int
 }
 
 type runnerState int
@@ -123,6 +128,7 @@ type Scaler struct {
 	log        *slog.Logger
 	gate       Gate
 	project    string
+	survivors  func() int
 	names      func() (string, error)
 
 	// abort ends every launch, reap and Admit in flight; see Abort.
@@ -160,6 +166,7 @@ func NewScaler(cfg ScalerConfig) *Scaler {
 		log:        log.With(slog.Int("scaleSetID", cfg.ScaleSetID)),
 		gate:       cfg.Gate,
 		project:    cfg.Project,
+		survivors:  cfg.Survivors,
 		names:      newName,
 		runners:    map[string]*record{},
 	}
@@ -191,12 +198,20 @@ func (s *Scaler) activeLocked() int {
 // retried on the listener's next call. It returns the number of waiting,
 // starting, idle and busy runners, and never an error.
 //
+// count is the scale set's assigned jobs, which include the jobs the
+// project's survivors run: Desired counts those survivors against it, so a
+// survivor's job gets no idle runner beside it.
+//
 // With the gate off (nil, or not Enabled), Desired starts each new runner
 // itself; a start that fails ends this call's starts and is retried on the
 // next. With the gate enabled, each new runner is recorded waiting, and its own
 // waiter goroutine admits it through the gate and then starts it; Desired never
 // waits on the gate.
 func (s *Scaler) Desired(ctx context.Context, count int) (int, error) {
+	// survivors takes the supervisor's lock: once per call, never under s.mu.
+	if s.survivors != nil {
+		count -= s.survivors()
+	}
 	count = max(count, 0)
 	// Enabled reads the gate's settings: once per call, never under s.mu.
 	gated := s.gate != nil && s.gate.Enabled()

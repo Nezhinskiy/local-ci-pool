@@ -71,6 +71,54 @@ func TestSurvivorHoldsItsSlotUntilItDies(t *testing.T) {
 	}
 }
 
+// A survivor's job still counts in its scale set's assigned jobs. The scaler
+// counts the project's survivors against that count, so a free slot gets no
+// idle runner for the job the survivor already runs; a second job gets one.
+// Once the survivor has died and its job has left the count, the one runner
+// is exactly what the scale set needs.
+func TestSurvivorsJobStartsNoIdleRunner(t *testing.T) {
+	h := newHarness(t, 2, 1, "alpha")
+	h.docker.add(survivorA, labelled(survivorA, "alpha", "2"))
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	img := h.imageOf("alpha")
+
+	h.actions.Assign(alphaSet, 1) // the survivor's own job
+	h.delivered(alphaSet)
+	time.Sleep(3 * 20 * time.Millisecond) // a few of the listener's nil-message calls
+	if got := h.docker.runners(img); len(got) != 0 {
+		t.Fatalf("started %v for the job the survivor runs, with a slot free", got)
+	}
+
+	h.actions.Assign(alphaSet, 1)
+	h.delivered(alphaSet)
+	h.eventually("the second job's runner started", func() bool { return len(h.docker.runners(img)) == 1 })
+
+	h.docker.exit(survivorA)
+	h.actions.Assign(alphaSet, -1)
+	h.delivered(alphaSet)
+	time.Sleep(3 * 20 * time.Millisecond)
+	if got := h.docker.runners(img); len(got) != 1 {
+		t.Fatalf("runners %v after the survivor's job left, want the one already started", got)
+	}
+}
+
+// Only the project's own survivors count against its jobs: a survivor of
+// another project, or of an older pool (no project label), leaves alpha's
+// job a runner.
+func TestOtherSurvivorsLeaveTheJobARunner(t *testing.T) {
+	h := newHarness(t, 3, 1, "alpha", "beta")
+	h.docker.add(survivorA, labelled(survivorA, "beta", "2"))
+	h.docker.add(survivorB, instanceLabels("main", survivorB))
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	img := h.imageOf("alpha")
+
+	h.actions.Assign(alphaSet, 1)
+	h.delivered(alphaSet)
+	h.eventually("alpha's runner started", func() bool { return len(h.docker.runners(img)) == 1 })
+}
+
 // The reconcile leaves a live survivor alone, and releases the slot of one
 // whose container vanished without a die event (a Docker restart).
 func TestReconcileSparesAndReleasesSurvivors(t *testing.T) {

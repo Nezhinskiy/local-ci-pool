@@ -174,8 +174,9 @@ func (pr *project) setup() error {
 		Docker:     s.deps.Docker,
 		Log:        pr.log,
 		// A nil Budget converts to a nil Gate: the budget is off.
-		Gate:    s.deps.Budget,
-		Project: pr.identity,
+		Gate:      s.deps.Budget,
+		Project:   pr.identity,
+		Survivors: func() int { return s.survivorsOf(pr.identity) },
 	})
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
