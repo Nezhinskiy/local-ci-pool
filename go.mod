@@ -1,8 +1,9 @@
 module github.com/Nezhinskiy/local-ci-pool
 
-go 1.25.3
+go 1.26.0
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/actions/scaleset v0.4.0
 	github.com/containerd/errdefs v1.0.0
 	github.com/golang-jwt/jwt/v4 v4.5.2
@@ -11,6 +12,7 @@ require (
 	github.com/moby/moby/api v1.56.1
 	github.com/moby/moby/client v0.6.1
 	github.com/opencontainers/image-spec v1.1.1
+	golang.org/x/sys v0.49.0
 )
 
 require (
@@ -31,5 +33,4 @@ require (
 	go.opentelemetry.io/otel v1.41.0 // indirect
 	go.opentelemetry.io/otel/metric v1.41.0 // indirect
 	go.opentelemetry.io/otel/trace v1.41.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
 )
