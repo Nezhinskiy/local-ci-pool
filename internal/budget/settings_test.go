@@ -48,6 +48,19 @@ func (r *logRecorder) lines(msg string) []string {
 	return out
 }
 
+// levels returns the level of every record with msg, in order.
+func (r *logRecorder) levels(msg string) []slog.Level {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []slog.Level
+	for _, rec := range r.recs {
+		if rec.Message == msg {
+			out = append(out, rec.Level)
+		}
+	}
+	return out
+}
+
 func attrLine(rec slog.Record) string {
 	var parts []string
 	rec.Attrs(func(a slog.Attr) bool {

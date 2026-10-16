@@ -6,6 +6,7 @@ require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/actions/scaleset v0.4.0
 	github.com/containerd/errdefs v1.0.0
+	github.com/core-slot/coreslot v0.1.0
 	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/google/uuid v1.6.0
 	github.com/moby/docker-image-spec v1.3.1
