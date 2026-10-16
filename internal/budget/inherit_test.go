@@ -197,3 +197,42 @@ func TestDropInheritedMalformed(t *testing.T) {
 	}
 	unix.Close(200)
 }
+
+// A standard stream is never closed, even a regular file: under launchd the pool's stdout and
+// stderr are its log file, and a variable naming them must not close the pool's own log.
+func TestDropInheritedLeavesAStandardStreamThatIsAFile(t *testing.T) {
+	clearInherited(t)
+	saved, err := unix.Dup(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := unix.Dup2(saved, 2); err != nil {
+			t.Errorf("restoring fd 2: %v", err)
+		}
+		unix.Close(saved)
+	})
+	p := filepath.Join(t.TempDir(), "pool.log")
+	if err := os.WriteFile(p, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := unix.Open(p, unix.O_WRONLY|unix.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Dup2(raw, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Close(raw); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CORESLOT_TOKEN_FDS", "2")
+	t.Setenv("CORESLOT_HELD_FD", "2")
+
+	DropInherited()
+
+	if !fdOpen(2) {
+		t.Error("fd 2, a regular file, was closed")
+	}
+	checkUnset(t, "CORESLOT_TOKEN_FDS", "CORESLOT_HELD_FD")
+}
