@@ -293,8 +293,10 @@ need it asked for. Turning the budget on or off applies to the next runner; noth
 running is cancelled.
 
 **An invalid file** is one that is not a regular file (a directory, a FIFO), is larger than 64 KiB,
-cannot be read, is not valid TOML, has another key under `[budget]`, a value of the wrong type,
-`enabled = true` without `cpu`, or a `cpu` outside 1 to 256. The last valid settings stay in force,
+cannot be read, has more than 64 dots, braces and brackets outside its comments and strings (a
+bound on nesting, which the TOML decoder's cost grows with), is not valid TOML, has another key
+under `[budget]`, a value of the wrong type, `enabled = true` without `cpu`, or a `cpu` outside 1
+to 256. The last valid settings stay in force,
 `/healthz` shows `budget.error = "config"`, and `pool.log` logs `budget settings invalid` with the
 error. A file that is invalid when the pool starts leaves the budget off, with the same error. The
 pool never exits over the file.

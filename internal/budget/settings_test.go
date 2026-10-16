@@ -293,3 +293,57 @@ func TestSettingsPathLogged(t *testing.T) {
 		t.Fatalf("budget settings lines = %q, want %q", got, want)
 	}
 }
+
+// The TOML decoder's cost grows with the square of the nesting depth, and the file is read on
+// every call: a deeply nested file is refused before it is decoded.
+func TestSettingsDeepNestingRefusedQuickly(t *testing.T) {
+	t.Parallel()
+	for name, body := range map[string]string{
+		"dotted keys":   "a" + strings.Repeat(".b", 4<<10) + " = 1\n",
+		"inline tables": "a = " + strings.Repeat("{b = ", 2<<10) + "1" + strings.Repeat("}", 2<<10) + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			p := filepath.Join(t.TempDir(), "config.toml")
+			writeSettings(t, p, body+"[budget]\nenabled = true\ncpu = 3\n")
+			f, _ := settingsAt(p)
+			type result struct {
+				s       Settings
+				invalid bool
+			}
+			done := make(chan result, 1)
+			go func() {
+				s, invalid := f.Load()
+				done <- result{s, invalid}
+			}()
+			select {
+			case r := <-done:
+				if r.s != (Settings{}) || !r.invalid {
+					t.Fatalf("Load() = %+v, invalid %v; want off, invalid", r.s, r.invalid)
+				}
+			case <-time.After(100 * time.Millisecond):
+				t.Fatal("Load() did not return within 100 ms")
+			}
+		})
+	}
+}
+
+// Dots, braces and brackets inside comments and strings are not nesting.
+func TestSettingsNestingIgnoresCommentsAndStrings(t *testing.T) {
+	t.Parallel()
+	many := strings.Repeat(".{[", 30)
+	body := "# A comment " + many + "\n" +
+		"[budget]\n" +
+		"enabled = true # " + many + "\n" +
+		"cpu = 3\n" +
+		"[other]\n" +
+		"basic = \"" + many + " \\\" " + many + "\"\n" +
+		"literal = '" + many + "'\n" +
+		"multi = \"\"\"\n" + many + "\n\"\" " + many + "\n\"\"\"\n" +
+		"multiliteral = '''\n" + many + "\n'''\n" +
+		"plain = [1, 2, {x = 1.5}]\n"
+	p := filepath.Join(t.TempDir(), "config.toml")
+	writeSettings(t, p, body)
+	f, _ := settingsAt(p)
+	checkLoad(t, f, Settings{Enabled: true, CPU: 3}, false)
+}
