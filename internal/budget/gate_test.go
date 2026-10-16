@@ -584,3 +584,89 @@ func TestRequestLabelOfAnUnlabelledSurvivor(t *testing.T) {
 		}
 	}
 }
+
+// A runner whose ctx ended (a drain, a lower Desired) is given up, never failed open: no Open, no
+// admission line, no error class.
+func TestAdmitWithEndedContext(t *testing.T) {
+	t.Parallel()
+	t.Run("at entry", func(t *testing.T) {
+		t.Parallel()
+		h := newGate(t, stateDir(t, cpu4), on3)
+		h.cc.openFails, h.cc.openErr = 1, errors.New("open refused")
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		ad, err := h.g.Admit(ctx, alpha("r1"))
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Admit = %+v, %v; want context.Canceled", ad, err)
+		}
+		checkReleasable(t, ad)
+		if n := h.cc.opens.Load(); n != 0 {
+			t.Fatalf("Open called %d times; want 0", n)
+		}
+		if got := h.log.lines("runner admitted"); len(got) != 0 {
+			t.Fatalf("runner admitted lines = %q; want none", got)
+		}
+		if got := h.g.State().Error; got != "" {
+			t.Fatalf("State().Error = %q; want none", got)
+		}
+	})
+	t.Run("during Open", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		h := newGate(t, stateDir(t, cpu4), on3, func(c *Config) {
+			c.Open = func(coreslot.Options) (client, error) {
+				cancel()
+				return nil, errors.New("open refused")
+			}
+		})
+		ad, err := h.g.Admit(ctx, alpha("r1"))
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Admit = %+v, %v; want context.Canceled", ad, err)
+		}
+		checkReleasable(t, ad)
+		if got := h.log.lines("runner admitted"); len(got) != 0 {
+			t.Fatalf("runner admitted lines = %q; want none", got)
+		}
+	})
+}
+
+// An adoption whose ctx ended runs on unbudgeted, as a fail open does, but consults nothing and
+// logs no admission.
+func TestAdoptWithEndedContext(t *testing.T) {
+	t.Parallel()
+	t.Run("at entry", func(t *testing.T) {
+		t.Parallel()
+		h := newGate(t, stateDir(t, cpu4), on3)
+		h.cc.openFails, h.cc.openErr = 1, errors.New("open refused")
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		ad := h.g.Adopt(ctx, runner.Admission{Runner: "s1", Project: "alpha"})
+		if ad.Mode != runner.ModeFailOpen || ad.Need != 3 {
+			t.Fatalf("Adopt = %+v; want fail_open, need 3", ad)
+		}
+		checkReleasable(t, ad)
+		if n := h.cc.opens.Load(); n != 0 {
+			t.Fatalf("Open called %d times; want 0", n)
+		}
+		if got := h.log.lines("runner admitted"); len(got) != 0 {
+			t.Fatalf("runner admitted lines = %q; want none", got)
+		}
+	})
+	t.Run("during Open", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		h := newGate(t, stateDir(t, cpu4), on3, func(c *Config) {
+			c.Open = func(coreslot.Options) (client, error) {
+				cancel()
+				return nil, errors.New("open refused")
+			}
+		})
+		ad := h.g.Adopt(ctx, runner.Admission{Runner: "s1", Project: "alpha"})
+		if ad.Mode != runner.ModeFailOpen {
+			t.Fatalf("Adopt = %+v; want fail_open", ad)
+		}
+		if got := h.log.lines("runner admitted"); len(got) != 0 {
+			t.Fatalf("runner admitted lines = %q; want none", got)
+		}
+	})
+}

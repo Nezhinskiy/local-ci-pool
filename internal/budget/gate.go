@@ -159,14 +159,25 @@ func (g *Gate) State() State {
 
 // Admit queues the runner in the budget and blocks until it is admitted. It returns an error only
 // when ctx ended or the request was cancelled through coreslot; every other failure fails open.
+// A runner whose ctx ended (a drain, a lower Desired) is never failed open: it would log an
+// admission for a runner that does not start.
 func (g *Gate) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, error) {
+	if err := ctx.Err(); err != nil {
+		return runner.Admitted{Release: noRelease}, err
+	}
 	s, _ := g.settings.Load()
 	if !s.Enabled {
 		return offAdmitted(), nil
 	}
 	req, label, need := request(a, s)
+	failOpen := func(wait time.Duration, class string, err error) (runner.Admitted, error) {
+		if ctx.Err() != nil {
+			return runner.Admitted{Release: noRelease}, ctx.Err()
+		}
+		return g.failOpen(a.Runner, label, need, wait, class, err), nil
+	}
 	if err := req.Validate(); err != nil {
-		return g.failOpen(a.Runner, label, need, 0, "refused", err), nil
+		return failOpen(0, "refused", err)
 	}
 	waitCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -175,10 +186,10 @@ func (g *Gate) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, 
 
 	cl, err := g.client()
 	if err != nil {
-		return g.failOpen(a.Runner, label, need, g.since(ad), "open", err), nil
+		return failOpen(g.since(ad), "open", err)
 	}
 	if !g.proceedWhenWedged(cl) {
-		return g.failOpen(a.Runner, label, need, g.since(ad), "wedged", errWedged), nil
+		return failOpen(g.since(ad), "wedged", errWedged)
 	}
 	var w waiter
 	for backoff := busyBackoffFirst; ; backoff = min(2*backoff, busyBackoffMax) {
@@ -194,7 +205,7 @@ func (g *Gate) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, 
 		}
 		var busy *coreslot.SectionBusyError
 		if !errors.As(err, &busy) || waitCtx.Err() != nil {
-			return g.failOpen(a.Runner, label, need, g.since(ad), failClass(err, waitCtx.Err() != nil), err), nil
+			return failOpen(g.since(ad), failClass(err, waitCtx.Err() != nil), err)
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -218,26 +229,38 @@ func (g *Gate) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, 
 	if err == nil {
 		err = errors.New("coreslot returned no grant")
 	}
-	return g.failOpen(a.Runner, label, need, g.since(ad), failClass(err, waitCtx.Err() != nil), err), nil
+	return failOpen(g.since(ad), failClass(err, waitCtx.Err() != nil), err)
 }
 
 // Adopt takes what is free for a runner already running, without queueing. It never fails: a
-// failure fails open.
+// failure fails open. An adoption whose ctx ended (the pool's life ended) consults nothing more and
+// logs no admission: the survivor runs on unbudgeted, as after a fail open.
 func (g *Gate) Adopt(ctx context.Context, a runner.Admission) runner.Admitted {
 	s, _ := g.settings.Load()
 	if !s.Enabled {
 		return offAdmitted()
 	}
 	req, label, need := request(a, s)
+	failOpen := func(class string, err error) runner.Admitted {
+		if cerr := ctx.Err(); cerr != nil {
+			g.log.Debug("budget adoption given up", slog.String("runner", a.Runner),
+				slog.String("error", cerr.Error()))
+			return runner.Admitted{Mode: runner.ModeFailOpen, Release: noRelease, Need: need}
+		}
+		return g.failOpen(a.Runner, label, need, 0, class, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return failOpen("", err)
+	}
 	if err := req.Validate(); err != nil {
-		return g.failOpen(a.Runner, label, need, 0, "refused", err)
+		return failOpen("refused", err)
 	}
 	cl, err := g.client()
 	if err != nil {
-		return g.failOpen(a.Runner, label, need, 0, "open", err)
+		return failOpen("open", err)
 	}
 	if !g.proceedWhenWedged(cl) {
-		return g.failOpen(a.Runner, label, need, 0, "wedged", errWedged)
+		return failOpen("wedged", errWedged)
 	}
 	actx, cancel := context.WithTimeout(ctx, g.adoptTimeout)
 	defer cancel()
@@ -247,7 +270,7 @@ func (g *Gate) Adopt(ctx context.Context, a runner.Admission) runner.Admitted {
 		if class == "other" && errors.Is(err, context.DeadlineExceeded) {
 			class = "busy"
 		}
-		return g.failOpen(a.Runner, label, need, 0, class, err)
+		return failOpen(class, err)
 	}
 	ad := g.admitted(a.Runner, label, runner.ModeAdopted, need, grant, 0)
 	if short := grant.Shortfall()["cpu"]; short > 0 {
