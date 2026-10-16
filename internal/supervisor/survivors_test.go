@@ -228,8 +228,9 @@ func TestSurvivorAdoptedUnderItsProject(t *testing.T) {
 }
 
 // A survivor of an older pool has no labels: it is adopted with no project
-// (the gate labels it as the pool's own) and the configured need (0). A need
-// label outside 1..256, or not a number, is the configured need too.
+// (the gate labels it as the pool's own) and need 0. A need label is passed
+// through as the number it names, 0 when it names none: the gate takes a
+// need outside 1..256 as the configured one.
 func TestUnlabelledSurvivorAdoptedAsPool(t *testing.T) {
 	const survivorC, survivorD = "local-ci-uuuuuuuuuuuu", "local-ci-vvvvvvvvvvvv"
 	h := newHarness(t, 4, 1, "alpha")
@@ -243,9 +244,9 @@ func TestUnlabelledSurvivorAdoptedAsPool(t *testing.T) {
 	h.eventually("every survivor adopted", func() bool { return len(b.adopted()) == 4 })
 	want := []runner.Admission{
 		{Runner: survivorA, Project: "", Need: 0},
-		{Runner: survivorB, Project: "alpha", Need: 0},
-		{Runner: survivorC, Project: "alpha", Need: 0},
-		{Runner: survivorD, Project: "alpha", Need: 0},
+		{Runner: survivorB, Project: "alpha", Need: 300}, // the gate asks the configured cpu
+		{Runner: survivorC, Project: "alpha", Need: -1},  // likewise
+		{Runner: survivorD, Project: "alpha", Need: 0},   // not a number
 	}
 	if got := b.adopted(); !slices.Equal(got, want) {
 		t.Fatalf("Adopt got %+v, want %+v", got, want)

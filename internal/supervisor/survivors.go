@@ -30,14 +30,11 @@ import (
 // runner per survivor, within the slots left. Such a runner takes no job,
 // holds its slot like any other, and is reaped when the count drops.
 
-// maxNeed is the largest need a need label may name.
-const maxNeed = 256
-
 // survivor is one runner of a previous run kept at start.
 type survivor struct {
 	held    bool        // a slot was taken for it
 	project string      // its project label; empty for a runner of an older pool
-	need    int         // its need label in 1..256, else 0
+	need    int         // its need label as a number, else 0; the gate takes a need outside 1..256 as its cpu
 	mode    runner.Mode // set by its adoption
 	release func()      // set by its adoption; nil before
 }
@@ -84,11 +81,12 @@ func (s *Supervisor) sweep(ctx context.Context) ([]string, error) {
 	return kept, nil
 }
 
-// survivorNeed is the need a survivor's labels name, when it is a number in
-// 1..256; otherwise 0, the configured need.
+// survivorNeed is the need a survivor's labels name, when it is a number;
+// otherwise 0. The gate takes any need outside 1..256 (0 included) as the
+// configured one, as runner.Admission says.
 func survivorNeed(labels map[string]string) int {
 	n, err := strconv.Atoi(labels[runner.LabelNeed])
-	if err != nil || n < 1 || n > maxNeed {
+	if err != nil {
 		return 0
 	}
 	return n
