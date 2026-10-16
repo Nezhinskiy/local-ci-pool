@@ -103,6 +103,34 @@ A heartbeat is the variable `CI_POOL_HB_<MACHINE>` with the value `"<unix epoch>
 fresh when it is at most 300 seconds old and at most 30 seconds in the future. Keys and values
 that do not match that shape are ignored.
 
+## Core budget (optional)
+
+With the core budget on, each CI job waits for its cores in the machine-wide
+[coreslot](https://github.com/core-slot/coreslot) budget that your local builds, tests and agents
+share, so CI and local work no longer oversubscribe the Mac. Nothing changes until you create the
+settings file.
+
+The file is `~/.config/local-ci-pool/config.toml` (a pool started by hand from a shell that sets
+`XDG_CONFIG_HOME` reads `$XDG_CONFIG_HOME/local-ci-pool/config.toml` instead). It has two keys:
+
+```toml
+[budget]
+enabled = true
+cpu = 2      # the cores one job asks for: 1 to 256, no default
+```
+
+Start at 2, the CPUs per slot the pool's sizing assumes. The installer writes the file for you
+when there is none, and never changes one that exists:
+
+```sh
+./install.sh --budget-cpu 2
+```
+
+Edit the file to change `cpu`; the next job asks for the new value, without a restart. To turn the
+budget off, set `enabled = false` or delete the file. The runbook covers
+[the settings](docs/runbook.md#the-budget-settings) in full and [what to do when CI
+waits](docs/runbook.md#ci-is-waiting).
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). The code that adapts `actions/scaleset` is credited in

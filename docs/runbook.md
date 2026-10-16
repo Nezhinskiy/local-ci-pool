@@ -33,6 +33,9 @@ docker info
 ./install.sh            # or: ./install.sh --version v0.1.0
 ```
 
+To take CI jobs' cores from the machine's core budget as well, add `--budget-cpu 2`; see
+[the budget settings](#the-budget-settings).
+
 Run `./install.sh --dry-run` first if you want to see what it would do. The installer:
 
 1. refuses to run as root, checks `gh auth status`, `docker info` and the slot count, and picks the
@@ -136,7 +139,8 @@ unloads the agent and waits until launchd has let go of it, then runs `pool forg
 variables are never touched), then removes the plist and the binary. The order matters: the heartbeat
 dies with the process, so a variable deleted before the pool is gone could be written again. Workflows
 fall back to hosted runners within five minutes, since a heartbeat is fresh for no longer than that.
-Logs, the cache and the Docker images stay; delete them by hand if you want the space back.
+Logs, the cache and the Docker images stay; delete them by hand if you want the space back. The
+budget settings file stays too, and the installer prints its path.
 
 The pool deletes its scale sets while it drains. If it was not running when you uninstalled, or its
 drain hit the bound, a scale set can be left: check each served repository's Settings > Actions >
@@ -219,7 +223,8 @@ tail -f ~/Library/Logs/local-ci-pool/pool.log
 | `slots`, `in_use`, `busy` | the slot limit; slots held by runners, including runners a killed previous run left running; runners known to be running a job, which excludes those left running |
 | `docker` | whether Docker answers |
 | `probe` | whether this is a probe run |
-| `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, and a `reason` when not healthy |
+| `budget` | the core budget: `state`, an `error` class when there is one, and `oldest_wait_s` (see [CI is waiting](#ci-is-waiting)) |
+| `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, a `reason` when not healthy, and the budget's `waiting` and `admitted` counts |
 
 The endpoint binds `127.0.0.1:8737` and answers only requests whose `Host` is a loopback name. A job
 can still reach it through Docker Desktop's host gateway address with a forged `Host`, and so learn
@@ -234,6 +239,131 @@ lost runner and needs a re-run. A pool killed while Docker keeps running (`kill 
 [launchd's 60-second limit](#launchds-60-second-limit)) is different: a job that had started keeps
 running in its container, and the next pool leaves it running, counts it in `in_use` until it exits,
 and removes only this pool's containers that had already stopped.
+
+## The budget settings
+
+The core budget is optional. When the settings file turns it on, each runner waits for its cores in
+the machine-wide [coreslot](https://github.com/core-slot/coreslot) budget, which local work shares,
+before its container starts. Without the file the pool runs as it always has.
+
+**Where.** The pool resolves the path on every read:
+
+1. `$XDG_CONFIG_HOME/local-ci-pool/config.toml` when `XDG_CONFIG_HOME` is set and absolute,
+   otherwise `~/.config/local-ci-pool/config.toml`;
+2. when that file does not exist (a symlink to a missing file counts as missing) and
+   `~/Library/Application Support/local-ci-pool/config.toml` does, the latter (the macOS fallback,
+   beside the installer's `bin/`).
+
+launchd starts the installed pool with `PATH` alone, so it never sees `XDG_CONFIG_HOME` and reads
+`~/.config/local-ci-pool/config.toml`, or the fallback. A pool started by hand (probe mode) resolves
+with its shell's `XDG_CONFIG_HOME`. `pool.log` logs `budget settings` with the `path` at start, and
+again whenever the resolution changes; `/healthz` never shows the path.
+
+**Keys.** One table, `[budget]`, with exactly two keys. Key names are case-sensitive: `CPU = 2` is an
+unknown key, and makes the file invalid. Keys in other tables are ignored.
+
+| Key | Value |
+|---|---|
+| `enabled` | `true` or `false` |
+| `cpu` | the cores one job asks for, a whole number from 1 to 256. It has no default: `enabled = true` without `cpu` is invalid |
+
+```toml
+[budget]
+enabled = true
+cpu = 2
+```
+
+Start at `cpu = 2`, the CPUs per slot the pool's sizing assumes. A `cpu` above the whole budget is
+clamped: the job waits for the whole budget and runs alone with it, and `pool.log` shows the
+shortfall.
+
+**Creating it.** `./install.sh --budget-cpu 2` creates `~/.config/local-ci-pool/config.toml` (mode
+0600) when no file exists at either path, and never changes one that exists: it prints
+`the budget settings exist; edit <path>` instead. It warns when its own `XDG_CONFIG_HOME` names
+another directory, which the installed pool does not read. `--dry-run` prints what it would write.
+After any install, when the file turns the budget on but the new pool's `/healthz` shows it off (an
+invalid file, or a release before the budget, which ignores the file), the installer warns.
+`--uninstall` leaves the file and prints its path.
+
+**Edits apply without a restart.** The pool reads the file on every decision, with no cache. A new
+`cpu` applies to the next runner; a runner already waiting keeps its place in the queue and the
+need it asked for. Turning the budget on or off applies to the next runner; nothing waiting or
+running is cancelled.
+
+**An invalid file** is one that is not a regular file (a directory, a FIFO), is larger than 64 KiB,
+cannot be read, is not valid TOML, has another key under `[budget]`, a value of the wrong type,
+`enabled = true` without `cpu`, or a `cpu` outside 1 to 256. The last valid settings stay in force,
+`/healthz` shows `budget.error = "config"`, and `pool.log` logs `budget settings invalid` with the
+error. A file that is invalid when the pool starts leaves the budget off, with the same error. The
+pool never exits over the file.
+
+**Off.** No file, an empty file, no `[budget]` table, or `enabled = false` leaves the budget off.
+Deleting the file turns it off and forgets the last valid settings.
+
+**Labels and priority.** The pool asks for each job's cores under the label `<identity>:ci` (for
+`alpha`, `alpha:ci`), always at priority 0. A `[priorities]` entry in coreslot's own configuration
+does not apply to these labels.
+
+**Inside `coreslot run`.** A pool started by hand inside `coreslot run` would inherit that run's
+grant. It drops it first, before it opens anything, budget on or off: it closes the grant's
+descriptors and unsets the `CORESLOT_*` variables, then queues as itself.
+
+**Survivors.** A job container the previous pool left running (see
+[launchd's 60-second limit](#launchds-60-second-limit)) carries its project and its need as labels.
+With the budget on, the new pool takes a hold in the budget for each one shortly after it starts,
+and `pool.log` logs `runner admitted` with `mode=adopted`. A survivor that does not fit is not
+stopped, since a running job cannot be paused: `pool.log` warns `survivor oversubscribed` with the
+shortfall, and the hold is kept. A survivor of a release before the budget carries no labels and is
+adopted as `local-ci-pool:ci` with the configured `cpu`. From the old pool's exit until the
+adoption, survivors run outside the budget.
+
+**Rolling back.** Set `enabled = false`, or delete the file: the next runner starts without the
+budget, with no restart. To leave the feature entirely, install the release before it with
+`./install.sh --version v0.1.1`, which ignores the file.
+
+## CI is waiting
+
+With the budget on, a runner waits until the budget has its cores, however long that takes: a full
+budget never lets a runner start without them. Its job shows as queued on GitHub meanwhile.
+
+`/healthz` shows where things stand:
+
+| Field | Meaning |
+|---|---|
+| `budget.state` | `off`, `on`, or `wedged` (below) |
+| `budget.error` | absent when there is none; `config` (the settings file is invalid), `open` (the pool could not open coreslot's state; it retries after a backoff of up to a minute), or `state` (coreslot's state failed during the last admission, for example its state directory was removed) |
+| `budget.oldest_wait_s` | the seconds the oldest waiting runner has waited |
+| `waiting`, per project | the project's runners waiting for cores |
+| `admitted`, per project | the project's runners and survivors holding an admission now: `queued` (admitted through the queue), `adopted` (survivors), `fail_open` (started without a grant) |
+
+`pool.log` logs `runner waiting for the budget` when a runner queues, `runner admitted` (with
+`mode`, `need`, `granted`, `shortfall` and `wait_s`) when it starts, and
+`runner given up before admission` when it was given up before it started (`reason=cancelled`: no
+longer needed; `reason=coreslot_cancel`: cancelled through coreslot). Once the oldest runner has waited
+30 minutes, it warns `budget full`, once every 30 minutes, with `oldest_wait_s` and the three
+largest holds as `holds="<label> cpu=<n>, …"`. `/healthz` never names a hold.
+
+To get CI moving:
+
+1. See who holds the cores: `coreslot status` lists the holds and the queue, and the `budget full`
+   line names the largest holds.
+2. End the holder, or let it finish.
+3. Or set `enabled = false` in the settings file: the next runner starts without the budget. A
+   runner already waiting keeps its ticket; `coreslot cancel --label <identity>:ci` withdraws it,
+   the runner is given up without starting (`reason=coreslot_cancel`), and the pool starts another
+   for the job, which now runs without the budget.
+
+**Wedged.** `budget.state` is `wedged` when one process has held coreslot's admission section for 2
+minutes. A healthy client holds it for milliseconds, so the holder is stopped (for example by
+Ctrl-Z) or stuck, and nobody can be admitted, local gates included. `pool.log` warns
+`budget wedged` with the holder's `pid`. Meanwhile the pool's runners start without a grant: resume
+the process (`kill -CONT <pid>`) or end it. The wedge clears at the next check that finds the
+section free, and `pool.log` logs `budget unwedged`.
+
+**Started without a grant.** When coreslot itself fails (it cannot be opened, its state fails, or it
+is wedged), a runner starts anyway rather than block CI: `pool.log` warns `runner admitted` with
+`mode=fail_open` and a `class` saying why, and `/healthz` counts it in `admitted.fail_open`.
+`coreslot status` does not list such a runner, so its cores are not counted in the budget.
 
 ## Probe mode
 
