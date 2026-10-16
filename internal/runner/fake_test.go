@@ -267,6 +267,10 @@ type fakeStarter struct {
 	onStart func(name string)
 	// hangs makes a start wait for its context, like a stuck daemon.
 	hangs bool
+	// block, when set, makes a start wait until it is closed or its context
+	// ends.
+	block chan struct{}
+	ctxs  map[string]context.Context
 }
 
 func (s *fakeStarter) start(ctx context.Context, name, jit string, need int) error {
@@ -279,11 +283,23 @@ func (s *fakeStarter) start(ctx context.Context, name, jit string, need int) err
 	s.names = append(s.names, name)
 	s.jits[name] = jit
 	s.needs[name] = need
+	if s.ctxs == nil {
+		s.ctxs = map[string]context.Context{}
+	}
+	s.ctxs[name] = ctx
 	err := s.err
 	hangs := s.hangs
+	block := s.block
 	s.mu.Unlock()
 	if hook != nil {
 		hook(name)
+	}
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	if hangs {
 		<-ctx.Done()
@@ -296,6 +312,13 @@ func (s *fakeStarter) started() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.names...)
+}
+
+// ctxOf is the context a runner's start ran on.
+func (s *fakeStarter) ctxOf(name string) context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ctxs[name]
 }
 
 // needOf is the need a runner was started with.
@@ -370,6 +393,8 @@ type fakeGate struct {
 	enabled      atomic.Bool
 	reqs         chan *admitReq
 	enabledCalls atomic.Int32
+	// returned counts the Admit calls that returned.
+	returned atomic.Int32
 	// onEnabled runs inside every Enabled call.
 	onEnabled func()
 	// onRelease runs after a release is counted.
@@ -423,6 +448,7 @@ func (g *fakeGate) Enabled() bool {
 }
 
 func (g *fakeGate) Admit(ctx context.Context, a Admission) (Admitted, error) {
+	defer g.returned.Add(1)
 	r := &admitReq{name: a.Runner, project: a.Project, ctx: ctx, answer: make(chan admitAnswer, 1)}
 	g.mu.Lock()
 	if g.closed {

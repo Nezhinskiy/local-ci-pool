@@ -604,7 +604,30 @@ func (s *Scaler) ResetNoJobExits() {
 // at once: a drain past its bound uses it so that nothing waits on a start or an
 // unregistration it is about to undo. A start already minted still forgets
 // its runner, within forgetTimeout.
+//
+// Abort never blocks: it ends every waiting runner's Admit and returns. Join
+// waits for their goroutines.
 func (s *Scaler) Abort() { s.aborted() }
+
+// Join waits up to timeout for every waiter goroutine to return, and reports
+// whether all did. A waiter goroutine admits its runner and then launches it,
+// so one in a failed start's forget can outlast a short timeout. Call it after
+// Drain or Abort, once no new runner can start waiting.
+func (s *Scaler) Join(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
+}
 
 // Drain stops new starts: Desired starts nothing from now on, every waiting
 // runner is given up (its Admit's ctx ended), and a start whose JIT

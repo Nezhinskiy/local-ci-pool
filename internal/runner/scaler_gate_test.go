@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"slices"
 	"strings"
@@ -331,5 +332,151 @@ func TestOscillatingCountLeaksNothing(t *testing.T) {
 	}
 	if got := h.gate.releasedOf(w3.name); got != 0 {
 		t.Errorf("w3, never admitted, released %d times", got)
+	}
+}
+
+// admitIdle admits one runner with ModeQueued and waits until it is idle.
+func admitIdle(t *testing.T, h *gateHarness) string {
+	t.Helper()
+	desired(t, h.scaler, 1)
+	r := h.gate.next(t)
+	r.reply(h.gate.admitted(r.name, ModeQueued, 3), nil)
+	eventually(t, "the admitted runner is idle", func() bool { return stateOf(h.scaler, r.name) == stateIdle })
+	return r.name
+}
+
+func TestReleaseOnEveryPath(t *testing.T) {
+	// Every Release runs the harness's onRelease, which calls s.Held() and
+	// fails the test if that blocks: Release must run after unlocking.
+	t.Run("die event", func(t *testing.T) {
+		h := newGateHarness(t, NewSlots(4))
+		name := admitIdle(t, h)
+		h.scaler.Exited(name)
+		if got := h.gate.releasedOf(name); got != 1 {
+			t.Fatalf("released %d times, want 1", got)
+		}
+	})
+	t.Run("failed launch", func(t *testing.T) {
+		h := newGateHarness(t, NewSlots(4))
+		h.starter.err = errors.New("no such image")
+		desired(t, h.scaler, 1)
+		r := h.gate.next(t)
+		r.reply(h.gate.admitted(r.name, ModeQueued, 3), nil)
+		eventually(t, "the failed start released", func() bool { return len(h.scaler.Held()) == 0 })
+		if got := h.gate.releasedOf(r.name); got != 1 {
+			t.Fatalf("released %d times, want 1", got)
+		}
+	})
+	t.Run("reap", func(t *testing.T) {
+		h := newGateHarness(t, NewSlots(4))
+		name := admitIdle(t, h)
+		desired(t, h.scaler, 0)
+		if got := h.docker.removed(); !slices.Equal(got, []string{name}) {
+			t.Fatalf("removed %v, want [%s]", got, name)
+		}
+		if got := h.gate.releasedOf(name); got != 1 {
+			t.Fatalf("released %d times, want 1", got)
+		}
+	})
+	t.Run("reconcile", func(t *testing.T) {
+		h := newGateHarness(t, NewSlots(4))
+		name := admitIdle(t, h)
+		// Reconcile releases a held runner that is not Starting and whose
+		// container is gone.
+		if got, want := h.scaler.Held(), []HeldRunner{{Name: name}}; !slices.Equal(got, want) {
+			t.Fatalf("Held() = %v, want %v", got, want)
+		}
+		h.scaler.Exited(name)
+		if got := h.gate.releasedOf(name); got != 1 {
+			t.Fatalf("released %d times, want 1", got)
+		}
+	})
+	t.Run("drain removes a waiting runner", func(t *testing.T) {
+		h := newGateHarness(t, NewSlots(4))
+		desired(t, h.scaler, 1)
+		r := h.gate.next(t)
+		h.scaler.Drain()
+		h.scaler.Exited(r.name)
+		r.reply(h.gate.admitted(r.name, ModeQueued, 3), nil)
+		if !h.scaler.Join(2 * time.Second) {
+			t.Fatal("the waiter goroutine did not return")
+		}
+		if got := h.gate.releasedOf(r.name); got != 1 {
+			t.Fatalf("released %d times, want 1", got)
+		}
+		if got := h.scaler.slots.InUse(); got != 0 {
+			t.Fatalf("InUse %d, want 0", got)
+		}
+	})
+}
+
+func TestDrainCancelsWaitersPromptly(t *testing.T) {
+	h := newGateHarness(t, NewSlots(4))
+	desired(t, h.scaler, 3)
+	var reqs []*admitReq
+	for range 3 {
+		r := h.gate.next(t)
+		answerOnCancel(r)
+		reqs = append(reqs, r)
+	}
+	h.scaler.Drain()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(h.scaler.Held()) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("Held() = %v 5s after Drain, want empty", h.scaler.Held())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for _, r := range reqs {
+		if !ended(r.ctx) {
+			t.Fatalf("the Admit ctx of %s is live after Drain", r.name)
+		}
+	}
+}
+
+func TestAdmittedLaunchSurvivesDrain(t *testing.T) {
+	h := newGateHarness(t, NewSlots(4))
+	block := make(chan struct{})
+	h.starter.block = block
+	desired(t, h.scaler, 1)
+	r := h.gate.next(t)
+	r.reply(h.gate.admitted(r.name, ModeQueued, 3), nil)
+	eventually(t, "the start began", func() bool { return h.starter.ctxOf(r.name) != nil })
+
+	h.scaler.mu.Lock()
+	h.scaler.runners[r.name].cancel()
+	h.scaler.mu.Unlock()
+	h.scaler.Drain()
+	if err := h.starter.ctxOf(r.name).Err(); err != nil {
+		t.Fatalf("the start's ctx ended (%v) with the wait ctx and the drain", err)
+	}
+	close(block)
+	eventually(t, "the runner idle", func() bool { return stateOf(h.scaler, r.name) == stateIdle })
+}
+
+func TestJoinWaitsAbortDoesNot(t *testing.T) {
+	h := newGateHarness(t, NewSlots(4))
+	desired(t, h.scaler, 2)
+	for range 2 {
+		r := h.gate.next(t)
+		go func() {
+			<-r.ctx.Done()
+			time.Sleep(300 * time.Millisecond)
+			r.reply(Admitted{}, r.ctx.Err())
+		}()
+	}
+	start := time.Now()
+	h.scaler.Abort()
+	if d := time.Since(start); d > 50*time.Millisecond {
+		t.Fatalf("Abort took %v, want it to return at once", d)
+	}
+	if h.scaler.Join(10 * time.Millisecond) {
+		t.Fatal("Join(10ms) = true while both Admits wait 300ms")
+	}
+	if !h.scaler.Join(5 * time.Second) {
+		t.Fatal("Join(5s) = false")
+	}
+	if got := h.gate.returned.Load(); got != 2 {
+		t.Fatalf("%d Admit calls returned after Join, want 2", got)
 	}
 }
