@@ -188,7 +188,7 @@ func (g *Gate) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, 
 		}
 		// The runner's ctx first: a *SectionBusyError wraps the ctx's error.
 		if ctx.Err() != nil {
-			return runner.Admitted{}, ctx.Err()
+			return runner.Admitted{Release: noRelease}, ctx.Err()
 		}
 		var busy *coreslot.SectionBusyError
 		if !errors.As(err, &busy) || waitCtx.Err() != nil {
@@ -209,9 +209,9 @@ func (g *Gate) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, 
 	case err == nil && grant != nil: // whatever ctx is now: the caller releases it
 		return g.admitted(a.Runner, label, runner.ModeQueued, need, grant, g.since(ad)), nil
 	case errors.Is(err, coreslot.ErrCanceled):
-		return runner.Admitted{}, runner.ErrCancelledByBudget
+		return runner.Admitted{Release: noRelease}, runner.ErrCancelledByBudget
 	case ctx.Err() != nil:
-		return runner.Admitted{}, ctx.Err()
+		return runner.Admitted{Release: noRelease}, ctx.Err()
 	}
 	if err == nil {
 		err = errors.New("coreslot returned no grant")
@@ -274,8 +274,11 @@ func request(a runner.Admission, s Settings) (req coreslot.Request, label string
 		Need: map[string]coreslot.Range{"cpu": {Min: need, Max: need}}}, label, need
 }
 
+// noRelease is the Release of every result that holds no grant.
+func noRelease() {}
+
 func offAdmitted() runner.Admitted {
-	return runner.Admitted{Mode: runner.ModeOff, Release: func() {}}
+	return runner.Admitted{Mode: runner.ModeOff, Release: noRelease}
 }
 
 // failClass is the class a fail open logs: wedged when the wedge ended the call, else by error.
@@ -361,14 +364,16 @@ func (g *Gate) admitted(name, label string, mode runner.Mode, need int, grant *c
 // failOpen admits the runner without a grant. The library's reason goes to a debug line only.
 func (g *Gate) failOpen(name, label string, need int, wait time.Duration, class string, err error) runner.Admitted {
 	if class == "state" {
+		// The budget is unusable as opened (its state directory removed, for one): the next call
+		// opens coreslot again, which recreates a missing directory.
 		g.mu.Lock()
-		g.stateErr = true
+		g.stateErr, g.cl = true, nil
 		g.mu.Unlock()
 	}
 	g.log.Debug("budget call failed", slog.String("runner", name), slog.String("class", class),
 		slog.String("error", err.Error()))
 	g.logAdmitted(slog.LevelWarn, name, label, runner.ModeFailOpen, need, 0, 0, wait, class)
-	return runner.Admitted{Mode: runner.ModeFailOpen, Release: func() {}, Need: need}
+	return runner.Admitted{Mode: runner.ModeFailOpen, Release: noRelease, Need: need}
 }
 
 func (g *Gate) logAdmitted(level slog.Level, name, label string, mode runner.Mode, need, granted, shortfall int,

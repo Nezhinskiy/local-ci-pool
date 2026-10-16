@@ -49,6 +49,16 @@ func waitResult(t *testing.T, ch <-chan admitResult) admitResult {
 
 func alpha(name string) runner.Admission { return runner.Admission{Runner: name, Project: "alpha"} }
 
+// checkReleasable fails the test unless ad's Release is callable, as the seam promises on every
+// result, an error's included.
+func checkReleasable(t *testing.T, ad runner.Admitted) {
+	t.Helper()
+	if ad.Release == nil {
+		t.Fatalf("Admitted %+v has a nil Release", ad)
+	}
+	ad.Release()
+}
+
 // waitTickets waits until dir's live alpha:ci tickets need exactly want.
 func waitTickets(t *testing.T, dir string, want ...int) {
 	t.Helper()
@@ -145,6 +155,7 @@ func TestAdmitGiveUpRace(t *testing.T) {
 		if !errors.Is(r.err, context.Canceled) {
 			t.Fatalf("Admit = %+v, %v; want context.Canceled", r.ad, r.err)
 		}
+		checkReleasable(t, r.ad)
 		rep := snapshot(t, dir)
 		if live := liveTickets(rep, "alpha:ci"); len(live) != 0 {
 			t.Fatalf("live alpha:ci tickets after the give-up: %v", live)
@@ -195,17 +206,21 @@ func TestAdmitCancelledByBudget(t *testing.T) {
 	if !errors.Is(r.err, runner.ErrCancelledByBudget) {
 		t.Fatalf("Admit = %+v, %v; want ErrCancelledByBudget", r.ad, r.err)
 	}
+	checkReleasable(t, r.ad)
 }
 
 func TestAdmitStateDirRemovedFailsOpen(t *testing.T) {
 	t.Parallel()
 	dir := stateDir(t, cpu4)
 	h := newGate(t, dir, on3)
-	hold(t, dir, "holder:x", 4)
+	holder := hold(t, dir, "holder:x", 4)
 	ch := admitAsync(context.Background(), h, alpha("r1"))
 	waitTickets(t, dir, 3)
 
-	if err := os.RemoveAll(dir); err != nil {
+	// Renamed away in one step, the directory is missing at once to every client; removing it
+	// in place would race the waiting ticket's own refreshes.
+	removed := filepath.Join(filepath.Dir(dir), "removed")
+	if err := os.Rename(dir, removed); err != nil {
 		t.Fatal(err)
 	}
 	r := waitResult(t, ch)
@@ -214,6 +229,23 @@ func TestAdmitStateDirRemovedFailsOpen(t *testing.T) {
 	}
 	if got := h.g.State().Error; got != "state" {
 		t.Fatalf("State().Error = %q; want state", got)
+	}
+	holder.Close() // a *StateError: its hold is no longer at its path
+	if err := os.RemoveAll(removed); err != nil {
+		t.Fatal(err)
+	}
+
+	// The next Admit opens coreslot again, which recreates the directory with the defaults.
+	ad, err := h.g.Admit(context.Background(), alpha("r2"))
+	if err != nil || ad.Mode != runner.ModeQueued {
+		t.Fatalf("Admit after the removal = %+v, %v; want queued", ad, err)
+	}
+	ad.Release()
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		t.Fatalf("the state directory was not recreated: %v", err)
+	}
+	if got := h.g.State().Error; got != "" {
+		t.Fatalf("State().Error = %q after a queued admission; want none", got)
 	}
 }
 
@@ -363,10 +395,11 @@ func TestSectionBusyWrappingCanceledIsNotRetried(t *testing.T) {
 	time.AfterFunc(50*time.Millisecond, cancel)
 
 	start := time.Now()
-	_, err := h.g.Admit(ctx, alpha("r1"))
+	ad, err := h.g.Admit(ctx, alpha("r1"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Admit error = %v; want context.Canceled", err)
 	}
+	checkReleasable(t, ad)
 	if d := time.Since(start); d > time.Second {
 		t.Fatalf("Admit returned after %v; want within 1 s", d)
 	}
