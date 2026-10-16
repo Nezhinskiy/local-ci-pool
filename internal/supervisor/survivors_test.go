@@ -87,9 +87,10 @@ func TestReconcileSparesAndReleasesSurvivors(t *testing.T) {
 	}
 	h.docker.vanish(survivorA)
 	h.eventually("the vanished survivor's slot released", func() bool { return h.sup.Snapshot().InUse == 0 })
-	if !h.logged("gone without an exit event; releasing its slot") {
-		t.Error("the release is not logged")
-	}
+	// The reconcile logs the release after it gave the slot back.
+	h.eventually("the release logged", func() bool {
+		return h.logged("a runner left from the previous run is gone without an exit event; releasing its slot")
+	})
 }
 
 // More survivors than slots: each is kept, a slot is held for as many as fit,
