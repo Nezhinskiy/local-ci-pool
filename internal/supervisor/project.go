@@ -544,9 +544,10 @@ func (pr *project) claimRefresh() bool {
 // the session and deletes the scale set, retrying a delete refused while a
 // job still runs until the deadline. Everything after the wait shares one
 // budget, afterBound past the later of now and the deadline, so a stop never
-// outlasts the drain bound by more than that. At the bound the runners left
-// are removed and an in-flight start or reap is aborted. It reports false if
-// life ended first, leaving the session to Run.
+// outlasts the drain bound by more than that. At the bound an in-flight start
+// or reap is aborted, the waiter goroutines are joined within that budget, and
+// the runners left are removed. It reports false if life ended first, leaving
+// the session to Run.
 func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	clock := pr.s.deps.Clock
 	pr.mu.Lock()
@@ -574,10 +575,14 @@ func (pr *project) drain(life context.Context, deadline time.Time) bool {
 		case <-clock.After(drainPoll):
 		}
 	}
-	post, cancel := context.WithTimeout(context.Background(), afterBound+max(deadline.Sub(clock.Now()), 0))
+	budget := afterBound + max(deadline.Sub(clock.Now()), 0)
+	postEnd := clock.Now().Add(budget)
+	post, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	if sc := pr.getScaler(); sc != nil && len(sc.Held()) > 0 {
-		pr.stopWaiters(sc, joinBound)
+		// The join is part of the work after the bound: what is left of
+		// post's budget, and never more than joinBound.
+		pr.stopWaiters(sc, min(joinBound, max(postEnd.Sub(clock.Now()), 0)))
 	}
 	pr.cancel()
 	select {

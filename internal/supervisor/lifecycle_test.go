@@ -354,3 +354,34 @@ func TestFatalStopSkipsAProjectWithoutAScaler(t *testing.T) {
 		t.Fatalf("Run returned %v, want boom", err)
 	}
 }
+
+// A waiter whose Admit ignores its context is joined within what is left of
+// the work after the drain bound (afterBound), not for the whole join bound:
+// the stop ends within afterBound.
+func TestDrainJoinSharesTheBudgetAfterTheBound(t *testing.T) {
+	old := afterBound
+	afterBound = 500 * time.Millisecond
+	t.Cleanup(func() { afterBound = old })
+	h := newHarness(t, 2, 1000, "alpha")
+	h.cfg.Drain = time.Minute // 60 ms
+	b := newFakeBudget(true)
+	answer := make(chan struct{})
+	t.Cleanup(func() { close(answer) })
+	b.admit = func(_ context.Context, a runner.Admission) (runner.Admitted, error) {
+		<-answer
+		return b.grant(a.Runner, runner.ModeQueued, 2), nil
+	}
+	h.budget = b
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.actions.Assign(alphaSet, 1)
+	h.eventually("a runner waiting", func() bool { return len(b.admitted()) == 1 })
+	began := time.Now()
+	h.cancel()
+	if err := h.wait(2 * joinBound); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(began); took > 3*time.Second {
+		t.Fatalf("the stop took %v, want about the drain bound plus afterBound, not the join bound %v", took, joinBound)
+	}
+}
