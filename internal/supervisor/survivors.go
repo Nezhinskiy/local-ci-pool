@@ -36,7 +36,7 @@ type survivor struct {
 	project string      // its project label; empty for a runner of an older pool
 	need    int         // its need label as a number, else 0; the gate takes a need outside 1..256 as its cpu
 	mode    runner.Mode // set by its adoption
-	release func()      // set by its adoption; nil before
+	release func()      // its adoption's Release; runner.NoRelease before
 }
 
 // sweep removes the containers a previous run of this instance left that are
@@ -112,7 +112,7 @@ func (s *Supervisor) keepSurvivor(name, project string, need int) bool {
 		return false
 	}
 	held := s.slots.TryAcquire()
-	s.survivors[name] = &survivor{held: held, project: project, need: need}
+	s.survivors[name] = &survivor{held: held, project: project, need: need, release: runner.NoRelease}
 	s.mu.Unlock()
 	if held {
 		s.log.Info("left a runner of the previous run running to finish its job; it holds a slot until it exits", "runner", name)
@@ -152,33 +152,38 @@ func (s *Supervisor) adoptSurvivors(ctx context.Context, names []string) {
 			continue
 		}
 		s.mu.Unlock()
-		if adm.Release != nil {
-			adm.Release()
-		}
+		adm.Release()
 	}
 }
 
-// releaseSurvivor forgets a survivor, gives back the slot held for it, if
-// any, and releases its adoption, after unlocking. It reports whether name
-// was a survivor; a second call for the same name does nothing, so a replayed
-// die event and a reconcile never release twice.
+// releaseSurvivor forgets a survivor (forgetSurvivorLocked) and releases its
+// adoption after unlocking. It reports whether name was a survivor; a second
+// call for the same name does nothing, so a replayed die event and a reconcile
+// never release twice.
 func (s *Supervisor) releaseSurvivor(name string) bool {
 	s.mu.Lock()
-	e, ok := s.survivors[name]
-	delete(s.survivors, name)
-	var release func()
-	if ok {
-		release, e.release = e.release, nil
-	}
-	slots := s.slots
+	release, ok := s.forgetSurvivorLocked(name)
 	s.mu.Unlock()
-	if ok && e.held {
-		slots.Release()
-	}
-	if release != nil {
-		release()
-	}
+	release()
 	return ok
+}
+
+// forgetSurvivorLocked forgets a survivor: it deletes its entry, gives back
+// the slot held for it, if any, and detaches its adoption. It returns the
+// adoption's Release, which the caller calls after unlocking, never under
+// s.mu, and whether name was a survivor; for a name that was not, the Release
+// is runner.NoRelease. s.mu is held.
+func (s *Supervisor) forgetSurvivorLocked(name string) (release func(), ok bool) {
+	e, ok := s.survivors[name]
+	if !ok {
+		return runner.NoRelease, false
+	}
+	delete(s.survivors, name)
+	if e.held {
+		s.slots.Release()
+	}
+	release, e.release = e.release, runner.NoRelease
+	return release, true
 }
 
 // survivorCountsLocked counts the survivors admitted into the budget, by the

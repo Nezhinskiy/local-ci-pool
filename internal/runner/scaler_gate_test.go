@@ -378,11 +378,11 @@ func TestReleaseOnEveryPath(t *testing.T) {
 			t.Fatalf("released %d times, want 1", got)
 		}
 	})
-	t.Run("reconcile", func(t *testing.T) {
+	t.Run("an admitted idle runner is held as not starting", func(t *testing.T) {
 		h := newGateHarness(t, NewSlots(4))
 		name := admitIdle(t, h)
-		// Reconcile releases a held runner that is not Starting and whose
-		// container is gone.
+		// The supervisor's reconcile releases, through Exited, a held runner
+		// that is not Starting and whose container is gone.
 		if got, want := h.scaler.Held(), []HeldRunner{{Name: name}}; !slices.Equal(got, want) {
 			t.Fatalf("Held() = %v, want %v", got, want)
 		}

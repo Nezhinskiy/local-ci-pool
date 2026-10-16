@@ -104,14 +104,15 @@ type record struct {
 	// cancel ends a waiting runner's Admit; nil for a runner started without
 	// the gate.
 	cancel context.CancelFunc
-	// adm is what the gate gave; its Release is nil until then.
+	// adm is what the gate gave; its Release is NoRelease until then.
 	adm Admitted
 }
 
 // Scaler keeps one scale set's runners. Every runner it knows holds one slot,
-// given back exactly once, when the runner is forgotten: by release (Exited, a
-// failed start, a reaped runner, an Admit error), or by admit, for a runner
-// given up while it waited whose Admit then returned.
+// given back exactly once, when forgetLocked forgets the runner: through
+// release (Exited, a failed start, a reaped runner, an Admit error), or
+// through admit, for a runner given up while it waited whose Admit then
+// returned a grant. The runner's grant is released after unlocking.
 type Scaler struct {
 	scaleSetID int
 	slots      *Slots
@@ -182,18 +183,19 @@ func (s *Scaler) activeLocked() int {
 	return s.countLocked(stateWaiting, stateStarting, stateIdle, stateBusy)
 }
 
-// Desired brings the scale set towards count runners. While draining it starts
-// nothing. Otherwise it starts runners until idle plus busy reaches
-// min(slots, count) or no slot is free, and removes idle runners that exceed
-// count. It never waits for a slot: a count the global limit blocks is retried
-// on the listener's next call. A start that fails ends this call's starts and
-// is retried on the next. It returns the number of waiting, starting, idle and
-// busy runners, and never an error.
+// Desired brings the scale set towards count runners. While draining it adds
+// none. Otherwise it adds runners, each taking a slot, until the waiting,
+// starting, idle and busy ones reach min(slots, count) or no slot is free, and
+// then removes those beyond count: waiting runners first, newest first, then
+// idle ones. It never waits for a slot: a count the global limit blocks is
+// retried on the listener's next call. It returns the number of waiting,
+// starting, idle and busy runners, and never an error.
 //
-// When the gate is enabled, a new runner is recorded waiting instead, and its
-// own waiter goroutine admits it through the gate and then starts it; Desired
-// never waits on the gate. Waiting runners are part of the excess, and are
-// given up, newest first, before idle runners are removed.
+// With the gate off (nil, or not Enabled), Desired starts each new runner
+// itself; a start that fails ends this call's starts and is retried on the
+// next. With the gate enabled, each new runner is recorded waiting, and its own
+// waiter goroutine admits it through the gate and then starts it; Desired never
+// waits on the gate.
 func (s *Scaler) Desired(ctx context.Context, count int) (int, error) {
 	count = max(count, 0)
 	// Enabled reads the gate's settings: once per call, never under s.mu.
@@ -230,7 +232,7 @@ func (s *Scaler) reserve(ctx context.Context, count int) (string, bool) {
 	defer s.mu.Unlock()
 	name, ok := s.reserveLocked(ctx, count)
 	if ok {
-		s.runners[name] = &record{state: stateStarting, seq: s.nextSeqLocked()}
+		s.runners[name] = &record{state: stateStarting, seq: s.nextSeqLocked(), adm: Admitted{Release: NoRelease}}
 	}
 	return name, ok
 }
@@ -245,7 +247,8 @@ func (s *Scaler) queue(ctx context.Context, count int) bool {
 		return false
 	}
 	waitCtx, cancel := context.WithCancel(s.abort)
-	s.runners[name] = &record{state: stateWaiting, seq: s.nextSeqLocked(), cancel: cancel}
+	s.runners[name] = &record{state: stateWaiting, seq: s.nextSeqLocked(), cancel: cancel,
+		adm: Admitted{Release: NoRelease}}
 	s.wg.Add(1)
 	go s.admit(waitCtx, cancel, name)
 	return true
@@ -282,10 +285,10 @@ func (s *Scaler) nextSeqLocked() uint64 {
 
 // admit is a waiting runner's goroutine. It asks the gate to admit the runner
 // and, if the runner is still waiting and the scaler is not draining, starts
-// it with the need the gate admitted. A runner given up meanwhile is dropped
-// and its grant released; one already released through Exited has no slot
-// left to free. An Admit error gives the runner up, which is never a no-job
-// exit and never starts it.
+// it with the need the gate admitted. A runner given up meanwhile is forgotten
+// and its grant released; one already released through Exited is not held
+// any more, and only its grant is released. An Admit error gives the runner
+// up, which is never a no-job exit and never starts it.
 func (s *Scaler) admit(ctx context.Context, cancel context.CancelFunc, name string) {
 	defer s.wg.Done()
 	defer cancel()
@@ -300,9 +303,7 @@ func (s *Scaler) admit(ctx context.Context, cancel context.CancelFunc, name stri
 		return
 	}
 	s.mu.Lock()
-	r, ok := s.runners[name]
-	switch {
-	case ok && r.state == stateWaiting && !s.draining:
+	if r, ok := s.runners[name]; ok && r.state == stateWaiting && !s.draining {
 		r.state = stateStarting
 		r.adm = adm
 		s.mu.Unlock()
@@ -311,14 +312,11 @@ func (s *Scaler) admit(ctx context.Context, cancel context.CancelFunc, name stri
 		// that already began finish.
 		s.launch(context.Background(), name, adm.Need)
 		return
-	case ok:
-		delete(s.runners, name)
-		s.slots.Release()
 	}
+	forget, _ := s.forgetLocked(name)
 	s.mu.Unlock()
-	if adm.Release != nil {
-		adm.Release()
-	}
+	forget()
+	adm.Release()
 }
 
 // launch mints the runner's JIT configuration and starts its container,
@@ -413,29 +411,17 @@ func (s *Scaler) unregister(ctx context.Context, name string) error {
 }
 
 // reap gives up waiting runners and removes idle runners beyond count. Waiting
-// runners go first, newest first: each is marked cancelled and its Admit's ctx
-// ended, and its waiter goroutine frees its slot. An idle runner may already
-// be running a job, because JobStarted reaches the listener late, so each one is
-// unregistered on GitHub first: GitHub refuses that for a runner with a job,
-// and the runner is then kept and marked busy. Only an unregistered runner's
-// container is removed. A removed container is gone, so its slot is released
-// at once; its die event then finds nothing to release. Any other failure
-// leaves the runner idle for the next call.
+// runners go first, newest first (giveUpWaitingLocked). An idle runner may
+// already be running a job, because JobStarted reaches the listener late, so
+// each one is unregistered on GitHub first: GitHub refuses that for a runner
+// with a job, and the runner is then kept and marked busy. Only an
+// unregistered runner's container is removed. A removed container is gone, so
+// its slot is released at once; its die event then finds nothing to release.
+// Any other failure leaves the runner idle for the next call.
 func (s *Scaler) reap(ctx context.Context, count int) {
 	s.mu.Lock()
 	excess := min(s.countLocked(stateWaiting, stateStarting, stateIdle), s.activeLocked()-count)
-	var waiting []*record
-	for _, r := range s.runners {
-		if r.state == stateWaiting {
-			waiting = append(waiting, r)
-		}
-	}
-	slices.SortFunc(waiting, func(a, b *record) int { return cmp.Compare(b.seq, a.seq) })
-	for _, r := range waiting[:min(max(excess, 0), len(waiting))] {
-		r.state = stateCancelled
-		r.cancel()
-		excess--
-	}
+	excess -= s.giveUpWaitingLocked(excess)
 	var victims []string
 	for name, r := range s.runners {
 		if len(victims) >= excess {
@@ -476,6 +462,25 @@ func (s *Scaler) reapOne(ctx context.Context, name string) {
 	}
 	s.log.Info("idle runner removed", slog.String("runner", name))
 	s.release(name, false)
+}
+
+// giveUpWaitingLocked gives up to n waiting runners up, newest first: each is
+// marked cancelled and its Admit's ctx ended, and its waiter goroutine forgets
+// it once Admit returns. It returns how many it gave up. s.mu is held.
+func (s *Scaler) giveUpWaitingLocked(n int) int {
+	var waiting []*record
+	for _, r := range s.runners {
+		if r.state == stateWaiting {
+			waiting = append(waiting, r)
+		}
+	}
+	slices.SortFunc(waiting, func(a, b *record) int { return cmp.Compare(b.seq, a.seq) })
+	waiting = waiting[:min(max(n, 0), len(waiting))]
+	for _, r := range waiting {
+		r.state = stateCancelled
+		r.cancel()
+	}
+	return len(waiting)
 }
 
 // bounded limits ctx to d and to Abort.
@@ -556,34 +561,42 @@ func (s *Scaler) Completed(name string) {
 // towards NoJobExits.
 func (s *Scaler) Exited(name string) { s.release(name, false) }
 
-// release forgets a runner and gives its slot back. The runner counts towards
-// NoJobExits if it was idle (started, no job reported) or if failedStart says
-// it was registered and could not start. A waiting runner's Admit is ended.
-// The runner's grant is detached under s.mu and released after unlocking.
+// release forgets a runner (forgetLocked) and releases its grant after
+// unlocking. The runner counts towards NoJobExits if it was idle (started, no
+// job reported) or if failedStart says it was registered and could not start.
 func (s *Scaler) release(name string, failedStart bool) {
 	s.mu.Lock()
-	r, ok := s.runners[name]
+	if r, ok := s.runners[name]; ok && (r.state == stateIdle || failedStart) && !s.draining {
+		s.noJob++
+	}
+	forget, ok := s.forgetLocked(name)
+	s.mu.Unlock()
 	if !ok {
-		s.mu.Unlock()
 		s.log.Debug("exit of a runner this scaler does not hold", slog.String("runner", name))
 		return
+	}
+	forget()
+}
+
+// forgetLocked is the one place the scaler forgets a runner: it deletes its
+// record, gives its slot back (and its busy mark), ends a waiting runner's
+// Admit, and detaches its grant. It returns the grant's Release, which the
+// caller calls after unlocking, never under s.mu, and whether the scaler held
+// name; for a name it does not hold, the Release is NoRelease. s.mu is held.
+func (s *Scaler) forgetLocked(name string) (release func(), ok bool) {
+	r, ok := s.runners[name]
+	if !ok {
+		return NoRelease, false
 	}
 	delete(s.runners, name)
 	if r.state == stateBusy {
 		s.slots.SetBusy(-1)
 	}
-	if (r.state == stateIdle || failedStart) && !s.draining {
-		s.noJob++
-	}
 	s.slots.Release()
-	if r.state == stateWaiting && r.cancel != nil {
+	if r.state == stateWaiting {
 		r.cancel()
 	}
-	adm := r.adm
-	s.mu.Unlock()
-	if adm.Release != nil {
-		adm.Release()
-	}
+	return r.adm.Release, true
 }
 
 // NoJobExits is the number of runners in a row that went away without
@@ -642,12 +655,7 @@ func (s *Scaler) Drain() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.draining = true
-	for _, r := range s.runners {
-		if r.state == stateWaiting {
-			r.state = stateCancelled
-			r.cancel()
-		}
-	}
+	s.giveUpWaitingLocked(len(s.runners))
 }
 
 // SetScaleSetID points the scaler at a scale set recreated under a new ID;

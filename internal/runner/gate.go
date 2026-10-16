@@ -34,6 +34,9 @@ type Admitted struct {
 	Need    int
 }
 
+// NoRelease is the Release of an admission that holds nothing.
+func NoRelease() {}
+
 // Gate admits runners into a machine-wide budget. Enabled reports whether the next runner
 // goes through Admit. Admit blocks until the runner may start; it returns an error only when
 // ctx ended or the request was cancelled through coreslot (ErrCancelledByBudget); any other

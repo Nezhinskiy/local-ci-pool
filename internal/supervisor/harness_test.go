@@ -559,16 +559,17 @@ func (c *fakeCaffeinate) state() (starts, stops int, running bool) {
 // fakeBudget is a budget gate the test scripts. Admit and Adopt call the
 // test's functions when set; by default Admit admits at once (queued, need 2)
 // and Adopt adopts with the need asked. Every Release it hands out counts its
-// calls by runner name.
+// calls by runner name, then runs onRelease, which the harness sets.
 type fakeBudget struct {
-	mu       sync.Mutex
-	enabled  bool
-	state    budget.State
-	admit    func(ctx context.Context, a runner.Admission) (runner.Admitted, error)
-	adopt    func(ctx context.Context, a runner.Admission) runner.Admitted
-	admits   []runner.Admission
-	adopts   []runner.Admission
-	released map[string]int
+	mu        sync.Mutex
+	enabled   bool
+	state     budget.State
+	admit     func(ctx context.Context, a runner.Admission) (runner.Admitted, error)
+	adopt     func(ctx context.Context, a runner.Admission) runner.Admitted
+	admits    []runner.Admission
+	adopts    []runner.Admission
+	released  map[string]int
+	onRelease func(name string)
 }
 
 func newFakeBudget(enabled bool) *fakeBudget {
@@ -613,8 +614,12 @@ func (b *fakeBudget) Adopt(ctx context.Context, a runner.Admission) runner.Admit
 func (b *fakeBudget) grant(name string, mode runner.Mode, need int) runner.Admitted {
 	return runner.Admitted{Mode: mode, Need: need, Release: func() {
 		b.mu.Lock()
-		defer b.mu.Unlock()
 		b.released[name]++
+		on := b.onRelease
+		b.mu.Unlock()
+		if on != nil {
+			on(name)
+		}
 	}}
 }
 
@@ -832,10 +837,30 @@ func (h *harness) deps() Deps {
 func (h *harness) start() {
 	h.t.Helper()
 	h.sup = New(h.cfg, h.deps())
+	if b, ok := h.budget.(*fakeBudget); ok && b != nil {
+		b.mu.Lock()
+		b.onRelease = h.releasedOutsideLock
+		b.mu.Unlock()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
 	h.done = make(chan error, 1)
 	go func() { h.done <- h.sup.Run(ctx) }()
+}
+
+// releasedOutsideLock fails the test if a Release ran under the supervisor's
+// lock: it takes that lock on another goroutine, which then blocks.
+func (h *harness) releasedOutsideLock(name string) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.sup.survivorNames()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		h.t.Errorf("Release of %s ran under the supervisor's lock: its lock blocked for 2s", name)
+	}
 }
 
 // wait returns Run's result, failing the test if it does not return in time.

@@ -163,7 +163,7 @@ func (g *Gate) State() State {
 // admission for a runner that does not start.
 func (g *Gate) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, error) {
 	if err := ctx.Err(); err != nil {
-		return runner.Admitted{Release: noRelease}, err
+		return runner.Admitted{Release: runner.NoRelease}, err
 	}
 	s, _ := g.settings.Load()
 	if !s.Enabled {
@@ -172,7 +172,7 @@ func (g *Gate) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, 
 	req, label, need := request(a, s)
 	failOpen := func(wait time.Duration, class string, err error) (runner.Admitted, error) {
 		if ctx.Err() != nil {
-			return runner.Admitted{Release: noRelease}, ctx.Err()
+			return runner.Admitted{Release: runner.NoRelease}, ctx.Err()
 		}
 		return g.failOpen(a.Runner, label, need, wait, class, err), nil
 	}
@@ -201,7 +201,7 @@ func (g *Gate) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, 
 		}
 		// The runner's ctx first: a *SectionBusyError wraps the ctx's error.
 		if ctx.Err() != nil {
-			return runner.Admitted{Release: noRelease}, ctx.Err()
+			return runner.Admitted{Release: runner.NoRelease}, ctx.Err()
 		}
 		var busy *coreslot.SectionBusyError
 		if !errors.As(err, &busy) || waitCtx.Err() != nil {
@@ -222,9 +222,9 @@ func (g *Gate) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, 
 	case err == nil && grant != nil: // whatever ctx is now: the caller releases it
 		return g.admitted(a.Runner, label, runner.ModeQueued, need, grant, g.since(ad)), nil
 	case errors.Is(err, coreslot.ErrCanceled):
-		return runner.Admitted{Release: noRelease}, runner.ErrCancelledByBudget
+		return runner.Admitted{Release: runner.NoRelease}, runner.ErrCancelledByBudget
 	case ctx.Err() != nil:
-		return runner.Admitted{Release: noRelease}, ctx.Err()
+		return runner.Admitted{Release: runner.NoRelease}, ctx.Err()
 	}
 	if err == nil {
 		err = errors.New("coreslot returned no grant")
@@ -245,7 +245,7 @@ func (g *Gate) Adopt(ctx context.Context, a runner.Admission) runner.Admitted {
 		if cerr := ctx.Err(); cerr != nil {
 			g.log.Debug("budget adoption given up", slog.String("runner", a.Runner),
 				slog.String("error", cerr.Error()))
-			return runner.Admitted{Mode: runner.ModeFailOpen, Release: noRelease, Need: need}
+			return runner.Admitted{Mode: runner.ModeFailOpen, Release: runner.NoRelease, Need: need}
 		}
 		return g.failOpen(a.Runner, label, need, 0, class, err)
 	}
@@ -296,11 +296,8 @@ func request(a runner.Admission, s Settings) (req coreslot.Request, label string
 		Need: map[string]coreslot.Range{"cpu": {Min: need, Max: need}}}, label, need
 }
 
-// noRelease is the Release of every result that holds no grant.
-func noRelease() {}
-
 func offAdmitted() runner.Admitted {
-	return runner.Admitted{Mode: runner.ModeOff, Release: noRelease}
+	return runner.Admitted{Mode: runner.ModeOff, Release: runner.NoRelease}
 }
 
 // failClass is the class a fail open logs: wedged when the wedge ended the call, else by error.
@@ -403,7 +400,7 @@ func (g *Gate) failOpen(name, label string, need int, wait time.Duration, class 
 	g.log.Debug("budget call failed", slog.String("runner", name), slog.String("class", class),
 		slog.String("error", err.Error()))
 	g.logAdmitted(slog.LevelWarn, name, label, runner.ModeFailOpen, need, 0, 0, wait, class)
-	return runner.Admitted{Mode: runner.ModeFailOpen, Release: noRelease, Need: need}
+	return runner.Admitted{Mode: runner.ModeFailOpen, Release: runner.NoRelease, Need: need}
 }
 
 func (g *Gate) logAdmitted(level slog.Level, name, label string, mode runner.Mode, need, granted, shortfall int,
