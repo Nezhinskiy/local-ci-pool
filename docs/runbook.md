@@ -61,12 +61,16 @@ Run `./install.sh --dry-run` first if you want to see what it would do. The inst
    new pool can bind it;
 6. renames the staged files into place (`~/Library/Application Support/local-ci-pool/bin/pool` and
    `~/Library/LaunchAgents/com.local-ci-pool.pool.plist`);
-7. runs `launchctl bootstrap` (retried a few times) and waits until `/healthz` reports the version it
+7. with `--budget-cpu N`, creates the budget settings file when the pool would read none, and
+   otherwise names the one it reads (see [the budget settings](#the-budget-settings));
+8. runs `launchctl bootstrap` (retried a few times) and waits until `/healthz` reports the version it
    just installed. If an older version answers, or the new pool logged `terminal:` (for example
    `already running`), it prints a `WARNING`, restarts the agent once with
    `launchctl kickstart -k gui/$UID/com.local-ci-pool.pool`, and fails if that did not help. A first
    start downloads the runner and builds images, so a pool that has not answered within a minute is
-   only reported, not treated as a failure.
+   only reported, not treated as a failure. Once the new pool answers, the installer checks that it
+   applies the budget settings, and warns when it does not (see
+   [the budget settings](#the-budget-settings)).
 
 The pool writes no configuration. `config.toml` is yours; the installer creates it only when asked.
 The pool keeps derived state only: its git mirrors under
@@ -260,7 +264,8 @@ with its shell's `XDG_CONFIG_HOME`. `pool.log` logs `budget settings` with the `
 again whenever the resolution changes; `/healthz` never shows the path.
 
 **Keys.** One table, `[budget]`, with exactly two keys. Key names are case-sensitive: `CPU = 2` is an
-unknown key, and makes the file invalid. Keys in other tables are ignored.
+unknown key, and makes the file invalid. So does a table spelled `[Budget]`, or `budget` in any
+other case. Keys in other tables are ignored.
 
 | Key | Value |
 |---|---|
@@ -291,7 +296,11 @@ path the pool does not read, or a release before the budget, which ignores the f
 **Edits apply without a restart.** The pool reads the file on every decision, with no cache. A new
 `cpu` applies to the next runner; a runner already waiting keeps its place in the queue and the
 need it asked for. Turning the budget on or off applies to the next runner; nothing waiting or
-running is cancelled.
+running is cancelled. Since the pool may read the file at any moment, save it by replacing it in
+one step: write a temporary file in the same directory, then rename it over `config.toml`. A
+half-written file is read as it is, which can make it invalid, turn the budget off or ask a
+truncated `cpu`, and a file briefly absent turns the budget off and forgets the last valid
+settings.
 
 **An invalid file** is one that is not a regular file (a directory, a FIFO), is larger than 64 KiB,
 cannot be read, has more than 64 dots, braces and brackets outside its comments and strings (a
@@ -315,13 +324,14 @@ descriptors and unsets the grant's variables (`CORESLOT_HELD_FD`, `CORESLOT_TOKE
 `CORESLOT_UNBUDGETED` and every `CORESLOT_GRANTED_*`), then queues as itself.
 
 **Survivors.** A job container the previous pool left running (see
-[launchd's 60-second limit](#launchds-60-second-limit)) carries its project and its need as labels.
+[launchd's 60-second limit](#launchds-60-second-limit)) carries its project as a label, and its need
+as another when the budget admitted it (in any mode but `off`).
 With the budget on, the new pool takes a hold in the budget for each one shortly after it starts,
 and `pool.log` logs `runner admitted` with `mode=adopted`. A survivor that does not fit is not
 stopped, since a running job cannot be paused: `pool.log` warns `survivor oversubscribed` with the
 shortfall, and the hold is kept. A survivor of a release before the budget carries no project or need
-label and is adopted as `local-ci-pool:ci` with the configured `cpu`. From the old pool's exit until the
-adoption, survivors run outside the budget.
+label and is adopted as `local-ci-pool:ci` with the configured `cpu`; in `/healthz` it counts under no
+project's `admitted`. From the old pool's exit until the adoption, survivors run outside the budget.
 
 **Rolling back.** Set `enabled = false`, or delete the file: the next runner starts without the
 budget, with no restart. To leave the feature entirely, install the release before it with

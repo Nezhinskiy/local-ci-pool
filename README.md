@@ -110,8 +110,11 @@ With the core budget on, each CI job waits for its cores in the machine-wide
 share, so CI and local work no longer oversubscribe the Mac. Nothing changes until you create the
 settings file.
 
-The file is `~/.config/local-ci-pool/config.toml` (a pool started by hand from a shell that sets
-`XDG_CONFIG_HOME` reads `$XDG_CONFIG_HOME/local-ci-pool/config.toml` instead). It has two keys:
+The file is `~/.config/local-ci-pool/config.toml`; when only
+`~/Library/Application Support/local-ci-pool/config.toml` exists, the pool reads that one. A pool
+started by hand from a shell whose `XDG_CONFIG_HOME` is an absolute path looks in
+`$XDG_CONFIG_HOME/local-ci-pool/` instead of `~/.config/local-ci-pool/`; the runbook has
+[the exact rule](docs/runbook.md#the-budget-settings). It has two keys:
 
 ```toml
 [budget]
