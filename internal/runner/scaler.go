@@ -36,6 +36,17 @@ var (
 	forgetTimeout = 30 * time.Second
 )
 
+// dipGrace is how long the assigned jobs must stay below the waiting runners
+// before Desired gives those runners up. GitHub completes an assigned job
+// request that no runner acquired 5 minutes after the assignment (result
+// canceled, no runner) and reissues it at once: the count dips for about 0.3 s
+// and comes back. A waiter given up on the dip loses its place in the budget's
+// queue, and the reissued job queues a fresh one at its tail. 30 s is a
+// hundred times the dip measured; the listener calls Desired on every message
+// and after every empty long poll (about 50 s), so a lasting drop gives the
+// waiters up within dipGrace and one poll.
+const dipGrace = 30 * time.Second
+
 // JITSource mints a runner's JIT configuration. *scaleset.Client satisfies it.
 type JITSource interface {
 	GenerateJitRunnerConfig(ctx context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, scaleSetID int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
@@ -77,6 +88,9 @@ type ScalerConfig struct {
 	// this Scaler takes them, so Desired subtracts them from the count. Nil
 	// means none.
 	Survivors func() int
+	// Now is the clock that times a dip of the assigned jobs (dipGrace). Nil
+	// is time.Now.
+	Now func() time.Time
 }
 
 type runnerState int
@@ -129,6 +143,7 @@ type Scaler struct {
 	gate       Gate
 	project    string
 	survivors  func() int
+	now        func() time.Time
 	names      func() (string, error)
 
 	// abort ends every launch, reap and Admit in flight; see Abort.
@@ -145,6 +160,9 @@ type Scaler struct {
 	// reporting a job: a container that exited idle, or a start that failed
 	// after its JIT configuration was minted. Any job report clears it.
 	noJob int
+	// dipSince is when Desired first kept waiting runners beyond the count,
+	// zero when it keeps none.
+	dipSince time.Time
 }
 
 // NewScaler returns a Scaler for one scale set.
@@ -152,6 +170,10 @@ func NewScaler(cfg ScalerConfig) *Scaler {
 	log := cfg.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
+	}
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
 	}
 	abort, aborted := context.WithCancel(context.Background())
 	return &Scaler{
@@ -167,6 +189,7 @@ func NewScaler(cfg ScalerConfig) *Scaler {
 		gate:       cfg.Gate,
 		project:    cfg.Project,
 		survivors:  cfg.Survivors,
+		now:        now,
 		names:      newName,
 		runners:    map[string]*record{},
 	}
@@ -194,9 +217,10 @@ func (s *Scaler) activeLocked() int {
 // none. Otherwise it adds runners, each taking a slot, until the waiting,
 // starting, idle and busy ones reach min(slots, count) or no slot is free, and
 // then removes those beyond count: waiting runners first, newest first, then
-// idle ones. It never waits for a slot: a count the global limit blocks is
-// retried on the listener's next call. It returns the number of waiting,
-// starting, idle and busy runners, and never an error.
+// idle ones. Waiting runners beyond count are kept until the count has stayed
+// below them for dipGrace (see reap). It never waits for a slot: a count the
+// global limit blocks is retried on the listener's next call. It returns the
+// number of waiting, starting, idle and busy runners, and never an error.
 //
 // count is the scale set's assigned jobs, which include the jobs the
 // project's survivors run: Desired counts those survivors against it, so a
@@ -426,7 +450,11 @@ func (s *Scaler) unregister(ctx context.Context, name string) error {
 }
 
 // reap gives up waiting runners and removes idle runners beyond count. Waiting
-// runners go first, newest first (giveUpWaitingLocked). An idle runner may
+// runners go first, newest first (giveUpWaitingLocked), but only once the
+// count has stayed below them for dipGrace, across calls: until then they keep
+// their tickets, so a job request that GitHub completes unacquired and
+// reissues at once finds its waiter still in the budget's queue. The idle
+// runners beyond the waiters are removed at once. An idle runner may
 // already be running a job, because JobStarted reaches the listener late, so
 // each one is unregistered on GitHub first: GitHub refuses that for a runner
 // with a job, and the runner is then kept and marked busy. Only an
@@ -436,7 +464,21 @@ func (s *Scaler) unregister(ctx context.Context, name string) error {
 func (s *Scaler) reap(ctx context.Context, count int) {
 	s.mu.Lock()
 	excess := min(s.countLocked(stateWaiting, stateStarting, stateIdle), s.activeLocked()-count)
-	excess -= s.giveUpWaitingLocked(excess)
+	if kept := min(s.countLocked(stateWaiting), max(excess, 0)); kept > 0 {
+		now := s.now()
+		if s.dipSince.IsZero() {
+			s.dipSince = now
+			s.log.Info("assigned jobs below the waiting runners; keeping them for the grace",
+				slog.Int("count", count), slog.Int("kept", kept), slog.Duration("grace", dipGrace))
+		}
+		if now.Sub(s.dipSince) >= dipGrace {
+			excess -= s.giveUpWaitingLocked(excess)
+		} else {
+			excess -= kept
+		}
+	} else {
+		s.dipSince = time.Time{}
+	}
 	var victims []string
 	for name, r := range s.runners {
 		if len(victims) >= excess {

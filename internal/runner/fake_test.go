@@ -506,10 +506,39 @@ func (g *fakeGate) next(t *testing.T) *admitReq {
 	}
 }
 
-// gateHarness is a harness whose scaler admits runners through a fakeGate.
+// gateHarness is a harness whose scaler admits runners through a fakeGate,
+// on a manual clock.
 type gateHarness struct {
 	*harness
-	gate *fakeGate
+	gate  *fakeGate
+	clock *manualClock
+}
+
+// manualClock is a clock that moves only when the test advances it.
+type manualClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *manualClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *manualClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// lower calls Desired(count) twice, dipGrace apart, so that the waiting
+// runners beyond count are given up, and returns the second call's result.
+func (h *gateHarness) lower(t *testing.T, count int) int {
+	t.Helper()
+	desired(t, h.scaler, count)
+	h.clock.advance(dipGrace)
+	return desired(t, h.scaler, count)
 }
 
 // newGateHarness wires a fakeGate into a harness. By default the gate's
@@ -520,9 +549,11 @@ type gateHarness struct {
 func newGateHarness(t *testing.T, slots *Slots) *gateHarness {
 	t.Helper()
 	g := newFakeGate()
+	clock := &manualClock{t: time.Unix(1_800_000_000, 0)}
 	h := newHarnessWith(slots, func(c *ScalerConfig) {
 		c.Gate = g
 		c.Project = "alpha"
+		c.Now = clock.now
 	})
 	held := func(what string) {
 		done := make(chan struct{})
@@ -551,7 +582,7 @@ func newGateHarness(t *testing.T, slots *Slots) *gateHarness {
 			t.Error("waiter goroutines still running 2s after cleanup")
 		}
 	})
-	return &gateHarness{harness: h, gate: g}
+	return &gateHarness{harness: h, gate: g, clock: clock}
 }
 
 // waitGroupWithin reports whether wg is done within d.

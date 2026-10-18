@@ -270,6 +270,27 @@ func (a *Actions) Assign(name string, delta int) {
 	a.queueLocked(id, body)
 }
 
+// Revoke takes n jobs off the scale set's assigned count and queues one
+// message with a JobCompleted per job, result canceled and no runner: what
+// github.com sends when it completes an assigned job request that no runner
+// acquired within 5 minutes. It then reissues the request at once, which
+// Assign scripts.
+func (a *Actions) Revoke(name string, n int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	id := a.mustIDLocked(name)
+	a.assigned[id] = max(a.assigned[id]-n, 0)
+	var body []any
+	for range n {
+		a.nextRequest++
+		m := scaleset.JobCompleted{Result: "canceled",
+			JobMessageBase: scaleset.JobMessageBase{JobID: fmt.Sprintf("job-%d", a.nextRequest)}}
+		m.MessageType = scaleset.MessageTypeJobCompleted
+		body = append(body, m)
+	}
+	a.queueLocked(id, body)
+}
+
 // Started marks the runner busy and queues a JobStarted for it.
 func (a *Actions) Started(name, runner string) {
 	a.mu.Lock()

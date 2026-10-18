@@ -177,6 +177,7 @@ func (pr *project) setup() error {
 		Gate:      s.deps.Budget,
 		Project:   pr.identity,
 		Survivors: func() int { return s.survivorsOf(pr.identity) },
+		Now:       s.deps.Clock.Now,
 	})
 	pr.mu.Lock()
 	defer pr.mu.Unlock()

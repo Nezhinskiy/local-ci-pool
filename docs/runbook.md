@@ -375,7 +375,13 @@ budget never lets a runner start without them. Its job shows as queued on GitHub
 `pool.log` logs `runner waiting for the budget` when a runner queues, `runner admitted` (with
 `mode`, `need`, `granted`, `shortfall` and `wait_s`) when it starts, and
 `runner given up before admission` when it was given up before it started (`reason=cancelled`: no
-longer needed; `reason=coreslot_cancel`: cancelled through coreslot). Once the oldest runner has waited
+longer needed; `reason=coreslot_cancel`: cancelled through coreslot). A runner is no longer needed when
+its repository's assigned jobs have stayed below its waiting runners for 30 seconds: GitHub
+completes an assigned job request that no runner took within 5 minutes (`job completed` with
+`result=canceled` and `runner=""`) and reissues it about 0.3 seconds later, and the brief dip in
+between gives no waiting runner up, so the reissued job finds its runner still in the queue. The
+pool logs `assigned jobs below the waiting runners; keeping them for the grace` when such a dip
+begins. Once the oldest runner has waited
 30 minutes, it warns `budget full`, once every 30 minutes, with `oldest_wait_s` and the three
 largest holds as `holds="<label> cpu=<n>, …"`. `/healthz` never names a hold.
 

@@ -112,7 +112,7 @@ func TestCancelledIsHeldAsStarting(t *testing.T) {
 	h := newGateHarness(t, NewSlots(4))
 	desired(t, h.scaler, 1)
 	r := h.gate.next(t)
-	desired(t, h.scaler, 0)
+	h.lower(t, 0)
 	if !ended(r.ctx) {
 		t.Fatal("the waiter's ctx is live after Desired(0)")
 	}
@@ -132,7 +132,7 @@ func TestCancelNewestFirst(t *testing.T) {
 		r := h.gate.next(t)
 		reqs[r.name] = r
 	}
-	desired(t, h.scaler, 1)
+	h.lower(t, 1)
 	if !ended(reqs["c"].ctx) || !ended(reqs["a"].ctx) || ended(reqs["b"].ctx) {
 		t.Fatalf("ctx ended: a %v, b %v, c %v; want the newest two (c, a) given up, b kept",
 			ended(reqs["a"].ctx), ended(reqs["b"].ctx), ended(reqs["c"].ctx))
@@ -148,7 +148,7 @@ func TestCancelledWaiterIsNotANoJobExit(t *testing.T) {
 	for range 3 {
 		answerOnCancel(h.gate.next(t))
 	}
-	desired(t, h.scaler, 0)
+	h.lower(t, 0)
 	eventually(t, "every waiter given up", func() bool { return len(h.scaler.Held()) == 0 })
 	if got := h.scaler.NoJobExits(); got != 0 {
 		t.Fatalf("NoJobExits %d after three cancelled waiters, want 0", got)
@@ -166,7 +166,7 @@ func TestGrantAfterGiveUpIsReleased(t *testing.T) {
 		h := newGateHarness(t, NewSlots(4))
 		desired(t, h.scaler, 1)
 		r := h.gate.next(t)
-		desired(t, h.scaler, 0)
+		h.lower(t, 0)
 		r.reply(h.gate.admitted(r.name, ModeQueued, 3), nil)
 		eventually(t, "the grant released", func() bool { return h.gate.releasedOf(r.name) == 1 })
 		if !waitGroupWithin(&h.scaler.wg, 2*time.Second) {
@@ -305,7 +305,7 @@ func TestOscillatingCountLeaksNothing(t *testing.T) {
 	w1.reply(h.gate.admitted(w1.name, ModeQueued, 3), nil)
 	eventually(t, "w1 idle", func() bool { return stateOf(h.scaler, w1.name) == stateIdle })
 
-	desired(t, h.scaler, 0) // w2 cancelled, w1 reaped
+	h.lower(t, 0) // w2 cancelled, w1 reaped
 	if !ended(w2.ctx) {
 		t.Fatal("w2's ctx is live after Desired(0)")
 	}
@@ -313,7 +313,7 @@ func TestOscillatingCountLeaksNothing(t *testing.T) {
 	w3, w4 := h.gate.next(t), h.gate.next(t)
 	w2.reply(h.gate.admitted(w2.name, ModeQueued, 3), nil)
 	answerOnCancel(w3)
-	desired(t, h.scaler, 0)
+	h.lower(t, 0)
 	w4.reply(h.gate.admitted(w4.name, ModeFailOpen, 3), nil)
 
 	for _, r := range []*admitReq{w1, w2, w3, w4} {
