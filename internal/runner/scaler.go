@@ -473,6 +473,9 @@ func (s *Scaler) reap(ctx context.Context, count int) {
 		}
 		if now.Sub(s.dipSince) >= dipGrace {
 			excess -= s.giveUpWaitingLocked(excess)
+			// The dip is acted on: a new one, even on the next call, waits a
+			// whole grace again.
+			s.dipSince = time.Time{}
 		} else {
 			excess -= kept
 		}

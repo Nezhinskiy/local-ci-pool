@@ -203,3 +203,32 @@ func TestDrainIgnoresTheGrace(t *testing.T) {
 		t.Fatal("a waiter is live after Drain")
 	}
 }
+
+// A dip confirmed and acted on ends there: a new dip on the very next call,
+// such as a revocation, keeps the remaining waiter for a whole grace again.
+func TestDipAfterAGiveUpWaitsAWholeGrace(t *testing.T) {
+	h := newGateHarness(t, NewSlots(4))
+	h.scaler.names = scripted("a", "b")
+	reqs := map[string]*admitReq{}
+	desired(t, h.scaler, 2)
+	for range 2 {
+		r := h.gate.next(t)
+		reqs[r.name] = r
+	}
+	desired(t, h.scaler, 1)
+	h.clock.advance(dipGrace)
+	desired(t, h.scaler, 1)
+	if ended(reqs["a"].ctx) || !ended(reqs["b"].ctx) {
+		t.Fatalf("ctx ended: a %v, b %v; want b given up at the grace, a kept", ended(reqs["a"].ctx), ended(reqs["b"].ctx))
+	}
+	h.clock.advance(time.Second)
+	desired(t, h.scaler, 0)
+	if ended(reqs["a"].ctx) {
+		t.Fatal("a was given up at once on a new dip; want a whole grace from the new dip")
+	}
+	h.clock.advance(dipGrace)
+	desired(t, h.scaler, 0)
+	if !ended(reqs["a"].ctx) {
+		t.Fatal("a is live a whole grace into the new dip")
+	}
+}
