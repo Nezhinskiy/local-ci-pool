@@ -35,6 +35,12 @@ const (
 // unlabelledProject is the project of a survivor whose container names none.
 const unlabelledProject = "local-ci-pool"
 
+// ciPriority is the priority of every CI request. coreslot orders tickets by arrival less
+// priority minutes, so a CI ticket goes ahead of local work that arrived up to five minutes after
+// it: GitHub completes an assigned job request that no runner acquired 5 minutes after the
+// assignment, and a runner that waits longer than that loses its job and its place.
+const ciPriority = 5
+
 // errOpenBackoff is a call that did not open coreslot because the last Open failed recently.
 var errOpenBackoff = errors.New("coreslot is not opened: the last Open failed, retried after a backoff")
 
@@ -169,7 +175,7 @@ func (g *Gate) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, 
 	if !s.Enabled {
 		return offAdmitted(), nil
 	}
-	req, label, need := request(a, s)
+	req, label, need := request(a, s, false)
 	failOpen := func(wait time.Duration, class string, err error) (runner.Admitted, error) {
 		if ctx.Err() != nil {
 			return runner.Admitted{Release: runner.NoRelease}, ctx.Err()
@@ -240,7 +246,7 @@ func (g *Gate) Adopt(ctx context.Context, a runner.Admission) runner.Admitted {
 	if !s.Enabled {
 		return offAdmitted()
 	}
-	req, label, need := request(a, s)
+	req, label, need := request(a, s, true)
 	failOpen := func(class string, err error) runner.Admitted {
 		if cerr := ctx.Err(); cerr != nil {
 			g.log.Debug("budget adoption given up", slog.String("runner", a.Runner),
@@ -280,9 +286,12 @@ func (g *Gate) Adopt(ctx context.Context, a runner.Admission) runner.Admitted {
 	return ad
 }
 
-// request is the coreslot request for a: label <project>:ci, priority 0, cpu need..need, where
-// need is a.Need when it is in 1..256 and the settings' cpu otherwise.
-func request(a runner.Admission, s Settings) (req coreslot.Request, label string, need int) {
+// request is the coreslot request for a: label <project>:ci, priority ciPriority, and cpu 1..need,
+// or need..need when exact, where need is a.Need when it is in 1..256 and the settings' cpu
+// otherwise. A runner asks 1..need: it starts once one core is free rather than wait for need
+// cores at the head of the queue, and its job reads the grant (CORESLOT_CPU) to size itself. A
+// survivor asks exactly the need it already runs with.
+func request(a runner.Admission, s Settings, exact bool) (req coreslot.Request, label string, need int) {
 	need = a.Need
 	if need < 1 || need > maxCPU {
 		need = s.CPU
@@ -292,8 +301,12 @@ func request(a runner.Admission, s Settings) (req coreslot.Request, label string
 		project = unlabelledProject
 	}
 	label = project + ":ci"
-	return coreslot.Request{Label: label, Priority: 0,
-		Need: map[string]coreslot.Range{"cpu": {Min: need, Max: need}}}, label, need
+	least := 1
+	if exact {
+		least = need
+	}
+	return coreslot.Request{Label: label, Priority: ciPriority,
+		Need: map[string]coreslot.Range{"cpu": {Min: least, Max: need}}}, label, need
 }
 
 func offAdmitted() runner.Admitted {
@@ -376,14 +389,21 @@ func (g *Gate) end(ad *admitting) {
 // since is the time on Clock since ad began.
 func (g *Gate) since(ad *admitting) time.Duration { return g.clock.Now().Sub(ad.start) }
 
-// admitted records a grant: it clears the state class and logs the admission.
+// admitted records a grant: it clears the state class and logs the admission. A queued runner's
+// Need is the cores granted, which may be fewer than it asked; an adopted survivor's is the need
+// it runs with.
 func (g *Gate) admitted(name, label string, mode runner.Mode, need int, grant *coreslot.Grant,
 	wait time.Duration) runner.Admitted {
 	g.mu.Lock()
 	g.stateErr = false
 	g.mu.Unlock()
-	g.logAdmitted(slog.LevelInfo, name, label, mode, need, grant.Granted()["cpu"], grant.Shortfall()["cpu"], wait, "")
-	return runner.Admitted{Mode: mode, Release: g.release(name, grant), Need: need}
+	granted := grant.Granted()["cpu"]
+	g.logAdmitted(slog.LevelInfo, name, label, mode, need, granted, grant.Shortfall()["cpu"], wait, "")
+	ad := runner.Admitted{Mode: mode, Release: g.release(name, grant), Need: need}
+	if mode == runner.ModeQueued && granted > 0 {
+		ad.Need = granted
+	}
+	return ad
 }
 
 // failOpen admits the runner without a grant. The library's reason goes to a debug line only.

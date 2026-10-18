@@ -27,7 +27,9 @@ type Admission struct {
 }
 
 // Admitted is what the gate gave. Release is idempotent, never nil, never blocks, and is
-// never called under a pool lock. Need is the need asked (0 for ModeOff).
+// never called under a pool lock. Need is the cores the runner may use: the cores granted for
+// ModeQueued, which can be fewer than it asked; the need asked for ModeAdopted and ModeFailOpen;
+// 0 for ModeOff. The runner's job gets it as CORESLOT_CPU.
 type Admitted struct {
 	Release func()
 	Mode    Mode

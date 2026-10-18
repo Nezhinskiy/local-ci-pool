@@ -115,15 +115,16 @@ func TestStartRunnerLabels(t *testing.T) {
 		name string
 		need int
 		want map[string]string
+		env  []string
 	}{
 		{"with a need", 3, map[string]string{
 			"local-ci-pool": "main", "local-ci-pool.runner": "local-ci-alpha-1",
 			"local-ci-pool.project": "alpha", "local-ci-pool.need": "3",
-		}},
+		}, []string{"HOME=/tmp/home", "CORESLOT_CPU=3"}},
 		{"without a need", 0, map[string]string{
 			"local-ci-pool": "main", "local-ci-pool.runner": "local-ci-alpha-1",
 			"local-ci-pool.project": "alpha",
-		}},
+		}, []string{"HOME=/tmp/home"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			d := newFakeDocker()
@@ -137,6 +138,10 @@ func TestStartRunnerLabels(t *testing.T) {
 			}
 			if got := d.creates[0].Config.Labels; !maps.Equal(got, c.want) {
 				t.Fatalf("Labels %v, want %v", got, c.want)
+			}
+			// The job reads its grant to size its parallelism.
+			if got := d.creates[0].Config.Env; !slices.Equal(got, c.env) {
+				t.Fatalf("Env %q, want %q", got, c.env)
 			}
 		})
 	}

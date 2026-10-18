@@ -119,10 +119,12 @@ started by hand from a shell whose `XDG_CONFIG_HOME` is an absolute path looks i
 ```toml
 [budget]
 enabled = true
-cpu = 2      # the cores one job asks for: 1 to 256, no default
+cpu = 2      # the most cores one job asks for: 1 to 256, no default
 ```
 
-Start at 2, the CPUs per slot the pool's sizing assumes. The installer writes the file for you
+Start at 2, the CPUs per slot the pool's sizing assumes. A job starts once one core is free and
+takes up to `cpu`; it finds its grant in `CORESLOT_CPU`, and a workflow that runs its suite with
+`-n "${CORESLOT_CPU:-2}"` (or the like) stays within it. The installer writes the file for you
 when there is none, and never changes one that exists:
 
 ```sh

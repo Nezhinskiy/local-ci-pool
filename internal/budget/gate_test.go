@@ -578,7 +578,7 @@ func TestReleaseNeverBlocks(t *testing.T) {
 // the pool's own; any other project labels its own.
 func TestRequestLabelOfAnUnlabelledSurvivor(t *testing.T) {
 	for project, want := range map[string]string{"": "local-ci-pool:ci", "alpha": "alpha:ci"} {
-		req, label, _ := request(runner.Admission{Runner: "local-ci-ssssssssssss", Project: project}, Settings{Enabled: true, CPU: 3})
+		req, label, _ := request(runner.Admission{Runner: "local-ci-ssssssssssss", Project: project}, Settings{Enabled: true, CPU: 3}, false)
 		if label != want || req.Label != want {
 			t.Errorf("project %q: label %q, request label %q; want %q", project, label, req.Label, want)
 		}
@@ -712,13 +712,56 @@ func TestOpenClassBeforeStateClass(t *testing.T) {
 }
 
 // A need outside 1..256 (a survivor's label of 300, or one that did not parse) asks the
-// configured cpu; one inside asks itself.
+// configured cpu; one inside asks itself. A runner asks it as its most, a survivor exactly.
 func TestRequestNeedOutsideRangeAsksConfigured(t *testing.T) {
 	t.Parallel()
 	for need, want := range map[int]int{-1: 3, 0: 3, 257: 3, 300: 3, 1: 1, 256: 256} {
-		req, _, got := request(runner.Admission{Runner: "s1", Project: "alpha", Need: need}, Settings{Enabled: true, CPU: 3})
-		if got != want || req.Need["cpu"] != (coreslot.Range{Min: want, Max: want}) {
-			t.Errorf("need %d: request asks %d (%+v); want %d", need, got, req.Need["cpu"], want)
+		a := runner.Admission{Runner: "s1", Project: "alpha", Need: need}
+		s := Settings{Enabled: true, CPU: 3}
+		if req, _, got := request(a, s, false); got != want || req.Need["cpu"] != (coreslot.Range{Min: 1, Max: want}) {
+			t.Errorf("need %d: request asks %d (%+v); want 1..%d", need, got, req.Need["cpu"], want)
+		}
+		if req, _, got := request(a, s, true); got != want || req.Need["cpu"] != (coreslot.Range{Min: want, Max: want}) {
+			t.Errorf("need %d: exact request asks %d (%+v); want %d..%d", need, got, req.Need["cpu"], want, want)
 		}
 	}
+}
+
+// A runner starts once one core is free and takes up to cpu, at priority 5: five minutes of
+// seniority, GitHub's window for an assigned job request that no runner acquired.
+func TestRequestRangeAndPriority(t *testing.T) {
+	t.Parallel()
+	s := Settings{Enabled: true, CPU: 3}
+	for _, exact := range []bool{false, true} {
+		req, _, _ := request(alpha("r1"), s, exact)
+		if req.Priority != 5 {
+			t.Errorf("exact %v: priority %d; want 5", exact, req.Priority)
+		}
+		if err := req.Validate(); err != nil {
+			t.Errorf("exact %v: %v", exact, err)
+		}
+	}
+}
+
+// With fewer cores free than cpu, a runner is admitted at once with what is free, and its Need is
+// the grant, which the pool hands the job as CORESLOT_CPU.
+func TestAdmitTakesWhatIsFree(t *testing.T) {
+	t.Parallel()
+	dir := stateDir(t, cpu4)
+	h := newGate(t, dir, on3)
+	hold(t, dir, "holder:x", 2)
+
+	r := waitResult(t, admitAsync(context.Background(), h, alpha("r1")))
+	if r.err != nil || r.ad.Mode != runner.ModeQueued || r.ad.Need != 2 {
+		t.Fatalf("Admit = %+v, %v; want queued, need 2 (the cores free)", r.ad, r.err)
+	}
+	hs := holdsOf(snapshot(t, dir), "alpha:ci")
+	if len(hs) != 1 || hs[0].Granted["cpu"] != 2 {
+		t.Fatalf("holds = %+v; want one alpha:ci holding cpu 2", hs)
+	}
+	if got := h.log.lines("runner admitted"); len(got) != 1 || !strings.HasPrefix(got[0], "runner=r1 label=alpha:ci mode=queued need=3 granted=2 shortfall=0 ") {
+		t.Fatalf("runner admitted lines = %q", got)
+	}
+	r.ad.Release()
+	h.g.waitReleases()
 }

@@ -305,12 +305,12 @@ func snapshot(t *testing.T, dir string) coreslot.Report {
 	return rep
 }
 
-// liveTickets returns the needs ("cpu" Min) of the live tickets labelled label.
+// liveTickets returns the needs ("cpu" Max: the most each asks) of the live tickets labelled label.
 func liveTickets(rep coreslot.Report, label string) []int {
 	var out []int
 	for _, tk := range rep.Tickets {
 		if tk.Label == label && !tk.Dead {
-			out = append(out, tk.Need["cpu"].Min)
+			out = append(out, tk.Need["cpu"].Max)
 		}
 	}
 	return out

@@ -272,7 +272,7 @@ other case. Keys in other tables are ignored.
 | Key | Value |
 |---|---|
 | `enabled` | `true` or `false` |
-| `cpu` | the cores one job asks for, a whole number from 1 to 256. It has no default: `enabled = true` without `cpu` is invalid |
+| `cpu` | the most cores one job asks for, a whole number from 1 to 256. It has no default: `enabled = true` without `cpu` is invalid |
 
 ```toml
 [budget]
@@ -280,9 +280,18 @@ enabled = true
 cpu = 2
 ```
 
-Start at `cpu = 2`, the CPUs per slot the pool's sizing assumes. A `cpu` above the whole budget is
-clamped: the job waits for the whole budget and runs alone with it, and `pool.log` shows the
-shortfall.
+Start at `cpu = 2`, the CPUs per slot the pool's sizing assumes. A job asks for `1..cpu`: it is
+admitted as soon as one core is free and takes up to `cpu` (a `cpu` above the whole budget takes
+at most the whole budget). The grant is fixed for the job's life, and `pool.log` logs it as
+`granted` beside the `need` asked.
+
+**The grant reaches the job** as `CORESLOT_CPU` in its environment (and as the container label
+`local-ci-pool.need`). A workflow sizes its parallelism to it, for example
+`pytest -n "${CORESLOT_CPU:-2}"` or `make -j "${CORESLOT_CPU:-2}"`; the default covers a job that
+runs without the budget, where the variable is unset. The budget counts only the cores granted: a
+job that uses more than its grant, because it ignores `CORESLOT_CPU`, undercounts, and the Mac is
+oversubscribed by the difference. Before this release a job always got all of `cpu`, so a workflow
+that assumed that must read `CORESLOT_CPU` now.
 
 **Creating it.** `./install.sh --budget-cpu 2` creates `~/.config/local-ci-pool/config.toml` (mode
 0600) when the installed pool would read no file, and never changes one that exists: it prints
@@ -298,7 +307,7 @@ the pool does not read, or a release before the budget, which ignores the file).
 
 **Edits apply without a restart.** The pool reads the file on every decision, with no cache. A new
 `cpu` applies to the next runner; a runner already waiting keeps its place in the queue and the
-need it asked for. Turning the budget on or off applies to the next runner; nothing waiting or
+range it asked for. Turning the budget on or off applies to the next runner; nothing waiting or
 running is cancelled. Since the pool may read the file at any moment, save it by replacing it in
 one step: write a temporary file in the same directory, then rename it over `config.toml`. A
 half-written file is read as it is, which can make it invalid, turn the budget off or ask a
@@ -318,7 +327,11 @@ pool never exits over the file.
 Deleting the file turns it off and forgets the last valid settings.
 
 **Labels and priority.** The pool asks for each job's cores under the label `<identity>:ci` (for
-`alpha`, `alpha:ci`), always at priority 0. A `[priorities]` entry in coreslot's own configuration
+`alpha`, `alpha:ci`), always at priority 5. coreslot orders its queue by arrival less the priority
+in minutes, so a CI job goes ahead of local work that queued up to five minutes after it. Five
+minutes is GitHub's window: it completes a job request assigned to the pool that no runner took
+within 5 minutes (`job completed` with `result=canceled` and no runner), and a runner still
+waiting for cores by then has lost its job. A `[priorities]` entry in coreslot's own configuration
 does not apply to these labels.
 
 **Inside `coreslot run`.** A pool started by hand inside `coreslot run` would inherit that run's
