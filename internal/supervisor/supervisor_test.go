@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -906,7 +907,7 @@ func TestSnapshotBudgetFields(t *testing.T) {
 		Waiting:  2,
 		Admitted: AdmittedHealth{Queued: 1, Adopted: 1, FailOpen: 1},
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("alpha's health %+v, want %+v", got, want)
 	}
 }

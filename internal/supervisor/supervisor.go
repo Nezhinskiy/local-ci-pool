@@ -134,6 +134,9 @@ type Docker interface {
 type GitHub interface {
 	discovery.Source
 	runnermount.ReleaseSource
+	// QueuedJobs lists the queued jobs of a repository's newest runs, for
+	// the queued-job watch (queued.go).
+	QueuedJobs(ctx context.Context, full string) ([]github.QueuedJob, error)
 }
 
 // Session is an open message session of one scale set.
@@ -274,6 +277,9 @@ type ProjectHealth struct {
 	// Admitted is the project's runners and survivors that hold an
 	// admission now, by mode.
 	Admitted AdmittedHealth `json:"admitted"`
+	// Stuck is the jobs the queued-job watch reports (queued.go); absent
+	// when there are none.
+	Stuck []StuckJob `json:"stuck,omitempty"`
 }
 
 // AdmittedHealth counts a project's runners and survivors admitted into the
@@ -481,6 +487,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		})
 	}
 	start(func() { s.watchdog(life) })
+	start(func() { s.watchQueued(life) })
 	start(func() { s.releases(life, arch) })
 	start(func() { s.caffeinate(life) })
 

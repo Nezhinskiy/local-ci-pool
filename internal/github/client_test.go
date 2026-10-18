@@ -449,3 +449,110 @@ func TestDownloadSlowButSteadyIsNotCut(t *testing.T) {
 		t.Fatalf("read %d bytes, %v", len(b), err)
 	}
 }
+
+func TestQueuedJobs(t *testing.T) {
+	var jobLists []string
+	var mu sync.Mutex
+	c, _, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		switch {
+		case r.URL.Path == "/repos/example/alpha/actions/runs":
+			if q.Get("per_page") != "10" {
+				t.Errorf("runs per_page = %q, want 10", q.Get("per_page"))
+			}
+			switch q.Get("status") {
+			case "queued":
+				fmt.Fprint(w, `{"total_count":1,"workflow_runs":[{"id":11,"html_url":"https://github.example/example/alpha/actions/runs/11","status":"queued"}]}`)
+			case "in_progress":
+				// 12 is listed under both statuses, as a run moving between them can be.
+				fmt.Fprint(w, `{"total_count":2,"workflow_runs":[{"id":12,"html_url":"https://github.example/example/alpha/actions/runs/12","status":"in_progress"},{"id":11,"html_url":"https://github.example/example/alpha/actions/runs/11","status":"in_progress"}]}`)
+			default:
+				t.Errorf("runs status = %q", q.Get("status"))
+			}
+		case strings.HasPrefix(r.URL.Path, "/repos/example/alpha/actions/runs/") && strings.HasSuffix(r.URL.Path, "/jobs"):
+			if q.Get("filter") != "latest" {
+				t.Errorf("jobs filter = %q, want latest", q.Get("filter"))
+			}
+			mu.Lock()
+			jobLists = append(jobLists, r.URL.Path)
+			mu.Unlock()
+			switch r.URL.Path {
+			case "/repos/example/alpha/actions/runs/11/jobs":
+				fmt.Fprint(w, `{"total_count":2,"jobs":[
+					{"id":101,"name":"frontend","status":"queued","labels":["alpha-local"],"created_at":"2026-10-18T18:16:07Z"},
+					{"id":102,"name":"static-checks","status":"completed","labels":["alpha-local"],"created_at":"2026-10-18T18:16:07Z"}]}`)
+			case "/repos/example/alpha/actions/runs/12/jobs":
+				fmt.Fprint(w, `{"total_count":1,"jobs":[{"id":103,"name":"lint","status":"queued","labels":["ubuntu-latest"],"created_at":"2026-10-18T18:20:00Z"}]}`)
+			}
+		default:
+			t.Errorf("unexpected %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	got, err := c.QueuedJobs(context.Background(), "example/alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []QueuedJob{
+		{RunURL: "https://github.example/example/alpha/actions/runs/11", ID: 101, Name: "frontend",
+			Labels: []string{"alpha-local"}, Created: time.Date(2026, 10, 18, 18, 16, 7, 0, time.UTC)},
+		{RunURL: "https://github.example/example/alpha/actions/runs/12", ID: 103, Name: "lint",
+			Labels: []string{"ubuntu-latest"}, Created: time.Date(2026, 10, 18, 18, 20, 0, 0, time.UTC)},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("QueuedJobs = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].RunURL != want[i].RunURL || got[i].ID != want[i].ID || got[i].Name != want[i].Name ||
+			strings.Join(got[i].Labels, ",") != strings.Join(want[i].Labels, ",") || !got[i].Created.Equal(want[i].Created) {
+			t.Fatalf("QueuedJobs[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if len(jobLists) != 2 {
+		t.Fatalf("listed the jobs of %v, want each run once", jobLists)
+	}
+}
+
+// At most maxQueuedRuns runs have their jobs listed, so one call costs a bounded share of the
+// rate limit.
+func TestQueuedJobsBoundsTheRuns(t *testing.T) {
+	var jobLists int
+	var mu sync.Mutex
+	c, _, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/jobs") {
+			mu.Lock()
+			jobLists++
+			mu.Unlock()
+			fmt.Fprint(w, `{"total_count":0,"jobs":[]}`)
+			return
+		}
+		var runs []string
+		base := 100
+		if r.URL.Query().Get("status") == "in_progress" {
+			base = 200
+		}
+		for i := range 10 {
+			runs = append(runs, fmt.Sprintf(`{"id":%d,"html_url":"u","status":"x"}`, base+i))
+		}
+		fmt.Fprintf(w, `{"total_count":10,"workflow_runs":[%s]}`, strings.Join(runs, ","))
+	})
+	if _, err := c.QueuedJobs(context.Background(), "example/alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if jobLists != maxQueuedRuns {
+		t.Fatalf("listed the jobs of %d runs, want %d", jobLists, maxQueuedRuns)
+	}
+}
+
+func TestQueuedJobsFailsOnAStatus(t *testing.T) {
+	c, _, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"message":"API rate limit exceeded"}`)
+	})
+	if _, err := c.QueuedJobs(context.Background(), "example/alpha"); err == nil {
+		t.Fatal("QueuedJobs succeeded on a 403")
+	}
+	if _, err := c.QueuedJobs(context.Background(), "../alpha"); err == nil {
+		t.Fatal("QueuedJobs accepted a bad repository name")
+	}
+}

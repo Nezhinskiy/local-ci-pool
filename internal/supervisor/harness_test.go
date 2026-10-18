@@ -401,6 +401,36 @@ type fakeGitHub struct {
 	repos   map[string]*fakeRepo
 	listErr error
 	lists   int
+	// queued is what QueuedJobs answers, by repository; queuedErr fails it.
+	queued      map[string][]github.QueuedJob
+	queuedErr   error
+	queuedCalls int
+}
+
+func (g *fakeGitHub) QueuedJobs(_ context.Context, full string) ([]github.QueuedJob, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.queuedCalls++
+	if g.queuedErr != nil {
+		return nil, g.queuedErr
+	}
+	return slices.Clone(g.queued[full]), nil
+}
+
+// setQueued scripts the queued jobs of a repository.
+func (g *fakeGitHub) setQueued(full string, jobs ...github.QueuedJob) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.queued == nil {
+		g.queued = map[string][]github.QueuedJob{}
+	}
+	g.queued[full] = jobs
+}
+
+func (g *fakeGitHub) calls() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.queuedCalls
 }
 
 func (g *fakeGitHub) ListPrivateOwnedRepos(context.Context) ([]github.Repo, error) {

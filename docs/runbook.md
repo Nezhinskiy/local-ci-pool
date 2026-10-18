@@ -228,7 +228,7 @@ tail -f ~/Library/Logs/local-ci-pool/pool.log
 | `docker` | whether Docker answers |
 | `probe` | whether this is a probe run |
 | `budget` | the core budget: `state`, an `error` class when there is one, and `oldest_wait_s` (see [CI is waiting](#ci-is-waiting)) |
-| `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, a `reason` when not healthy, and the budget's `waiting` and `admitted` counts |
+| `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, a `reason` when not healthy, the budget's `waiting` and `admitted` counts, and `stuck` when a job is queued that GitHub does not offer the pool (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)) |
 
 The endpoint binds `127.0.0.1:8737` and answers only requests whose `Host` is a loopback name. A job
 can still reach it through Docker Desktop's host gateway address with a forged `Host`, and so learn
@@ -445,4 +445,26 @@ one; a job that had started fails with a lost runner and needs a re-run. Otherwi
 - A repository whose workflow cannot: cancel the run, then choose **Re-run all jobs**. Re-running only
   the failed jobs reuses the stale route.
 
-The specific commands live in each project's own runbook. There is no automatic watchdog in v0.1.0.
+The specific commands live in each project's own runbook.
+
+## A job stays queued on a free pool
+
+GitHub completes a job request assigned to the pool that no runner took within 5 minutes and
+reissues it (see [Labels and priority](#the-budget-settings)). After such a reissue it has been
+seen to stop counting the job against the pool's scale set: the job stays queued on GitHub, every
+slot is free, and the pool never hears of it. The pool watches for this and only reports it; it
+cancels and re-runs nothing.
+
+When a job with the project's label (`<identity>-local`, or the scale set's name) has been queued
+for 10 minutes while the pool had a free slot and the project had no runner waiting, starting or
+idle, `pool.log` warns `a job is queued while the pool has a free slot and no runner waits for it`
+with the `run` URL, the `job` name and `queued_s`, once per job, and the project's `/healthz` entry
+lists it under `stuck` (`run_url`, `job`, `queued_s`) until it is no longer queued or the pool gets
+busy. The report does not change `healthy`.
+
+The pool asks GitHub only while those conditions have held for 10 minutes, at most every 5 minutes
+per project, with at most 12 requests a check (the 10 newest queued and in-progress runs). A check
+that fails (a rate limit, a network error) logs at debug only and changes nothing.
+
+To get the job moving, cancel the run and choose **Re-run all jobs**: the new attempt's jobs are
+offered to the pool as new requests.

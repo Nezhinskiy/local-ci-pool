@@ -64,6 +64,13 @@ type project struct {
 	// joinOnce runs stopWaiters once, for the drain or for Run's stop,
 	// whichever comes first; the other waits for it.
 	joinOnce sync.Once
+
+	// The queued-job watch (queued.go): since when the pool has had a free
+	// slot and the project nothing waiting, when GitHub was last asked, the
+	// jobs reported, and the job IDs already warned about.
+	freeSince, lastQueuedCheck time.Time
+	stuck                      []StuckJob
+	warned                     map[int64]bool
 }
 
 // errLeft stops a project's run when it asked for its own drain.
@@ -783,6 +790,7 @@ func (pr *project) health() ProjectHealth {
 	default:
 		h.Healthy = true
 	}
+	h.Stuck = slices.Clone(pr.stuck)
 	sc := pr.scaler
 	pr.mu.Unlock()
 	if sc != nil {

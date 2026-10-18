@@ -492,3 +492,80 @@ func (c *Client) DeleteVariable(ctx context.Context, full, name string) error {
 	}
 	return c.statusErr(http.MethodDelete, u, res)
 }
+
+// maxQueuedRuns bounds the runs QueuedJobs lists the jobs of: one call makes at most two run
+// listings and this many job listings.
+const maxQueuedRuns = 10
+
+// QueuedJob is a job GitHub reports queued: no runner has taken it.
+type QueuedJob struct {
+	RunURL  string // the workflow run's page
+	ID      int64
+	Name    string
+	Labels  []string
+	Created time.Time // when the job was queued
+}
+
+type runsJSON struct {
+	Runs []struct {
+		ID      int64  `json:"id"`
+		HTMLURL string `json:"html_url"`
+	} `json:"workflow_runs"`
+}
+
+type jobsJSON struct {
+	Jobs []struct {
+		ID        int64     `json:"id"`
+		Name      string    `json:"name"`
+		Status    string    `json:"status"`
+		Labels    []string  `json:"labels"`
+		CreatedAt time.Time `json:"created_at"`
+	} `json:"jobs"`
+}
+
+// QueuedJobs lists the queued jobs of the repository's newest queued and in-progress workflow
+// runs, at most maxQueuedRuns of them: a run in progress can hold a job that is still queued.
+func (c *Client) QueuedJobs(ctx context.Context, full string) ([]QueuedJob, error) {
+	if err := checkFull(full); err != nil {
+		return nil, err
+	}
+	type run struct {
+		id  int64
+		url string
+	}
+	var runs []run
+	seen := map[int64]bool{}
+	for _, status := range []string{"queued", "in_progress"} {
+		res, err := c.get(ctx, fmt.Sprintf("%s/repos/%s/actions/runs?status=%s&per_page=%d", c.base, full, status, maxQueuedRuns), "")
+		if err != nil {
+			return nil, err
+		}
+		var rs runsJSON
+		if err := json.Unmarshal(res.body, &rs); err != nil {
+			return nil, fmt.Errorf("github: decoding the %s runs of %s: %w", status, full, err)
+		}
+		for _, r := range rs.Runs {
+			if !seen[r.ID] {
+				seen[r.ID] = true
+				runs = append(runs, run{r.ID, r.HTMLURL})
+			}
+		}
+	}
+	var out []QueuedJob
+	for _, r := range runs[:min(len(runs), maxQueuedRuns)] {
+		res, err := c.get(ctx, fmt.Sprintf("%s/repos/%s/actions/runs/%d/jobs?filter=latest&per_page=100", c.base, full, r.id), "")
+		if err != nil {
+			return nil, err
+		}
+		var js jobsJSON
+		if err := json.Unmarshal(res.body, &js); err != nil {
+			return nil, fmt.Errorf("github: decoding the jobs of run %d of %s: %w", r.id, full, err)
+		}
+		for _, j := range js.Jobs {
+			if j.Status == "queued" {
+				out = append(out, QueuedJob{RunURL: r.url, ID: j.ID, Name: j.Name, Labels: j.Labels, Created: j.CreatedAt})
+			}
+		}
+	}
+	return out, nil
+}
