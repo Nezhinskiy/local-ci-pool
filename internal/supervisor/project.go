@@ -65,6 +65,9 @@ type project struct {
 	// whichever comes first; the other waits for it.
 	joinOnce sync.Once
 
+	// advertised is the capacity last given to the listener (capacity.go).
+	advertised int
+
 	// The queued-job watch (queued.go): since when the pool has had a free
 	// slot and the project nothing waiting, when GitHub was last asked, the
 	// jobs reported, and the job IDs already warned about.
@@ -361,20 +364,23 @@ func (pr *project) serveOnce() error {
 	if err != nil {
 		return fmt.Errorf("opening the session: %w", err)
 	}
+	maxRunners := pr.capacity()
 	pr.mu.Lock()
-	maxRunners := pr.s.slots.Cap()
 	if pr.draining {
 		maxRunners = 0
 	}
 	l, err := listener.New(sess, listener.Config{ScaleSetID: pr.scaleSetID, MaxRunners: maxRunners, Logger: pr.log.With("component", "listener")})
 	if err == nil {
 		pr.listener, pr.up, pr.reason = l, true, ""
+		pr.advertised = maxRunners
 	}
 	sc := pr.scaler
 	pr.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("creating the listener: %w", err)
 	}
+	// A slot may have changed since the capacity was counted.
+	pr.s.requestCapacity()
 	pr.log.Info("listening")
 	err = l.Run(pr.ctx, runner.NewAdapter(sc))
 	pr.mu.Lock()

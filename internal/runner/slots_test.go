@@ -64,3 +64,18 @@ func TestSlotsNegativeCapIsZero(t *testing.T) {
 		t.Fatalf("cap %d, want 0 and no acquire", s.Cap())
 	}
 }
+
+// OnChange runs after every acquire and release that changed the slots in
+// use, outside the lock, and never for one that changed nothing.
+func TestSlotsOnChange(t *testing.T) {
+	s := NewSlots(1)
+	var seen []int
+	s.OnChange(func() { seen = append(seen, s.InUse()) })
+	s.Release() // nothing taken
+	s.TryAcquire()
+	s.TryAcquire() // full
+	s.Release()
+	if want := []int{1, 0}; len(seen) != len(want) || seen[0] != want[0] || seen[1] != want[1] {
+		t.Fatalf("OnChange saw %v, want %v", seen, want)
+	}
+}

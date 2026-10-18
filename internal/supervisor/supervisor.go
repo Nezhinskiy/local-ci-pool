@@ -299,6 +299,8 @@ type Supervisor struct {
 
 	fatal     chan error
 	reconcile chan struct{}
+	// capacity asks capacities to advertise every project's capacity again.
+	capacity chan struct{}
 	// wg counts the project goroutines: runs, drains and image refreshes.
 	wg sync.WaitGroup
 
@@ -343,6 +345,7 @@ func New(cfg Config, deps Deps) *Supervisor {
 		log:       deps.Log,
 		fatal:     make(chan error, 1),
 		reconcile: make(chan struct{}, 1),
+		capacity:  make(chan struct{}, 1),
 		projects:  map[string]*project{},
 		survivors: map[string]*survivor{},
 	}
@@ -437,6 +440,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	s.mu.Lock()
 	s.machine, s.instance, s.mount = m, instance, mount
 	s.slots = runner.NewSlots(m.Slots)
+	s.slots.OnChange(s.requestCapacity)
 	s.dockerOK = true
 	s.mu.Unlock()
 	// The pid lets the installer tell this process's lines in the shared log
@@ -488,6 +492,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 	start(func() { s.watchdog(life) })
 	start(func() { s.watchQueued(life) })
+	start(func() { s.capacities(life) })
 	start(func() { s.releases(life, arch) })
 	start(func() { s.caffeinate(life) })
 

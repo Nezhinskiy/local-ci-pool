@@ -20,7 +20,11 @@ holds your `gh` login and runs the code of your private repositories.
   heartbeat is fresh (at most 300 seconds old).
 - **Slots.** How many jobs one Mac runs at once:
   `min(floor((round(GiB) - 2) / 4), floor(CPUs / 2), 8)`, where `GiB` and `CPUs` are what Docker
-  reports. The pool refuses to start below 1.
+  reports. The pool refuses to start below 1. Every project on the Mac shares them. Each scale set tells GitHub
+  how many jobs it can take now: the free slots plus its own running jobs, or 0 while it drains. So
+  while one project's jobs hold every slot, GitHub keeps another project's new jobs off this Mac
+  until a slot frees (another Mac that is up can still take them). A new count reaches GitHub with
+  the scale set's next message request, within about 50 seconds.
 
 ## Install
 

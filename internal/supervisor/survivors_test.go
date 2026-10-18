@@ -20,7 +20,7 @@ const survivorA, survivorB = "local-ci-ssssssssssss", "local-ci-tttttttttttt"
 
 // A pool killed while a job ran (a logout, kill -9, launchd's 60 s exit
 // timeout) leaves that job's container running. The next start keeps it, and
-// it holds the only slot until it dies: a job assigned meanwhile waits, and
+// it holds the only slot until it dies: a job queued meanwhile waits, and
 // starts once the survivor's die event frees the slot. The clock runs at wall
 // speed, so the watchdog's reconcile (first tick at 30 s) cannot stand in for
 // the die event. The finished containers of the previous run are swept at
@@ -51,8 +51,10 @@ func TestSurvivorHoldsItsSlotUntilItDies(t *testing.T) {
 		t.Fatalf("in use %d, want 1: the survivor holds a slot", got)
 	}
 
+	// The survivor names no project, so its slot is no project's: alpha
+	// advertises no capacity, and the service holds the job back.
+	h.eventually("alpha advertises 0", func() bool { return h.actions.Capacity(alphaSet) == "0" })
 	h.actions.Assign(alphaSet, 1)
-	h.delivered(alphaSet)
 	img := h.imageOf("alpha")
 	time.Sleep(3 * 20 * time.Millisecond) // a few of the listener's nil-message calls
 	if got := h.docker.runners(img); len(got) != 0 {
