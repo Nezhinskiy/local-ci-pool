@@ -26,7 +26,14 @@
 # implied). Do not rely on the ambient `gh` login: it is usually a broad
 # `repo`-scoped OAuth token, and this script runs unattended.
 #
-# launchd, every 120 seconds (~/Library/LaunchAgents/dev.example.heartbeat.plist):
+# launchd and cron start with a minimal PATH (/usr/bin:/bin[:/usr/sbin:/sbin]), so
+# gh (Homebrew: /opt/homebrew/bin) and docker (/usr/local/bin) are not found
+# unless PATH is set below; the script then stops with "gh is required" on every
+# run. The token sits in the job's definition, so keep that file private
+# (chmod 600) and never put the token in the command's arguments.
+#
+# launchd, every 120 seconds (/Users/YOU/Library/LaunchAgents/dev.example.heartbeat.plist,
+# chmod 600):
 #
 #   <key>ProgramArguments</key>
 #   <array>
@@ -37,12 +44,19 @@
 #     <string>--check</string><string>docker info >/dev/null</string>
 #   </array>
 #   <key>EnvironmentVariables</key>
-#   <dict><key>GH_TOKEN</key><string>github_pat_...</string></dict>
+#   <dict>
+#     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+#     <key>GH_TOKEN</key><string>github_pat_...</string>
+#   </dict>
+#   <key>StandardErrorPath</key><string>/Users/YOU/Library/Logs/heartbeat.err</string>
 #   <key>StartInterval</key><integer>120</integer>
 #
-# cron, every two minutes:
+# cron, every two minutes (crontab -e; the variable lines go at the top of the
+# crontab, which is readable only by you):
 #
-#   */2 * * * * GH_TOKEN=github_pat_... /path/to/heartbeat.sh --repo OWNER/NAME --machine MYMAC --slots 2 --check 'docker info >/dev/null'
+#   PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+#   GH_TOKEN=github_pat_...
+#   */2 * * * * /path/to/heartbeat.sh --repo OWNER/NAME --machine MYMAC --slots 2 --check 'docker info >/dev/null'
 #
 # HEARTBEAT_TEST_NOW overrides the clock (tests only), like route.sh's
 # ROUTE_TEST_NOW.
@@ -86,20 +100,24 @@ if [[ -z "$now" ]]; then
 fi
 
 [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repo must be OWNER/NAME"
+# "." and ".." would turn repos/<repo> into a different API path.
+[[ "/$repo/" != */./* && "/$repo/" != */../* ]] || die "--repo must be OWNER/NAME, without . or .. segments"
 [[ "$machine" =~ ^[A-Z0-9]{1,12}$ ]] || die "--machine must match [A-Z0-9]{1,12} (case-insensitive)"
 [[ "$slots" =~ ^[1-8]$ ]] || die "--slots must be 1 to 8"
 [[ "$now" =~ ^[0-9]{1,12}$ ]] || die "HEARTBEAT_TEST_NOW must be a unix time in seconds"
 command -v gh > /dev/null 2>&1 || die "gh is required but was not found on PATH"
 
-# Visibility first. Only the literal answer "true" continues: "false", an empty
-# answer or anything unexpected is not taken for private.
+# Visibility first. Only the literal answer "true" continues; an empty or
+# unexpected answer is not taken for private, and not reported as public.
 status=0
 private="$(gh api "repos/$repo" --jq .private)" || status=$?
 if ((status != 0)); then
   exit "$status"
 fi
-if [[ "$private" != "true" ]]; then
+if [[ "$private" == "false" ]]; then
   die "$repo is public; self-hosted runners must not serve public repositories"
+elif [[ "$private" != "true" ]]; then
+  die "could not tell whether $repo is private; not writing"
 fi
 
 if [[ "$have_check" == true ]]; then

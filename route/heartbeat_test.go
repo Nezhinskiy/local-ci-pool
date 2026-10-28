@@ -146,9 +146,13 @@ func TestHeartbeatScriptServesOrgPrivateRepo(t *testing.T) {
 	if r.exit != 0 {
 		t.Fatalf("exit %d\nstderr: %s", r.exit, r.stderr)
 	}
-	want := "variable|set|CI_POOL_HB_M1|--repo|some-org/app|--body|1000000 2|"
-	if w := r.wrote(); len(w) != 1 || w[0] != want {
-		t.Errorf("gh variable set calls = %q, want exactly [%q]", w, want)
+	// Visibility is asked of the same repository that is then written.
+	want := []string{
+		"api|repos/some-org/app|--jq|.private|",
+		"variable|set|CI_POOL_HB_M1|--repo|some-org/app|--body|1000000 2|",
+	}
+	if strings.Join(r.argv, "\n") != strings.Join(want, "\n") {
+		t.Errorf("gh calls = %q, want exactly %q", r.argv, want)
 	}
 }
 
@@ -169,6 +173,12 @@ func TestHeartbeatScriptStopsWhenVisibilityUnknown(t *testing.T) {
 	r = runHeartbeat(t, map[string]string{"FAKE_GH_PRIVATE": "null"}, "--repo", "o/r", "--machine", "m1", "--slots", "3")
 	if r.exit != 2 || len(r.wrote()) != 0 {
 		t.Errorf("answer null: exit %d, writes %q", r.exit, r.wrote())
+	}
+	if want := "heartbeat: could not tell whether o/r is private; not writing"; !strings.Contains(r.stderr, want) {
+		t.Errorf("answer null: stderr = %q, want it to contain %q", r.stderr, want)
+	}
+	if strings.Contains(r.stderr, "is public") {
+		t.Errorf("answer null reported as public: %q", r.stderr)
 	}
 }
 
@@ -201,23 +211,26 @@ func TestHeartbeatScriptRejectsBadInput(t *testing.T) {
 		return []string{"--repo", m["repo"], "--machine", m["machine"], "--slots", m["slots"]}
 	}
 	cases := map[string][]string{
-		"machine_hyphen":   with("machine", "mac-mini"),
-		"machine_empty":    with("machine", ""),
-		"machine_13_chars": with("machine", strings.Repeat("a", 13)),
-		"machine_newline":  with("machine", "m1\nx"),
-		"slots_0":          with("slots", "0"),
-		"slots_9":          with("slots", "9"),
-		"slots_text":       with("slots", "x"),
-		"slots_empty":      with("slots", ""),
-		"slots_newline":    with("slots", "3\n"),
-		"repo_no_slash":    with("repo", "o"),
-		"repo_two_slashes": with("repo", "o/r/x"),
-		"repo_empty":       with("repo", ""),
-		"repo_space":       with("repo", "o/r x"),
-		"repo_newline":     with("repo", "o/r\n"),
-		"no_args":          nil,
-		"unknown_flag":     append(with("repo", "o/r"), "--force"),
-		"flag_without_arg": {"--repo", "o/r", "--machine", "m1", "--slots"},
+		"machine_hyphen":    with("machine", "mac-mini"),
+		"machine_empty":     with("machine", ""),
+		"machine_13_chars":  with("machine", strings.Repeat("a", 13)),
+		"machine_newline":   with("machine", "m1\nx"),
+		"slots_0":           with("slots", "0"),
+		"slots_9":           with("slots", "9"),
+		"slots_text":        with("slots", "x"),
+		"slots_empty":       with("slots", ""),
+		"slots_newline":     with("slots", "3\n"),
+		"repo_no_slash":     with("repo", "o"),
+		"repo_two_slashes":  with("repo", "o/r/x"),
+		"repo_empty":        with("repo", ""),
+		"repo_dotdot_owner": with("repo", "../r"),
+		"repo_dotdot_name":  with("repo", "o/.."),
+		"repo_dot_owner":    with("repo", "./r"),
+		"repo_space":        with("repo", "o/r x"),
+		"repo_newline":      with("repo", "o/r\n"),
+		"no_args":           nil,
+		"unknown_flag":      append(with("repo", "o/r"), "--force"),
+		"flag_without_arg":  {"--repo", "o/r", "--machine", "m1", "--slots"},
 	}
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {
