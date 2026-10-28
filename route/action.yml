@@ -8,7 +8,7 @@ inputs:
     description: The repository variables, serialised with toJSON(vars).
     required: true
   identity:
-    description: The repository identity (its name reduced to [a-z0-9-]); the local label is <identity>-local.
+    description: The repository identity (its name reduced to [a-z0-9-]); the local label defaults to <identity>-local.
     required: true
   hosted-label:
     description: The label to use when no machine has a fresh heartbeat.
@@ -16,6 +16,10 @@ inputs:
   hosted-shards:
     description: The shard count to use when no machine has a fresh heartbeat.
     required: true
+  local-label:
+    description: The label to use when a machine has a fresh heartbeat; empty means <identity>-local.
+    required: false
+    default: ""
   mode:
     description: "auto, or hosted to force the hosted label."
     required: false
@@ -42,6 +46,7 @@ runs:
         IDENTITY: ${{ inputs.identity }}
         HOSTED_LABEL: ${{ inputs.hosted-label }}
         HOSTED_SHARDS: ${{ inputs.hosted-shards }}
+        LOCAL_LABEL: ${{ inputs.local-label }}
         MODE: ${{ inputs.mode }}
         ACTION_PATH: ${{ github.action_path }}
       run: bash "$ACTION_PATH/route.sh"

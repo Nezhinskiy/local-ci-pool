@@ -8,6 +8,8 @@
 #   VARS_JSON      toJSON(vars)
 #   IDENTITY       repository identity, [a-z0-9-]
 #   HOSTED_LABEL   label to use when no machine is fresh
+#   LOCAL_LABEL    label to use when a machine is fresh, [a-z0-9.-]{1,64}
+#                  (optional; defaults to <IDENTITY>-local)
 #   HOSTED_SHARDS  shard count to use when no machine is fresh
 #   MODE           auto | hosted
 #   ROUTE_TEST_NOW unix time override (tests only; defaults to the clock). Not named NOW
@@ -26,6 +28,7 @@ command -v jq > /dev/null 2>&1 || die "jq is required but was not found on PATH"
 identity="${IDENTITY-}"
 hosted_label="${HOSTED_LABEL-}"
 hosted_shards="${HOSTED_SHARDS-}"
+local_label="${LOCAL_LABEL:-${identity}-local}"
 mode="${MODE-auto}"
 now="${ROUTE_TEST_NOW-}"
 if [[ -z "$now" ]]; then
@@ -34,6 +37,7 @@ fi
 
 [[ "$identity" =~ ^[a-z0-9-]{1,40}$ ]] || die "identity must match [a-z0-9-]{1,40}"
 [[ "$hosted_label" =~ ^[a-z0-9.-]{1,64}$ ]] || die "hosted-label must match [a-z0-9.-]{1,64}"
+[[ "$local_label" =~ ^[a-z0-9.-]{1,64}$ ]] || die "local-label must match [a-z0-9.-]{1,64}"
 [[ "$hosted_shards" =~ ^[1-9][0-9]?$ ]] || die "hosted-shards must be a positive integer below 100"
 [[ "$mode" == "auto" || "$mode" == "hosted" ]] || die "mode must be auto or hosted"
 [[ "$now" =~ ^[0-9]{1,12}$ ]] || die "ROUTE_TEST_NOW must be a unix time in seconds"
@@ -91,7 +95,7 @@ if [[ "$mode" == "auto" ]]; then
 fi
 
 if ((fresh > 0)); then
-  label="${identity}-local"
+  label="$local_label"
   shards=$((total < 4 ? total : 4))
   is_local=true
 else

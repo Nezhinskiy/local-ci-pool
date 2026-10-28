@@ -274,6 +274,9 @@ func TestRouteRejectsBadInputs(t *testing.T) {
 		"github_output_empty":    {"GITHUB_OUTPUT": ""},
 		"github_output_unset":    {"GITHUB_OUTPUT": "\x00unset"},
 		"identity_unset_in_step": {"IDENTITY": "\x00unset"},
+		"local_label_underscore": {"LOCAL_LABEL": "Bad_Label"},
+		"local_label_65_chars":   {"LOCAL_LABEL": strings.Repeat("a", 65)},
+		"local_label_newline":    {"LOCAL_LABEL": "mac\nlocal=true"},
 	}
 	for name, env := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -287,6 +290,12 @@ func TestRouteRejectsBadInputs(t *testing.T) {
 			}
 			if strings.TrimSpace(r.stderr) == "" {
 				t.Error("want an explanation on stderr")
+			}
+			if strings.HasPrefix(name, "local_label") && !strings.Contains(r.stderr, "route: local-label must match [a-z0-9.-]{1,64}") {
+				t.Errorf("want the local-label message on stderr, got %q", r.stderr)
+			}
+			if strings.HasPrefix(name, "local_label") && r.exit != 1 {
+				t.Errorf("want exit 1, got %d", r.exit)
 			}
 		})
 	}
@@ -323,6 +332,7 @@ func TestActionWiring(t *testing.T) {
 		"HOSTED_LABEL":  "inputs.hosted-label",
 		"HOSTED_SHARDS": "inputs.hosted-shards",
 		"MODE":          "inputs.mode",
+		"LOCAL_LABEL":   "inputs.local-label",
 		"ACTION_PATH":   "github.action_path",
 	}
 	for env, expr := range wiring {
@@ -354,6 +364,9 @@ func TestActionWiring(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("output %s is not wired to the step output (%s)", name, want)
 		}
+	}
+	if !regexp.MustCompile(`(?s)\n  local-label:\n.*?required: false\n\s+default: ""`).MatchString(text) {
+		t.Error(`input local-label is not declared with required: false and default: ""`)
 	}
 	if !regexp.MustCompile(`(?s)mode:.*?default: auto`).MatchString(text) {
 		t.Error("input mode does not default to auto")
@@ -458,6 +471,35 @@ func TestFmtAge(t *testing.T) {
 			vars := fmt.Sprintf(`{"CI_POOL_HB_M1":"%d 2"}`, 1000000-c.age)
 			r := runRoute(t, map[string]string{"VARS_JSON": vars})
 			wantOneAnnotation(t, r, "::warning title=local-ci-pool::no fresh Mac heartbeat (the newest, CI_POOL_HB_M1, is "+c.want+" old); running on ubuntu-24.04")
+		})
+	}
+}
+
+func TestRouteLocalLabelOverride(t *testing.T) {
+	r := runRoute(t, map[string]string{"LOCAL_LABEL": "mac-runner", "VARS_JSON": `{"CI_POOL_HB_M1":"1000000 3"}`})
+	if r.exit != 0 {
+		t.Fatalf("exit %d: %s", r.exit, r.stderr)
+	}
+	got := parseOutputs(t, r)
+	if got["label"] != "mac-runner" || got["local"] != "true" {
+		t.Errorf("got %v, want label=mac-runner local=true", got)
+	}
+}
+
+func TestRouteLocalLabelDefault(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"unset": {},
+		"empty": {"LOCAL_LABEL": ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env["VARS_JSON"] = `{"CI_POOL_HB_M1":"1000000 3"}`
+			r := runRoute(t, env)
+			if r.exit != 0 {
+				t.Fatalf("exit %d: %s", r.exit, r.stderr)
+			}
+			if got := parseOutputs(t, r); got["label"] != localLabel || got["local"] != "true" {
+				t.Errorf("got %v, want label=%s local=true", got, localLabel)
+			}
 		})
 	}
 }
