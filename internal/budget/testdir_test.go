@@ -64,6 +64,31 @@ func hold(t *testing.T, dir, label string, n int) *coreslot.Grant {
 	return g
 }
 
+// closeAtOnce closes g, a grant on dir, so that a waiting ticket sees all of its cpu free at once.
+// Grant.Close unlocks the tokens one by one outside the admission section, and a ticket asking
+// 1..n admitted between two of them takes only the cores free so far. So the test holds the
+// section until every token of g is unlocked; Close then waits for it to remove the hold.
+func closeAtOnce(t *testing.T, dir string, g *coreslot.Grant) {
+	t.Helper()
+	c := openClient(t, dir)
+	free := func() int {
+		rep, err := c.Snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rep.Resources["cpu"].Available
+	}
+	want := free() + g.Granted()["cpu"]
+	_, unlock := holdSection(t, dir, os.Getpid())
+	closed := make(chan error, 1)
+	go func() { closed <- g.Close() }()
+	eventually(t, "the grant's cpu unlocked", func() bool { return free() == want })
+	unlock()
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+}
+
 // countingClient wraps the real client: it counts calls, signals every Snapshot, and lets a test
 // replace the waiter Enqueue returns or make one call return a chosen error.
 type countingClient struct {

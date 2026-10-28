@@ -89,9 +89,7 @@ func TestAdmitWaitsThenAdmits(t *testing.T) {
 		t.Fatalf("Admit returned while the budget was full: %+v", r)
 	default:
 	}
-	if err := holder.Close(); err != nil {
-		t.Fatal(err)
-	}
+	closeAtOnce(t, dir, holder)
 	r := waitResult(t, ch)
 	if r.err != nil || r.ad.Mode != runner.ModeQueued || r.ad.Need != 3 {
 		t.Fatalf("Admit = %+v, %v; want queued, need 3", r.ad, r.err)
@@ -516,7 +514,7 @@ func TestRunnerAdmittedLines(t *testing.T) {
 	ch := admitAsync(context.Background(), h, alpha("r1"))
 	waitTickets(t, dir, 3)
 	h.clk.Advance(12400 * time.Millisecond)
-	holder.Close()
+	closeAtOnce(t, dir, holder)
 	r := waitResult(t, ch)
 	if r.err != nil || r.ad.Mode != runner.ModeQueued {
 		t.Fatalf("Admit = %+v, %v; want queued", r.ad, r.err)
