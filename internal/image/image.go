@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -203,9 +204,11 @@ var versionLine = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+`)
 // PreflightVersion is Preflight that also returns the runner version the image
 // printed. The run starts as RunUser of the image. When the entrypoint reports
 // that it runs as uid 0 (a passwd name such as toor), it runs again as
-// DefaultUser; when it reports gid 0 (a passwd entry whose primary group is
-// root), it runs again as the same user with defaultGroup. The user of the
-// last run is the one returned. A job never starts as root or in group root.
+// DefaultUser; when it reports gid 0 or group 0 among its supplementary groups
+// (a passwd entry whose primary group is root, a member of root in
+// /etc/group), it runs again as the same user with defaultGroup: with a group
+// given, Docker adds no supplementary groups. The user of the last run is the
+// one returned. A job never starts as root or in group root.
 //
 // The uid line is printed inside the image, so this guards against an image
 // that is root by mistake, not one built to be: such an image could fake the
@@ -221,7 +224,7 @@ func PreflightVersion(ctx context.Context, d Docker, ref string, m runnermount.M
 	case err == nil && id.uid == 0 && user != DefaultUser:
 		user = DefaultUser
 		id, version, err = preflightAs(ctx, d, ref, m, user)
-	case err == nil && id.gid == 0:
+	case err == nil && (id.gid == 0 || id.rootGroup):
 		name, _, _ := strings.Cut(user, ":")
 		user = name + ":" + defaultGroup
 		id, version, err = preflightAs(ctx, d, ref, m, user)
@@ -231,16 +234,20 @@ func PreflightVersion(ctx context.Context, d Docker, ref string, m runnermount.M
 		return "", "", err
 	case id.uid == 0:
 		return "", "", fmt.Errorf("preflight of %s: user %s runs as root", ref, user)
-	case id.gid == 0:
+	case id.gid == 0 || id.rootGroup:
 		return "", "", fmt.Errorf("preflight of %s: user %s runs in group root", ref, user)
 	}
 	return user, version, nil
 }
 
-// ids are the effective uid and gid the entrypoint reported.
-type ids struct{ uid, gid int }
+// ids are the effective uid and gid the entrypoint reported, and whether
+// group 0 is among the supplementary groups.
+type ids struct {
+	uid, gid  int
+	rootGroup bool
+}
 
-var idLine = regexp.MustCompile(`^local-ci: uid ([0-9]+) gid ([0-9]+)$`)
+var idLine = regexp.MustCompile(`^local-ci: uid ([0-9]+) gid ([0-9]+) groups((?: [0-9]+)*)$`)
 
 // preflightAs runs the entrypoint with --preflight as user and returns the
 // effective uid and gid and the runner version it printed. The entrypoint is set as
@@ -322,7 +329,7 @@ func preflightAs(ctx context.Context, d Docker, ref string, m runnermount.Mount,
 			if uerr != nil || gerr != nil {
 				break
 			}
-			return ids{uid, gid}, version, nil
+			return ids{uid: uid, gid: gid, rootGroup: slices.Contains(strings.Fields(mm[3]), "0")}, version, nil
 		}
 	}
 	return ids{}, "", fmt.Errorf("preflight of %s as user %s printed no uid:\n%s", ref, user, lastLines(out, failureLines))

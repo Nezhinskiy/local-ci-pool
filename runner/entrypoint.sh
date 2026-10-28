@@ -84,19 +84,27 @@ if has_icu; then
 fi
 
 if [ "$mode" = preflight ]; then
-	# The effective uid and gid, for the pool to refuse root and group root in
-	# whatever spelling the image's USER gave them (00, +0, a passwd name with
-	# uid 0 or primary group 0). They are read from the kernel: bash takes
+	# The effective uid and gid and the supplementary groups, for the pool to
+	# refuse root and group root in whatever spelling the image's USER gave
+	# them (00, +0, a passwd name with uid 0 or primary group 0, a member of
+	# group root in /etc/group). They are read from the kernel: bash takes
 	# $EUID from the environment, which the image sets.
 	euid=''
 	egid=''
-	while read -r key _ effective _; do
+	groups=''
+	while read -r key list; do
 		case "$key" in
-		Uid:) euid=$effective ;;
-		Gid:) egid=$effective ;;
+		Uid:) euid=$list ;;
+		Gid:) egid=$list ;;
+		Groups:) groups=$list ;;
 		esac
 	done <"$proc_status"
-	echo "local-ci: uid $euid gid $egid"
+	# Uid: and Gid: list the real, effective, saved and filesystem ids.
+	euid=${euid#*[[:space:]]}
+	euid=${euid%%[[:space:]]*}
+	egid=${egid#*[[:space:]]}
+	egid=${egid%%[[:space:]]*}
+	echo "local-ci: uid $euid gid $egid groups $groups"
 	# A runner in an image with no CA bundle retries its TLS handshake forever
 	# while `--version` still passes, so the bundle is part of the check.
 	ca_ok=
