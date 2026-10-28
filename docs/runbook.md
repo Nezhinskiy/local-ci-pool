@@ -112,7 +112,7 @@ The pool writes no configuration. `config.toml` is yours; the installer creates 
 The pool keeps derived state only: its git mirrors under
 `~/Library/Caches/local-ci-pool`, the Docker images `local-ci-pool/runner:<version>` (the runner
 trees) and `local-ci/<identity>:<digest>` (the job images), one Docker network per pool
-instance, `local-ci-pool-main` (a probe's is `local-ci-pool-probe-<owner>`), which every job
+instance, `local-ci-pool-<instance>` (`main`, or `probe-<owner>` for a probe), which every job
 container of every project joins, with traffic between containers off and the default bridge's
 MTU, and the health token
 `~/Library/Application Support/local-ci-pool/health-<port>.token`. Deleting any of it costs a

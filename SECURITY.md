@@ -47,7 +47,8 @@ container is code from those repositories. It is not a sandbox for untrusted cod
   it would also break every image whose jobs rely on `sudo`. Keep such programs out of the images
   you serve.
 - Job containers join one bridge network per pool instance, shared by every project the instance
-  serves: `local-ci-pool-main` for the installed pool, `local-ci-pool-probe-<owner>` for a probe.
+  serves: `local-ci-pool-<instance>`, where the instance is `main` for the installed pool and
+  `probe-<owner>` for a probe.
   It is not one network per project. Traffic between the containers on it is off
   (`com.docker.network.bridge.enable_icc=false`), so a job cannot reach a port that another job
   opened, of its own repository or another, and cannot reach containers on Docker's default bridge
