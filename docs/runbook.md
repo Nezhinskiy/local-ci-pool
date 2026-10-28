@@ -42,8 +42,9 @@ the pool choose again:
 launchctl kickstart -k gui/$(id -u)/com.local-ci-pool.pool
 ```
 
-`-k` kills the running pool at once, like any stop that comes from launchd (see [launchd's 60-second
-limit](#launchds-60-second-limit)); stop it with `SIGTERM` as shown there if a job is running.
+`-k` stops the pool the way any stop that comes from launchd does, giving it at most 60 seconds (see
+[launchd's 60-second limit](#launchds-60-second-limit), where that was measured); stop it with
+`SIGTERM` as shown there if a job is running.
 
 ```sh
 gh auth status
@@ -338,12 +339,14 @@ fresh heartbeat, so the question is why this one did not.
 
    A run forced to `mode: hosted` prints none of them.
 
-3. **An example of a pool that was down.** On 2026-10-21 a pool stayed down for 42 hours. `gh auth
-   token` had failed to finish (its keychain lookup timed out on a stalled Mac), the pool took that
-   for a logout and exited 0, and launchd does not restart a pool that exits 0. Every run in those
-   42 hours went hosted, and a run's annotation said `is 1d 18h old` at the end. Since v0.3.2 the
-   pool does not exit on a token it cannot read: it retries, and `pool status` shows `login lost`
-   while `gh` cannot give a token (see [Install](#install)).
+3. **An example of a pool that was down.** On 2026-10-21 the pool started at 03:29. Its first
+   `gh auth token` ran until 03:55 and exited 1, and the pool took that for a logout: it logged
+   `terminal: gh logged out` and exited 0, which launchd never restarts. It stayed down for 42 hours
+   with the login intact. `gh` exits 1 both when it is logged out and when its keychain lookup times
+   out, so that status proves nothing. The annotations did not exist yet; a run after 42 hours of
+   that would show `is 1d 18h old` in the second warning above. Since v0.3.2 the pool does not exit
+   on a token it cannot read: it retries, and `pool status` shows `login lost` while `gh` cannot
+   give a token (see [Install](#install)).
 
 ## The budget settings
 

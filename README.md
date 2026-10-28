@@ -18,8 +18,6 @@ operations.
   are not there unless your image has them.
 - A Mac must be awake and logged in.
 
-Supported upstream: `actions/scaleset v0.4.0`, pinned exactly.
-
 ## Quickstart
 
 1. Log in to GitHub and start Docker (Engine 28 or newer):
@@ -124,7 +122,8 @@ jobs:
     runs-on: ${{ needs.route.outputs.label }}
     strategy:
       matrix:
-        shard: [1, 2, 3, 4]
+        # `shards` is 1 to 4: this maps it to that many matrix entries.
+        shard: ${{ fromJSON('{"1":[1],"2":[1,2],"3":[1,2,3],"4":[1,2,3,4]}')[needs.route.outputs.shards] }}
     steps:
       - run: echo "shard ${{ matrix.shard }} of ${{ needs.route.outputs.shards }}"
 ```
@@ -134,7 +133,9 @@ instructions whether it lands on the Mac or falls back, and it costs less than t
 available to a private repository of a personal account on 2026-10-28. Where your account has no
 arm runners, or your Mac is an Intel one, pass `hosted-label: ubuntu-24.04` instead.
 
-Pin the action by its full commit SHA; Renovate's `github-actions` manager keeps it current.
+Pin the action by its full commit SHA; Renovate's `github-actions` manager keeps it current. Take the
+SHA from a release that has `local-label` and the annotations below, v0.4.0 or later:
+`git rev-parse v0.4.0^{commit}`.
 
 | Input | Meaning |
 |---|---|
@@ -236,7 +237,7 @@ documentation did not settle it.
 | [gharp](https://github.com/muhac/actions-runner-pool) | any Docker host; needs a public HTTPS URL | yes (webhook-driven containers) | none | n/a | yes |
 | [omniaura/mac-runner](https://github.com/omniaura/mac-runner) | macOS 13+ | no (persistent native runners) | via runner-fallback-action | fine-grained PAT, *Administration: Read-only* | repository or organization |
 | [Tartelet](https://github.com/framna-dk/tartelet) | macOS (Tart VMs) | unverified | unverified | unverified | unverified |
-| [runner-fallback-action](https://github.com/mikehardy/runner-fallback-action) | a selector, not a runner: lists the registered self-hosted runners through the REST API | n/a | yes; behaviour with a scale-to-zero pool: pending Task 10 | PAT, *Administration: Read* (repository) or organization admin | yes |
+| [runner-fallback-action](https://github.com/mikehardy/runner-fallback-action) | a selector, not a runner: lists the registered self-hosted runners through the REST API | n/a | yes; behaviour with a scale-to-zero pool: unverified | PAT, *Administration: Read* (repository) or organization admin | yes |
 | [ARC](https://github.com/actions/actions-runner-controller) | Kubernetes | unverified | unverified | unverified | unverified |
 | [rhobuild/runpool](https://github.com/rhobuild/runpool) | Linux, rootful Docker Engine 28 | yes (a capsule per job with an inner dockerd) | unverified | unverified | unverified |
 
@@ -274,6 +275,8 @@ budget off, set `enabled = false` or delete the file. The runbook covers
 waits](docs/runbook.md#ci-is-waiting).
 
 ## Development
+
+Supported upstream: `actions/scaleset v0.4.0`, pinned exactly.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). The code that adapts `actions/scaleset` is credited in
 [third_party/NOTICE](third_party/NOTICE). This project is released under the [MIT License](LICENSE).
