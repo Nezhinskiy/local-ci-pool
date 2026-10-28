@@ -68,6 +68,7 @@ done
 
 jq -s -r '
   def secs: fromdateiso8601;
+  def clean: gsub("[\u0000-\u001f\u007f-\u009f|]"; "?");
   def span: (.completed_at | secs) - (.started_at | secs);
   def step($j; $name):
     ([$j.steps[]? | select(.name == $name)] | first)
@@ -91,13 +92,14 @@ jq -s -r '
   | "| label | n | queue p50 | setup p50 | build p50 | test p50 | test min–max |",
     "|---|---:|---:|---:|---:|---:|---:|",
     ($rows[] | . as $r | $r.ok as $ok
-      | "| \($r.label) | \($ok | length) | \($ok | map(.queue) | cell) | \($ok | map(.setup) | cell) | \($ok | map(.build) | cell) | \($ok | map(.test) | cell) | \(if ($ok | length) == 0 then "-" else "\($ok | map(.test) | min)–\($ok | map(.test) | max)" end) |"),
+      | "| \($r.label | clean) | \($ok | length) | \($ok | map(.queue) | cell) | \($ok | map(.setup) | cell) | \($ok | map(.build) | cell) | \($ok | map(.test) | cell) | \(if ($ok | length) == 0 then "-" else "\($ok | map(.test) | min)–\($ok | map(.test) | max)" end) |"),
     (if any($rows[]; .failed > 0) then "" else empty end),
-    ($rows[] | select(.failed > 0) | "failed: \(.label) \(.failed)")
+    ($rows[] | select(.failed > 0) | "failed: \(.label | clean) \(.failed)")
 ' "${files[@]}"
 
 # An empty row looks like a valid table; make it loud.
-empty="$(jq -s -r '[.[].jobs[]] | group_by(.labels[0])[] | select(all(.conclusion != "success")) | .[0].labels[0]' "${files[@]}")"
+empty="$(jq -s -r 'def clean: gsub("[\u0000-\u001f\u007f-\u009f|]"; "?");
+  [.[].jobs[]] | group_by(.labels[0])[] | select(all(.conclusion != "success")) | .[0].labels[0] | clean' "${files[@]}")"
 if [ -n "$empty" ]; then
   while IFS= read -r label; do
     echo "bench-report: $label has no successful job; its row is empty" >&2

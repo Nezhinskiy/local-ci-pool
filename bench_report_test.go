@@ -115,3 +115,27 @@ func TestBenchReportRefusesUnfinishedRuns(t *testing.T) {
 		t.Errorf("exit code = %d, want 2", code)
 	}
 }
+
+// A label comes from the GitHub API, where anyone who can edit a workflow
+// chooses it. An escape sequence must not reach the terminal and a pipe must
+// not add a column: each becomes "?", in the table, the failed line and the
+// stderr line alike.
+func TestBenchReportCleansLabels(t *testing.T) {
+	out, errOut, code := runBenchReport(t, "hostile", "501")
+	wantOut := `| label | n | queue p50 | setup p50 | build p50 | test p50 | test min–max |
+|---|---:|---:|---:|---:|---:|---:|
+| alpha?[2J?x | 1 | 4 | 12 | 22 | 30 | 30–30 |
+| beta??y | 0 | - | - | - | - | - |
+
+failed: beta??y 1
+`
+	if out != wantOut {
+		t.Errorf("stdout mismatch\n got: %q\nwant: %q", out, wantOut)
+	}
+	if want := "bench-report: beta??y has no successful job; its row is empty\n"; errOut != want {
+		t.Errorf("stderr = %q, want %q", errOut, want)
+	}
+	if code != 3 {
+		t.Errorf("exit code = %d, want 3", code)
+	}
+}

@@ -1,0 +1,147 @@
+{
+  "total_count": 2,
+  "jobs": [
+    {
+      "id": 5001,
+      "run_id": 501,
+      "name": "bench (hostile, 1)",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-28T10:00:00Z",
+      "started_at": "2026-10-28T10:00:04Z",
+      "completed_at": "2026-10-28T10:01:11Z",
+      "labels": [
+        "alpha\u001b[2J|x"
+      ],
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 1,
+          "started_at": "2026-10-28T10:00:04Z",
+          "completed_at": "2026-10-28T10:00:05Z"
+        },
+        {
+          "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 2,
+          "started_at": "2026-10-28T10:00:05Z",
+          "completed_at": "2026-10-28T10:00:07Z"
+        },
+        {
+          "name": "Set up Go",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 3,
+          "started_at": "2026-10-28T10:00:07Z",
+          "completed_at": "2026-10-28T10:00:13Z"
+        },
+        {
+          "name": "Download modules",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 4,
+          "started_at": "2026-10-28T10:00:13Z",
+          "completed_at": "2026-10-28T10:00:19Z"
+        },
+        {
+          "name": "Build",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 5,
+          "started_at": "2026-10-28T10:00:19Z",
+          "completed_at": "2026-10-28T10:00:41Z"
+        },
+        {
+          "name": "Test",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 6,
+          "started_at": "2026-10-28T10:00:41Z",
+          "completed_at": "2026-10-28T10:01:11Z"
+        },
+        {
+          "name": "Complete job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 7,
+          "started_at": "2026-10-28T10:01:11Z",
+          "completed_at": "2026-10-28T10:01:11Z"
+        }
+      ]
+    },
+    {
+      "id": 5002,
+      "run_id": 501,
+      "name": "bench (hostile, 2)",
+      "status": "completed",
+      "conclusion": "failure",
+      "created_at": "2026-10-28T10:00:00Z",
+      "started_at": "2026-10-28T10:00:04Z",
+      "completed_at": "2026-10-28T10:01:11Z",
+      "labels": [
+        "beta\u009b|y"
+      ],
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 1,
+          "started_at": "2026-10-28T10:00:04Z",
+          "completed_at": "2026-10-28T10:00:05Z"
+        },
+        {
+          "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 2,
+          "started_at": "2026-10-28T10:00:05Z",
+          "completed_at": "2026-10-28T10:00:07Z"
+        },
+        {
+          "name": "Set up Go",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 3,
+          "started_at": "2026-10-28T10:00:07Z",
+          "completed_at": "2026-10-28T10:00:13Z"
+        },
+        {
+          "name": "Download modules",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 4,
+          "started_at": "2026-10-28T10:00:13Z",
+          "completed_at": "2026-10-28T10:00:19Z"
+        },
+        {
+          "name": "Build",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 5,
+          "started_at": "2026-10-28T10:00:19Z",
+          "completed_at": "2026-10-28T10:00:41Z"
+        },
+        {
+          "name": "Test",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 6,
+          "started_at": "2026-10-28T10:00:41Z",
+          "completed_at": "2026-10-28T10:01:11Z"
+        },
+        {
+          "name": "Complete job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 7,
+          "started_at": "2026-10-28T10:01:11Z",
+          "completed_at": "2026-10-28T10:01:11Z"
+        }
+      ]
+    }
+  ]
+}
