@@ -239,9 +239,20 @@ documentation did not settle it.
 | [gharp](https://github.com/muhac/actions-runner-pool) | any Docker host; needs a public HTTPS URL | yes (webhook-driven containers) | none | n/a | yes |
 | [omniaura/mac-runner](https://github.com/omniaura/mac-runner) | macOS 13+ | no (persistent native runners) | via runner-fallback-action | fine-grained PAT, *Administration: Read-only* | repository or organization |
 | [Tartelet](https://github.com/framna-dk/tartelet) | macOS (Tart VMs) | unverified | unverified | unverified | unverified |
-| [runner-fallback-action](https://github.com/mikehardy/runner-fallback-action) | a selector, not a runner: lists the registered self-hosted runners through the REST API | n/a | yes; behaviour with a scale-to-zero pool: unverified | PAT, *Administration: Read* (repository) or organization admin | yes |
+| [runner-fallback-action](https://github.com/mikehardy/runner-fallback-action) | a selector, not a runner: lists the registered self-hosted runners through the REST API | n/a | yes, but with a scale-set pool it chose the hosted runner every time we tried, also while a Mac was free (tested, see below) | PAT, *Administration: Read* (repository) or organization admin | yes |
 | [ARC](https://github.com/actions/actions-runner-controller) | Kubernetes | unverified | unverified | unverified | unverified |
 | [rhobuild/runpool](https://github.com/rhobuild/runpool) | Linux, rootful Docker Engine 28 | yes (a capsule per job with an inner dockerd) | unverified | unverified | unverified |
+
+The runner-fallback-action row was tested on 2026-10-28 against this pool. The action was at commit
+`dc7732f`, with `primaries-required: 1` and a PAT with *Administration: Read-only*. It chose the
+hosted runner in all three cases:
+
+- the pool was idle, with no runner registered;
+- one runner was online and busy;
+- one of two Macs was stopped.
+
+Each time a Mac could take the job, and `route` sent it there. The runners API lists a scale-set
+runner with no labels, so a label check cannot match it.
 
 ## Core budget (optional)
 
