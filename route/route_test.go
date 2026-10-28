@@ -194,9 +194,19 @@ func TestRouteSelection(t *testing.T) {
 				t.Errorf("got label=%s shards=%s local=%s, want label=%s shards=%s local=%s",
 					got["label"], got["shards"], got["local"], c.want[0], c.want[1], c.want[2])
 			}
+			// The selected: line is the last stdout line and the only one that is
+			// not a workflow-command annotation (a fallback prints one first).
 			lines := strings.Split(strings.TrimSuffix(r.stdout, "\n"), "\n")
-			if len(lines) != 1 || !strings.HasPrefix(lines[0], "selected: ") {
-				t.Errorf("want exactly one stdout line starting with %q, got %q", "selected: ", r.stdout)
+			if !strings.HasPrefix(lines[len(lines)-1], "selected: ") {
+				t.Errorf("want the last stdout line to start with %q, got %q", "selected: ", r.stdout)
+			}
+			if len(lines) > 2 {
+				t.Errorf("want at most one annotation before the selected: line, got %q", r.stdout)
+			}
+			for _, l := range lines[:len(lines)-1] {
+				if !strings.HasPrefix(l, "::warning title=local-ci-pool::") && !strings.HasPrefix(l, "::notice title=local-ci-pool::") {
+					t.Errorf("unexpected stdout line %q", l)
+				}
 			}
 			if _, err := os.Stat(filepath.Join(r.workdir, "x")); err == nil {
 				t.Error("file x exists: a key was executed as shell")
@@ -350,5 +360,104 @@ func TestActionWiring(t *testing.T) {
 	}
 	if strings.Contains(text, "fromJSON") {
 		t.Error("the action must not require fromJSON")
+	}
+}
+
+// annotations returns the workflow-command lines (::warning / ::notice) on
+// stdout.
+func annotations(stdout string) []string {
+	var out []string
+	for _, l := range strings.Split(strings.TrimSuffix(stdout, "\n"), "\n") {
+		if strings.HasPrefix(l, "::") {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func wantOneAnnotation(t *testing.T, r result, want string) {
+	t.Helper()
+	if r.exit != 0 {
+		t.Fatalf("exit %d\nstdout: %s\nstderr: %s", r.exit, r.stdout, r.stderr)
+	}
+	got := annotations(r.stdout)
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("annotations = %q, want exactly [%q]\nstdout: %s", got, want, r.stdout)
+	}
+	if !strings.Contains(r.stdout, "selected: ") {
+		t.Errorf("the selected: line is gone from stdout: %q", r.stdout)
+	}
+}
+
+func TestRouteWarnsWhenHeartbeatsAreStale(t *testing.T) {
+	r := runRoute(t, map[string]string{
+		"VARS_JSON": `{"CI_POOL_HB_M1":"992800 4","CI_POOL_HB_M2":"900000 2"}`, // newest 7200 s old
+	})
+	wantOneAnnotation(t, r, "::warning title=local-ci-pool::no fresh Mac heartbeat (the newest, CI_POOL_HB_M1, is 2h 0m old); running on ubuntu-24.04")
+	got := parseOutputs(t, r)
+	if got["label"] != hostedLabel || got["local"] != "false" {
+		t.Errorf("got %v, want the hosted label", got)
+	}
+}
+
+func TestRouteNoticeWhenNoHeartbeats(t *testing.T) {
+	r := runRoute(t, map[string]string{"VARS_JSON": "{}"})
+	wantOneAnnotation(t, r, "::notice title=local-ci-pool::no Mac heartbeat found; running on ubuntu-24.04")
+	if got := parseOutputs(t, r); got["label"] != hostedLabel || got["local"] != "false" {
+		t.Errorf("got %v, want the hosted label", got)
+	}
+}
+
+func TestRouteStaleHeartbeatFromTheFuture(t *testing.T) {
+	r := runRoute(t, map[string]string{"VARS_JSON": `{"CI_POOL_HB_M1":"1000100 4"}`}) // 100 s ahead, beyond the 30 s skew
+	wantOneAnnotation(t, r, "::warning title=local-ci-pool::no fresh Mac heartbeat (the newest, CI_POOL_HB_M1, is in the future); running on ubuntu-24.04")
+	if got := parseOutputs(t, r); got["label"] != hostedLabel || got["local"] != "false" {
+		t.Errorf("got %v, want the hosted label", got)
+	}
+}
+
+func TestRouteNoAnnotationWhenLocal(t *testing.T) {
+	r := runRoute(t, map[string]string{"VARS_JSON": `{"CI_POOL_HB_M1":"1000000 3"}`})
+	if r.exit != 0 {
+		t.Fatalf("exit %d: %s", r.exit, r.stderr)
+	}
+	if got := parseOutputs(t, r); got["local"] != "true" {
+		t.Errorf("got %v, want local=true", got)
+	}
+	if strings.Contains(r.stdout, "::warning") || strings.Contains(r.stdout, "::notice") {
+		t.Errorf("annotation printed for a local selection: %q", r.stdout)
+	}
+}
+
+func TestRouteNoAnnotationWhenForcedHosted(t *testing.T) {
+	r := runRoute(t, map[string]string{"VARS_JSON": `{"CI_POOL_HB_M1":"1000000 3"}`, "MODE": "hosted"})
+	if r.exit != 0 {
+		t.Fatalf("exit %d: %s", r.exit, r.stderr)
+	}
+	if got := parseOutputs(t, r); got["local"] != "false" || got["label"] != hostedLabel {
+		t.Errorf("got %v, want the hosted label", got)
+	}
+	if strings.Contains(r.stdout, "::warning") || strings.Contains(r.stdout, "::notice") {
+		t.Errorf("annotation printed for mode hosted: %q", r.stdout)
+	}
+}
+
+func TestFmtAge(t *testing.T) {
+	cases := []struct {
+		age  int
+		want string
+	}{
+		{301, "5m"},
+		{3599, "59m"},
+		{3600, "1h 0m"},
+		{86400, "1d 0h"},
+		{151200, "1d 18h"},
+	}
+	for _, c := range cases {
+		t.Run(c.want, func(t *testing.T) {
+			vars := fmt.Sprintf(`{"CI_POOL_HB_M1":"%d 2"}`, 1000000-c.age)
+			r := runRoute(t, map[string]string{"VARS_JSON": vars})
+			wantOneAnnotation(t, r, "::warning title=local-ci-pool::no fresh Mac heartbeat (the newest, CI_POOL_HB_M1, is "+c.want+" old); running on ubuntu-24.04")
+		})
 	}
 }
