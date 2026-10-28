@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
@@ -93,6 +94,11 @@ const (
 // drains at once, so the drain bound plus afterBound is the longest a stop
 // takes. A variable so tests can shorten it.
 var afterBound = DefaultAfterBound
+
+// visibleFor is how long GitHub's answer that a repository is private lets
+// its runners start (project.vet): the longest a repository that turned
+// public can still get a runner. A variable so tests can change it.
+var visibleFor = time.Minute
 
 // joinBound bounds a drain's wait, after its abort, for the scaler's waiter
 // goroutines, and Run's own after a fatal error: a waiter whose Admit outlives
@@ -324,6 +330,9 @@ type Supervisor struct {
 	mount    runnermount.Mount
 	dockerOK bool
 	projects map[string]*project // by owner/name
+	// public lists, by owner/name, the projects drained because their
+	// repository turned public, until the repository is served again.
+	public map[string]ProjectHealth
 	// survivors are the runners of a previous run still running at start, by
 	// runner name (survivors.go).
 	survivors map[string]*survivor
@@ -359,6 +368,7 @@ func New(cfg Config, deps Deps) *Supervisor {
 		reconcile: make(chan struct{}, 1),
 		capacity:  make(chan struct{}, 1),
 		projects:  map[string]*project{},
+		public:    map[string]ProjectHealth{},
 		survivors: map[string]*survivor{},
 	}
 	if s.deps.Detect == nil {
@@ -704,6 +714,7 @@ func (s *Supervisor) startLocked(life context.Context, p discovery.Project) {
 	if old := s.projects[p.Repo]; old != nil {
 		old.cancel() // a failed project; its goroutine has returned
 	}
+	delete(s.public, p.Repo)
 	pr := newProject(s, life, p)
 	s.projects[p.Repo] = pr
 	pr.log.Info("serving the project")
@@ -716,9 +727,13 @@ func (s *Supervisor) drainLocked(life context.Context, pr *project, deadline tim
 	}
 	s.goLocked(func() {
 		if pr.drain(life, deadline) {
+			h := pr.health()
 			s.mu.Lock()
 			if s.projects[pr.repo] == pr {
 				delete(s.projects, pr.repo)
+				if pr.isPublic() {
+					s.public[pr.repo] = ProjectHealth{Repo: h.Repo, Identity: h.Identity, Image: h.Image, Reason: h.Reason}
+				}
 			}
 			s.mu.Unlock()
 		}
@@ -726,7 +741,7 @@ func (s *Supervisor) drainLocked(life context.Context, pr *project, deadline tim
 }
 
 // requestDrain drains a project from its own goroutine's request, such as a
-// repository found public before a session opens.
+// repository found public (a drain already running then ends at once).
 func (s *Supervisor) requestDrain(pr *project) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -853,6 +868,12 @@ func (s *Supervisor) Snapshot() Snapshot {
 	slots := s.slots
 	prs := s.projectList()
 	survivors := s.survivorCountsLocked()
+	var gone []ProjectHealth
+	for _, repo := range slices.Sorted(maps.Keys(s.public)) {
+		if s.projects[repo] == nil {
+			gone = append(gone, s.public[repo])
+		}
+	}
 	s.mu.Unlock()
 	if slots != nil {
 		snap.Slots, snap.InUse, snap.Busy = slots.Cap(), slots.InUse(), slots.Busy()
@@ -869,6 +890,7 @@ func (s *Supervisor) Snapshot() Snapshot {
 		h.Admitted.FailOpen += c.FailOpen
 		snap.Projects = append(snap.Projects, h)
 	}
+	snap.Projects = append(snap.Projects, gone...)
 	return snap
 }
 

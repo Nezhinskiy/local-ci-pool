@@ -6,7 +6,13 @@ The pool serves **private repositories that you own and trust**. Everything that
 container is code from those repositories. It is not a sandbox for untrusted code:
 
 - Do not point it at a repository that accepts workflow runs from forks or from people you do not
-  trust. Public repositories are refused.
+  trust. Public repositories are refused. A served repository that turns public can still get a
+  runner for at most one minute: before each runner starts, the pool needs GitHub's answer that the
+  repository is private, and it caches that answer for one minute. While the project has jobs
+  assigned, the pool also asks again at its listener's next call (about every 50 seconds) once
+  the answer is a minute old. When the answer is "not private", it refuses the runner, stops and
+  removes the project's job containers at once, busy ones included, and deletes the scale set. A
+  failed check refuses the runner too; it is never read as private.
 - Repository owner, pool operator and the account behind the GitHub login are the same person.
 
 ## Blast radius

@@ -232,12 +232,18 @@ moment are lost with the containers; a job assigned to the pool at that time is 
   next discovery pass (every 10 minutes), builds or pulls the image, runs a preflight, and starts a
   listener. The project shows in `/healthz`; its heartbeat appears once it is healthy.
 - **Out:** remove the marker from the default branch. The pool drains the project (running jobs
-  finish, no new ones start) and deletes its scale set. A repository that turns public, or moves to
-  another owner, is drained the same way.
+  finish, no new ones start) and deletes its scale set. A repository that moves to another owner is
+  drained the same way.
 - **Making a served repository public:** stop the pool first (`./install.sh --uninstall`, or by hand
-  as in [launchd's 60-second limit](#launchds-60-second-limit)). The pool notices the change on its next discovery pass,
-  up to 10 minutes later, and in that window a pull request from a fork could target
-  `<identity>-local` directly and run on this Mac.
+  as in [launchd's 60-second limit](#launchds-60-second-limit)). A running pool needs GitHub's
+  answer that the repository is private, at most one minute old, before it starts a runner, and asks
+  again while jobs are assigned. So for up to a minute after the change, a pull request from a fork
+  could still target `<identity>-local` directly and run on this Mac. When a runner start or a
+  listener call sees the change, the pool logs a WARN line, removes the project's job containers at
+  once, busy ones included, and deletes the scale set. `/healthz` and `pool status` then list the
+  project as unhealthy with the reason `the repository is no longer private`, until it is private
+  and served again or the pool restarts. A discovery pass that sees the change first drains the
+  project as for a removed marker; its capacity is zero from then on, so no new job reaches it.
 - **Repository names:** the `route` action accepts identities of 1 to 40 characters. A repository
   whose identity is longer fails its route job visibly; rename it to use the pool.
 

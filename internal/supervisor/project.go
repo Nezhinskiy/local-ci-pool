@@ -74,10 +74,21 @@ type project struct {
 	freeSince, lastQueuedCheck time.Time
 	stuck                      []StuckJob
 	warned                     map[int64]bool
+
+	// privateAt is when GitHub last answered that the repository is private
+	// (vet); public: it answered that it is not, and the project is leaving.
+	privateAt time.Time
+	public    bool
+	// vetMu lets one visibility call run at a time, so runners vetted
+	// together share its answer.
+	vetMu sync.Mutex
 }
 
 // errLeft stops a project's run when it asked for its own drain.
 var errLeft = errors.New("the repository is no longer served")
+
+// notPrivate is the reason of a project whose repository turned public.
+const notPrivate = "the repository is no longer private: its runners are refused and its containers removed"
 
 func newProject(s *Supervisor, life context.Context, p discovery.Project) *project {
 	prefix := ""
@@ -188,6 +199,7 @@ func (pr *project) setup() error {
 		Project:   pr.identity,
 		Survivors: func() int { return s.survivorsOf(pr.identity) },
 		Now:       s.deps.Clock.Now,
+		Vet:       pr.vet,
 	})
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
@@ -390,23 +402,93 @@ func (pr *project) serveOnce() error {
 }
 
 // recheck asks GitHub again, before a session opens, whether the repository
-// is still there, still under the same owner and name (a case-only rename
-// aside), and private. One that is not is drained; the run returns errLeft.
+// is still served (checkRepo); the run returns errLeft when it is not.
 func (pr *project) recheck() error {
-	r, err := pr.s.deps.GitHub.Repo(pr.ctx, pr.repo)
-	switch {
-	case errors.Is(err, github.ErrNotFound), err == nil && (!r.Private || !strings.EqualFold(r.FullName, pr.repo)):
-		pr.log.Warn("the repository is gone, moved or no longer private; draining", "now", r.FullName)
-		pr.setDown("the repository is gone, moved or no longer private")
-		pr.s.requestDrain(pr)
-		return errLeft
-	case err != nil:
+	err := pr.checkRepo(pr.ctx)
+	if err != nil && !errors.Is(err, errLeft) {
 		if t := loginRejected(err); t != nil {
 			return t
 		}
 		return fmt.Errorf("re-checking the repository's visibility: %w", err)
 	}
+	return err
+}
+
+// vet is the scaler's Vet: the repository must be known to be private, by an
+// answer from GitHub no older than visibleFor, before a runner is minted. A
+// stale answer is asked again; an answer that the repository is not served
+// any more, or a failed call, refuses. A failure is never read as private.
+func (pr *project) vet(ctx context.Context) error {
+	pr.vetMu.Lock()
+	defer pr.vetMu.Unlock()
+	pr.mu.Lock()
+	at, public := pr.privateAt, pr.public
+	pr.mu.Unlock()
+	switch {
+	case public:
+		return errors.New(notPrivate)
+	case !at.IsZero() && pr.s.deps.Clock.Now().Sub(at) < visibleFor:
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+	err := pr.checkRepo(ctx)
+	if t := loginRejected(err); t != nil {
+		pr.s.fail(t)
+	}
+	if err != nil && !errors.Is(err, errLeft) {
+		return fmt.Errorf("checking the repository's visibility: %w", err)
+	}
+	return err
+}
+
+// checkRepo asks GitHub whether the repository is still there, still under
+// the same owner and name (a case-only rename aside), and private, and
+// records a private answer for vet. A repository no longer private is left at
+// once (leavePublic); one gone or moved is drained. Either returns errLeft.
+func (pr *project) checkRepo(ctx context.Context) error {
+	asked := pr.s.deps.Clock.Now()
+	r, err := pr.s.deps.GitHub.Repo(ctx, pr.repo)
+	switch {
+	case err == nil && !r.Private:
+		pr.leavePublic()
+		return errLeft
+	case errors.Is(err, github.ErrNotFound), err == nil && !strings.EqualFold(r.FullName, pr.repo):
+		if !pr.isDraining() {
+			pr.log.Warn("the repository is gone or moved; draining", "now", r.FullName)
+			pr.setDown("the repository is gone or moved")
+			pr.s.requestDrain(pr)
+		}
+		return errLeft
+	case err != nil:
+		return err
+	}
+	pr.mu.Lock()
+	pr.privateAt = asked
+	pr.mu.Unlock()
 	return nil
+}
+
+// leavePublic refuses the runners of a repository that turned public and
+// drains the project at once: its drain removes every runner it holds,
+// busy ones included, instead of waiting for their jobs (drain).
+func (pr *project) leavePublic() {
+	pr.mu.Lock()
+	first := !pr.public
+	pr.public, pr.privateAt = true, time.Time{}
+	pr.up, pr.reason = false, notPrivate
+	pr.mu.Unlock()
+	if !first {
+		return
+	}
+	pr.log.Warn("the repository is no longer private; refusing its runners and removing its containers now")
+	pr.s.requestDrain(pr)
+}
+
+func (pr *project) isPublic() bool {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	return pr.public
 }
 
 func (pr *project) currentID() int {
@@ -555,7 +637,8 @@ func (pr *project) claimRefresh() bool {
 }
 
 // drain stops the project for good: no new runners, then it waits until the
-// scaler holds no runner or the deadline passes, stops the listener, closes
+// scaler holds no runner or the deadline passes (at once, for a repository no
+// longer private), stops the listener, closes
 // the session and deletes the scale set, retrying a delete refused while a
 // job still runs until the deadline. Everything after the wait shares one
 // budget, afterBound past the later of now and the deadline, so a stop never
@@ -576,12 +659,20 @@ func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	}
 	pr.log.Info("draining")
 	for {
+		public := pr.isPublic()
+		if public && clock.Now().Before(deadline) {
+			deadline = clock.Now()
+		}
 		sc := pr.getScaler()
 		if sc == nil || len(sc.Held()) == 0 {
 			break
 		}
 		if !clock.Now().Before(deadline) {
-			pr.log.Warn("the drain bound passed with runners left; removing them", "runners", len(sc.Held()))
+			if public {
+				pr.log.Warn("removing the runners of a repository no longer private", "runners", len(sc.Held()))
+			} else {
+				pr.log.Warn("the drain bound passed with runners left; removing them", "runners", len(sc.Held()))
+			}
 			break
 		}
 		select {
@@ -785,6 +876,8 @@ func (pr *project) health() ProjectHealth {
 	pr.mu.Lock()
 	h := ProjectHealth{Repo: pr.repo, Identity: pr.identity, Image: pr.img.Ref}
 	switch {
+	case pr.public:
+		h.Reason = notPrivate
 	case pr.draining:
 		h.Reason = "draining"
 	case pr.failed || !pr.up:

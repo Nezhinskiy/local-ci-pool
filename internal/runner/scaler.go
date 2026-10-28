@@ -34,6 +34,8 @@ var (
 	// forgetTimeout bounds the best-effort unregistration of a runner that
 	// never started.
 	forgetTimeout = 30 * time.Second
+	// vetTimeout bounds Desired's vet.
+	vetTimeout = 30 * time.Second
 )
 
 // dipGrace is how long the assigned jobs must stay below the waiting runners
@@ -91,6 +93,13 @@ type ScalerConfig struct {
 	// Now is the clock that times a dip of the assigned jobs (dipGrace). Nil
 	// is time.Now.
 	Now func() time.Time
+	// Vet is asked right before each runner's JIT configuration is minted,
+	// and by every Desired call while the scale set has assigned jobs, so a
+	// job that lands on a runner already started is noticed too. An error
+	// refuses: the runner is not minted (its slot is released, and it is no
+	// no-job exit), and that Desired call starts no runner. The supervisor
+	// binds it to the repository's visibility, cached. Nil vets nothing.
+	Vet func(ctx context.Context) error
 }
 
 type runnerState int
@@ -144,6 +153,7 @@ type Scaler struct {
 	project    string
 	survivors  func() int
 	now        func() time.Time
+	vet        func(ctx context.Context) error
 	names      func() (string, error)
 
 	// abort ends every launch, reap and Admit in flight; see Abort.
@@ -190,6 +200,7 @@ func NewScaler(cfg ScalerConfig) *Scaler {
 		project:    cfg.Project,
 		survivors:  cfg.Survivors,
 		now:        now,
+		vet:        cfg.Vet,
 		names:      newName,
 		runners:    map[string]*record{},
 	}
@@ -237,11 +248,15 @@ func (s *Scaler) Desired(ctx context.Context, count int) (int, error) {
 		count -= s.survivors()
 	}
 	count = max(count, 0)
+	refused := count > 0 && !s.vetted(ctx)
 	// Enabled reads the gate's settings: once per call, never under s.mu.
 	gated := s.gate != nil && s.gate.Enabled()
 	s.mu.Lock()
 	need := min(s.slots.Cap(), count) - s.activeLocked()
 	s.mu.Unlock()
+	if refused {
+		need = 0
+	}
 	if gated {
 		for range max(need, 0) {
 			if !s.queue(ctx, count) {
@@ -263,6 +278,21 @@ func (s *Scaler) Desired(ctx context.Context, count int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.activeLocked(), nil
+}
+
+// vetted asks Vet, within vetTimeout, and reports whether it passed. A refusal
+// is logged.
+func (s *Scaler) vetted(ctx context.Context) bool {
+	if s.vet == nil {
+		return true
+	}
+	ctx, cancel := s.bounded(ctx, vetTimeout)
+	defer cancel()
+	if err := s.vet(ctx); err != nil {
+		s.log.Warn("refusing new runners", slog.String("error", err.Error()))
+		return false
+	}
+	return true
 }
 
 // reserve takes a slot for a new runner if the scale set is below its target.
@@ -359,19 +389,23 @@ func (s *Scaler) admit(ctx context.Context, cancel context.CancelFunc, name stri
 }
 
 // launch mints the runner's JIT configuration and starts its container,
-// within launchTimeout. On failure it unregisters the runner if its
-// configuration was minted, then releases its slot through Exited. A Drain that
-// lands while the configuration is minted is honoured the same way: the runner
-// is unregistered and released instead of started.
+// within launchTimeout. A runner Vet refuses is released without a mint. On
+// failure it unregisters the runner if its configuration was minted, then
+// releases its slot through Exited. A Drain that lands while the configuration
+// is minted is honoured the same way: the runner is unregistered and released
+// instead of started.
 func (s *Scaler) launch(ctx context.Context, name string, need int) bool {
 	ctx, cancel := s.bounded(ctx, launchTimeout)
 	defer cancel()
 	minted, err := s.startRunner(ctx, name, need)
 	if err != nil {
 		drained := errors.Is(err, errDrained)
-		if drained {
+		switch {
+		case drained:
 			s.log.Info("draining; not starting the runner", slog.String("runner", name))
-		} else {
+		case errors.Is(err, errRefused):
+			s.log.Warn("refusing the runner", slog.String("runner", name), slog.String("error", err.Error()))
+		default:
 			s.log.Error("starting a runner", slog.String("runner", name), slog.String("error", err.Error()))
 		}
 		if minted {
@@ -395,9 +429,17 @@ func (s *Scaler) launch(ctx context.Context, name string, need int) bool {
 // errDrained stops a start whose scaler began draining while it minted.
 var errDrained = errors.New("the scaler is draining")
 
+// errRefused stops a start that Vet refused before its mint.
+var errRefused = errors.New("vet refused the runner")
+
 // startRunner reports whether the JIT configuration was minted, which
 // registers the runner on GitHub, and any error.
 func (s *Scaler) startRunner(ctx context.Context, name string, need int) (minted bool, err error) {
+	if s.vet != nil {
+		if err := s.vet(ctx); err != nil {
+			return false, fmt.Errorf("%w: %w", errRefused, err)
+		}
+	}
 	s.mu.Lock()
 	id := s.scaleSetID
 	s.mu.Unlock()

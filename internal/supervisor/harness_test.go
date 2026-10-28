@@ -405,6 +405,9 @@ type fakeGitHub struct {
 	queued      map[string][]github.QueuedJob
 	queuedErr   error
 	queuedCalls int
+	// repoCalls counts the Repo calls: discovery's, the session's recheck and
+	// the visibility checks.
+	repoCalls int
 }
 
 func (g *fakeGitHub) QueuedJobs(_ context.Context, full string) ([]github.QueuedJob, error) {
@@ -453,6 +456,7 @@ func (g *fakeGitHub) ListPrivateOwnedRepos(context.Context) ([]github.Repo, erro
 func (g *fakeGitHub) Repo(_ context.Context, full string) (github.Repo, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.repoCalls++
 	r := g.repos[full]
 	if r == nil {
 		return github.Repo{}, github.ErrNotFound
@@ -490,6 +494,12 @@ func (g *fakeGitHub) edit(f func()) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	f()
+}
+
+func (g *fakeGitHub) repoAsks() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.repoCalls
 }
 
 func (g *fakeGitHub) listings() int {

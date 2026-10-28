@@ -770,7 +770,9 @@ func TestNowPublicRepoDrainsBeforeReopening(t *testing.T) {
 	if !h.logged("no longer private") {
 		t.Fatal("the reason is not logged")
 	}
-	h.eventually("the project removed", func() bool { _, ok := h.health(alphaRepo); return !ok })
+	if !h.refused(alphaRepo) {
+		t.Fatal("the project is not listed with the refusal")
+	}
 }
 
 // A scale set deleted under the pool is got-or-created again, and the scaler
