@@ -21,9 +21,10 @@ func TestListenerLogDropsThePollLine(t *testing.T) {
 		t.Fatalf("the poll line was written: %q", buf.String())
 	}
 
-	// Everything else the listener logs at Info is the record that GitHub
-	// handed the scale set a job, and stays.
-	for _, msg := range []string{"Handling initial session statistics", "Acquiring jobs", "Jobs acquired"} {
+	// The listener's only other Info line stays. (The record that GitHub
+	// handed the scale set a job, Acquiring jobs and Jobs acquired, now comes
+	// from the Adapter through the scaler's logger, not this one.)
+	for _, msg := range []string{"Handling initial session statistics"} {
 		buf.Reset()
 		l.Info(msg, "count", 1)
 		out := buf.String()

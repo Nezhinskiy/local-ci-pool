@@ -50,7 +50,9 @@ type Actions struct {
 	conflicts    int // the next n session creates answer 409; < 0 always
 	sessionGate  chan struct{}
 	failGets     int
-	stillRunning int // the next n scale set deletes answer JobStillRunning; < 0 always
+	failAcquires int         // the next n acquirejobs requests answer 500
+	polls        map[int]int // scale set -> message requests answered
+	stillRunning int         // the next n scale set deletes answer JobStillRunning; < 0 always
 	staleOnOpen  bool
 	rejected     map[string]bool // tokens the registration endpoint refuses
 	rejectAll    bool
@@ -89,6 +91,7 @@ func New(t testing.TB) *Actions {
 		runners:     map[string]*registered{},
 		rejected:    map[string]bool{},
 		capacity:    map[int]string{},
+		polls:       map[int]int{},
 		anyCapacity: map[int]bool{},
 	}
 	a.actionsServer = newServer(t, http.HandlerFunc(a.serve), WithRunnerRegistrationTokenHandler(a.registrationToken))
@@ -204,6 +207,22 @@ func (a *Actions) FailNextGets(n int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.failGets = n
+}
+
+// FailNextAcquires makes the next n acquirejobs requests answer 500. A failed
+// one is logged "POST acquirejobs <set> <n> failed".
+func (a *Actions) FailNextAcquires(n int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.failAcquires = n
+}
+
+// Polls is the number of message requests the scale set's listeners made
+// that were answered.
+func (a *Actions) Polls(name string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.polls[a.idLocked(name)]
 }
 
 // DeleteStillRunning makes the next n scale set deletes answer
@@ -487,7 +506,7 @@ func (a *Actions) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 // acquireJobs acquires every request asked for, and logs
-// "POST acquirejobs <set> <n>".
+// "POST acquirejobs <set> <n>", unless FailNextAcquires scripted a failure.
 func (a *Actions) acquireJobs(w http.ResponseWriter, r *http.Request, id int) {
 	var ids []int64
 	_ = json.NewDecoder(r.Body).Decode(&ids)
@@ -496,8 +515,18 @@ func (a *Actions) acquireJobs(w http.ResponseWriter, r *http.Request, id int) {
 	if ss := a.scaleSets[id]; ss != nil {
 		name = ss.Name
 	}
-	a.logLocked("POST acquirejobs %s %d", name, len(ids))
+	fail := a.failAcquires > 0
+	if fail {
+		a.failAcquires--
+		a.logLocked("POST acquirejobs %s %d failed", name, len(ids))
+	} else {
+		a.logLocked("POST acquirejobs %s %d", name, len(ids))
+	}
 	a.mu.Unlock()
+	if fail {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "scripted failure"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"count": len(ids), "value": ids})
 }
 
@@ -670,6 +699,7 @@ func (a *Actions) getMessage(w http.ResponseWriter, r *http.Request, id int) {
 		if open && (capacity != "0" || a.anyCapacity[id]) && len(a.queues[id]) > 0 {
 			m := a.queues[id][0]
 			a.queues[id] = a.queues[id][1:]
+			a.polls[id]++
 			a.mu.Unlock()
 			a.writeMessage(w, m)
 			return
@@ -679,6 +709,9 @@ func (a *Actions) getMessage(w http.ResponseWriter, r *http.Request, id int) {
 		select {
 		case <-changed:
 		case <-deadline:
+			a.mu.Lock()
+			a.polls[id]++
+			a.mu.Unlock()
 			w.WriteHeader(http.StatusAccepted)
 			return
 		case <-r.Context().Done():

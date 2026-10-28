@@ -277,9 +277,11 @@ for a token:
 `pool status` reads the same endpoint and prints it as text (see [CI went hosted](#ci-went-hosted)).
 
 The log leaves out the listener's per-poll line, `Getting next message`, which `actions/scaleset`
-writes before every poll of every scale set and which would be nearly all of it. Its other lines stay,
-among them `Handling initial session statistics`, `Acquiring jobs` and `Jobs acquired`: the last two
-are the only record that GitHub handed a scale set a job before a runner started.
+writes before every poll of every scale set and which would be nearly all of it. Its other line,
+`Handling initial session statistics`, stays. `Acquiring jobs` and `Jobs acquired` are written by the
+pool's scaler, with `scaleSetID`, before any runner of the job starts: they are the only record that
+GitHub handed a scale set a job. A failed acquisition is logged at Warn as `acquiring jobs failed`, and
+the listener keeps running: GitHub reissues an unacquired request after 5 minutes.
 
 The endpoint binds `127.0.0.1:8737` and answers only requests whose `Host` is a loopback name. A job
 can still reach it through Docker Desktop's host gateway address with a forged `Host`, and so learn
