@@ -23,12 +23,14 @@ import (
 	"github.com/Nezhinskiy/local-ci-pool/internal/runnermount"
 )
 
-// Two slots, both held by alpha; beta wants one and gets none. When an alpha
-// container exits, beta's runner starts on its listener's next nil-message
-// call, with no other trigger. No JobCompleted is ever delivered, so the
-// release can only come from the exit; the clock runs at wall speed, so the
-// watchdog's reconcile (first tick at 30 s) cannot stand in for the exit
-// event within the 10 s wait.
+// Two slots, both held by alpha; beta wants one and gets none. Beta advertises
+// 0 by then, but its job still reaches it, as a job github.com assigned on a
+// long poll sent before alpha took the slots does. When an alpha container
+// exits, beta's runner starts on its listener's next nil-message call, with
+// no other trigger. No JobCompleted is ever delivered, so the release can only
+// come from the exit; the clock runs at wall speed, so the watchdog's
+// reconcile (first tick at 30 s) cannot stand in for the exit event within
+// the 10 s wait.
 func TestBlockedProjectStartsAfterOtherFinishes(t *testing.T) {
 	h := newHarness(t, 2, 1, "alpha", "beta") // real time: the watchdog's first tick is 30 s away
 	h.start()
@@ -43,6 +45,8 @@ func TestBlockedProjectStartsAfterOtherFinishes(t *testing.T) {
 	h.actions.Started(alphaSet, alpha[1])
 	h.delivered(alphaSet)
 
+	h.eventually("beta advertises 0", func() bool { return h.actions.Capacity(betaSet) == "0" })
+	h.actions.IgnoreCapacity(betaSet)
 	h.actions.Assign(betaSet, 1)
 	h.delivered(betaSet)
 	time.Sleep(3 * 20 * time.Millisecond) // a few of beta's nil-message calls
