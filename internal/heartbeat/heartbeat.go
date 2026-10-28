@@ -75,9 +75,11 @@ type Config struct {
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 	// Fatal, if set, is asked about every failed write while the context is
-	// live. It returns true when err means the GitHub login is lost
-	// (supervisor.Supervisor.FailOnLoginLoss), which ends the process; Run
-	// then returns, because no later write can succeed.
+	// live. It returns true when err means the GitHub login is lost, GitHub
+	// refusing a token read again (supervisor.Supervisor.FailOnLoginLoss),
+	// which ends the process; Run then returns, because no later write can
+	// succeed. A token gh cannot give just now is not that: the write is
+	// logged and the next beat tries again.
 	Fatal func(err error) bool
 	// Log receives write failures; nil discards them.
 	Log *slog.Logger

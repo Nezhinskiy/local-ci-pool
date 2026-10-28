@@ -14,7 +14,9 @@ import (
 )
 
 // ErrNoToken is wrapped by every error of Token: the token could not be read
-// (gh is not logged in, or not installed, or printed nothing).
+// (gh is not logged in, or not installed, or printed nothing). It does not
+// prove a logout: gh exits 1 as well when its keychain lookup times out (60 s
+// in gh 2.x), which a slow or stalled Mac can make it do.
 var ErrNoToken = errors.New("reading the GitHub token")
 
 // Source reads and caches the token.
@@ -23,6 +25,11 @@ type Source struct {
 
 	mu  sync.Mutex
 	tok string
+
+	// failed is the error of the last read, nil once one succeeded. It has
+	// its own lock so ReadErr does not wait for a read in progress.
+	failedMu sync.Mutex
+	failed   error
 }
 
 // NewSource returns a Source that obtains the token from run. A nil run
@@ -57,6 +64,18 @@ func (s *Source) Token(ctx context.Context) (string, error) {
 	if s.tok != "" {
 		return s.tok, nil
 	}
+	tok, err := s.read(ctx)
+	s.failedMu.Lock()
+	s.failed = err
+	s.failedMu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	s.tok = tok
+	return tok, nil
+}
+
+func (s *Source) read(ctx context.Context) (string, error) {
 	out, err := s.run(ctx)
 	if err != nil {
 		return "", fmt.Errorf("%w: %w", ErrNoToken, err)
@@ -66,8 +85,15 @@ func (s *Source) Token(ctx context.Context) (string, error) {
 	if tok == "" {
 		return "", fmt.Errorf("%w: the token is empty (is `gh` logged in?)", ErrNoToken)
 	}
-	s.tok = tok
 	return tok, nil
+}
+
+// ReadErr returns the error of the last read of the token, or nil if it
+// succeeded or none has been made. It never waits for a read in progress.
+func (s *Source) ReadErr() error {
+	s.failedMu.Lock()
+	defer s.failedMu.Unlock()
+	return s.failed
 }
 
 // Invalidate drops the cached token, so the next Token call reads it again.

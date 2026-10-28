@@ -19,7 +19,7 @@ import (
 func sample() supervisor.Snapshot {
 	return supervisor.Snapshot{
 		Version: "v0.1.0", Commit: "abc1234", Machine: "examplemac",
-		Slots: 2, InUse: 1, Busy: 1, Docker: true,
+		Slots: 2, InUse: 1, Busy: 1, Docker: true, Login: true,
 		Budget: budget.State{State: "wedged", Error: "state", OldestWaitS: 42},
 		Projects: []supervisor.ProjectHealth{
 			{Repo: "example/alpha", Identity: "alpha", Image: "example.invalid/alpha@sha256:0", Healthy: true,
@@ -52,13 +52,13 @@ func TestHealthzStatusAndShape(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &fields); err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []string{"version", "commit", "machine", "slots", "in_use", "busy", "docker", "probe", "budget", "projects"} {
+	for _, k := range []string{"version", "commit", "machine", "slots", "in_use", "busy", "docker", "login", "probe", "budget", "projects"} {
 		if _, ok := fields[k]; !ok {
 			t.Errorf("no %q field in %s", k, rec.Body.String())
 		}
 	}
-	if len(fields) != 10 {
-		t.Errorf("%d fields, want 10: %s", len(fields), rec.Body.String())
+	if len(fields) != 11 {
+		t.Errorf("%d fields, want 11: %s", len(fields), rec.Body.String())
 	}
 	var back supervisor.Snapshot
 	if err := json.Unmarshal(rec.Body.Bytes(), &back); err != nil {
@@ -102,6 +102,19 @@ func TestHealthzDockerDownIs503WithTheSameBody(t *testing.T) {
 	var back supervisor.Snapshot
 	if err := json.Unmarshal(rec.Body.Bytes(), &back); err != nil || back.Docker || back.Machine != "examplemac" {
 		t.Fatalf("body = %s (%v)", rec.Body.String(), err)
+	}
+}
+
+// A pool waiting for gh to give it a token cannot take jobs either.
+func TestHealthzNoLoginIs503WithTheSameBody(t *testing.T) {
+	snap := sample()
+	snap.Login = false
+	rec := get(t, Handler(func() supervisor.Snapshot { return snap }), http.MethodGet, "/healthz")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 without a login", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"login":false`) {
+		t.Fatalf("body = %s, want \"login\":false", rec.Body.String())
 	}
 }
 

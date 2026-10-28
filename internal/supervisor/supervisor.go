@@ -74,14 +74,14 @@ const (
 	maxPingFailures = 3
 	releaseEvery    = time.Hour
 	authWindow      = 10 * time.Minute
-	// A token read that fails at start is retried for startRetryWindow.
-	startRetryWindow = 2 * time.Minute
-	startRetryFirst  = 2 * time.Second
-	startRetryMax    = 30 * time.Second
-	deleteRetry      = 10 * time.Second
-	drainPoll        = time.Second
-	inUsePoll        = time.Second
-	callTimeout      = 30 * time.Second
+	// A token read that fails at start is retried until one succeeds,
+	// waiting tokenRetryFirst doubling to tokenRetryMax between reads.
+	tokenRetryFirst = 2 * time.Second
+	tokenRetryMax   = 5 * time.Minute
+	deleteRetry     = 10 * time.Second
+	drainPoll       = time.Second
+	inUsePoll       = time.Second
+	callTimeout     = 30 * time.Second
 	// noJobLimit runners in a row that go away without reporting a job mark
 	// the project unhealthy: its image or the runner is broken.
 	noJobLimit = 3
@@ -118,6 +118,15 @@ type Config struct {
 	Instance string
 	// Version and Commit are reported in the Snapshot.
 	Version, Commit string
+}
+
+// TokenSource is the GitHub token the pool reads from gh. *ghauth.Source
+// satisfies it.
+type TokenSource interface {
+	github.TokenSource
+	// ReadErr is the error of the last read, nil once one succeeded. It
+	// does not wait for a read in progress.
+	ReadErr() error
 }
 
 // Docker is the part of the Docker API the pool uses. *client.Client
@@ -219,7 +228,7 @@ type Image struct{ Ref, User string }
 type Deps struct {
 	Docker  Docker
 	GitHub  GitHub
-	Token   github.TokenSource
+	Token   TokenSource
 	Clients ClientFactory
 	Mirror  image.Mirror
 	Clock   Clock
@@ -258,7 +267,10 @@ type Snapshot struct {
 	InUse   int    `json:"in_use"`
 	Busy    int    `json:"busy"`
 	Docker  bool   `json:"docker"`
-	Probe   bool   `json:"probe"`
+	// Login is false while the last read of the token from gh failed: the
+	// pool waits for gh and takes no jobs meanwhile.
+	Login bool `json:"login"`
+	Probe bool `json:"probe"`
 	// Budget is the budget's state: {State: "off"} when none is wired.
 	Budget   budget.State    `json:"budget"`
 	Projects []ProjectHealth `json:"projects"`
@@ -389,12 +401,24 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		// configuration error.
 		return terminal("binding the health address %s: %v", s.cfg.HealthAddr, err)
 	}
-	defer func() { _ = ln.Close() }()
+	// The health endpoint answers from here on, through the drain, so a pool
+	// that waits for its token says why.
+	serving, stopServing := context.WithCancel(context.WithoutCancel(ctx))
+	var served sync.WaitGroup
+	if s.deps.Serve != nil {
+		served.Go(func() { s.deps.Serve(serving, ln) })
+	}
+	defer func() {
+		stopServing()
+		_ = ln.Close()
+		served.Wait()
+	}()
 
-	// The token cache is empty at start, so this reads it from gh. Right
-	// after boot gh may not produce one yet (the login keychain is still
-	// locked), so a failed read is retried for startRetryWindow.
-	err = s.retryAtStart(ctx, func() error {
+	// The token cache is empty at start, so this reads it from gh. gh may
+	// not produce one for a while (right after boot, or when its keychain
+	// lookup times out on a stalled Mac), so the read is retried until it
+	// succeeds; the heartbeat stays silent meanwhile.
+	err = s.retryTokenRead(ctx, func() error {
 		_, err := s.deps.Token.Token(ctx)
 		return err
 	})
@@ -402,7 +426,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	case ctx.Err() != nil:
 		return nil
 	case err != nil:
-		return terminal("gh logged out: %v; run gh auth login", err)
+		return fmt.Errorf("reading the GitHub token: %w", err)
 	}
 	m, arch, err := s.deps.Detect(ctx)
 	if errors.Is(err, machine.ErrHostName) {
@@ -423,7 +447,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		instance = "probe-" + m.Owner
 	}
 	var mount runnermount.Mount
-	err = s.retryAtStart(ctx, func() error {
+	err = s.retryTokenRead(ctx, func() error {
 		var err error
 		mount, err = s.deps.Mount(ctx, arch)
 		return err
@@ -469,9 +493,6 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			f()
 		}()
 	}
-	if s.deps.Serve != nil {
-		start(func() { s.deps.Serve(life, ln) })
-	}
 	// The survivors are adopted once the exit watcher has subscribed, so a die
 	// event during an Adopt is not lost.
 	subscribed := make(chan struct{})
@@ -502,36 +523,31 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	s.stopWaiters()
 	s.wg.Wait()
 	s.closeSessions()
-	_ = ln.Close()
 	bg.Wait()
 	return err
 }
 
-// retryAtStart calls f until it returns an error that is not a failed token
-// read, or until startRetryWindow has passed since the first call, waiting
-// startRetryFirst doubling to startRetryMax between calls. A token rejection
-// (ErrUnauthorized after the GitHub client's own re-read) is never retried:
-// it returns at once. It returns f's last error, or nil once ctx ends.
-func (s *Supervisor) retryAtStart(ctx context.Context, f func() error) error {
-	clock := s.deps.Clock
-	began := clock.Now()
-	wait := startRetryFirst
+// retryTokenRead calls f until it returns an error that is not a failed token
+// read, waiting tokenRetryFirst doubling to tokenRetryMax between calls. It has
+// no deadline: a read can fail for longer than any window (one gh call that
+// hung for 26 minutes once used up a two-minute one on its own), and gh logged
+// in again recovers the pool without a restart. A token rejection
+// (ErrUnauthorized after the GitHub client's own re-read) is never retried: it
+// returns at once. It returns f's last error, or nil once ctx ends.
+func (s *Supervisor) retryTokenRead(ctx context.Context, f func() error) error {
+	wait := tokenRetryFirst
 	for {
 		err := f()
 		if !isTokenRead(err) {
 			return err
 		}
-		left := startRetryWindow - clock.Now().Sub(began)
-		if left <= 0 {
-			return err
-		}
-		s.log.Warn("gh has no token yet; retrying", "error", err.Error(), "in", min(wait, left))
+		s.log.Warn("gh gives no token; retrying (run gh auth login if gh is logged out)", "error", err.Error(), "in", wait)
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-clock.After(min(wait, left)):
+		case <-s.deps.Clock.After(wait):
 		}
-		wait = min(wait*2, startRetryMax)
+		wait = min(wait*2, tokenRetryMax)
 	}
 }
 
@@ -605,11 +621,12 @@ func (s *Supervisor) stopWaiters() {
 }
 
 // FailOnLoginLoss ends Run with a terminal error if err means the GitHub login
-// is gone (gh logged out, or a token GitHub refuses after it was read again),
-// the same classification every other GitHub call of the pool gets. It reports
-// whether it did. Callers outside the supervisor, such as the heartbeat, use it
-// so that a lost login ends the process with exit 0 instead of being logged
-// forever.
+// is gone (a token GitHub refuses after it was read again), the same
+// classification every other GitHub call of the pool gets. It reports whether
+// it did. Callers outside the supervisor, such as the heartbeat, use it so that
+// a lost login ends the process with exit 0 instead of being logged forever. A
+// token gh cannot give is not a lost login: the caller's next attempt reads it
+// again.
 func (s *Supervisor) FailOnLoginLoss(err error) bool {
 	t := loginRejected(err)
 	if t == nil {
@@ -805,8 +822,9 @@ func (s *Supervisor) newClient(ctx context.Context, repo string) (ScaleSets, int
 	tok, err := s.deps.Token.Token(ctx)
 	if err != nil {
 		// The token is cached, so a read happens only after a refusal
-		// dropped it: gh no longer has a login.
-		return nil, gen, terminal("gh logged out: %v; run gh auth login", err)
+		// dropped it. A read that fails is retried with the listener's
+		// restart, or with the project's on the next discovery pass.
+		return nil, gen, fmt.Errorf("building the scale set client: %w", err)
 	}
 	c, err := s.deps.Clients(repo, tok)
 	if err != nil {
@@ -829,6 +847,7 @@ func (s *Supervisor) Snapshot() Snapshot {
 		Commit:  s.cfg.Commit,
 		Machine: s.machine.Name,
 		Docker:  s.dockerOK,
+		Login:   s.deps.Token == nil || s.deps.Token.ReadErr() == nil,
 		Probe:   s.cfg.Probe,
 	}
 	slots := s.slots

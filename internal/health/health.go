@@ -21,8 +21,8 @@ const (
 )
 
 // Handler answers GET /healthz with the Snapshot as JSON: 200 while Docker
-// answers, 503 otherwise. The body is the same either way, so the cause of a
-// 503 is in it. Every other path is a 404 and every other method a 405.
+// answers and gh gives the pool a token, 503 otherwise. The body is the same
+// either way, so the cause of a 503 is in it. Every other path is a 404 and every other method a 405.
 //
 // A request whose Host header is not a loopback name is refused with 403, so a
 // web page cannot read the endpoint through a DNS name that it rebinds to
@@ -40,7 +40,7 @@ func Handler(snap func() supervisor.Snapshot) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		if !s.Docker {
+		if !s.Docker || !s.Login {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 		_, _ = w.Write(append(body, '\n'))

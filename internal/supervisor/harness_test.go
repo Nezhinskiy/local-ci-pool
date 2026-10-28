@@ -520,13 +520,29 @@ type fakeToken struct {
 	// failFirst makes the first reads fail with firstErr, then succeed.
 	failFirst int
 	firstErr  error
-	reads     int
+	// delay makes the first read block this long on the wall clock before
+	// it answers, like a gh whose keychain lookup hangs.
+	delay time.Duration
+	reads int
+	last  error // the last read's error
 }
 
 func (f *fakeToken) Token(context.Context) (string, error) {
 	f.mu.Lock()
+	reads := f.reads + 1
+	f.reads = reads
+	f.mu.Unlock()
+	if reads == 1 && f.delay > 0 {
+		time.Sleep(f.delay) // unlocked: ReadErr must not wait for it
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.reads++
+	tok, err := f.answer()
+	f.last = err
+	return tok, err
+}
+
+func (f *fakeToken) answer() (string, error) {
 	if f.failFirst > 0 {
 		f.failFirst--
 		return "", f.firstErr
@@ -535,6 +551,19 @@ func (f *fakeToken) Token(context.Context) (string, error) {
 		return "", f.err
 	}
 	return fmt.Sprintf("tok-%d", f.gen+1), nil
+}
+
+func (f *fakeToken) ReadErr() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.last
+}
+
+// setErr makes every read from now on fail with err, or succeed for nil.
+func (f *fakeToken) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
 }
 
 func (f *fakeToken) Invalidate() {
@@ -708,6 +737,8 @@ type harness struct {
 	logs    *syncBuffer
 	// budget is Deps.Budget; nil leaves the budget off.
 	budget Budget
+	// serve is Deps.Serve, the health endpoint; nil serves none.
+	serve func(ctx context.Context, ln net.Listener)
 
 	mu       sync.Mutex
 	images   map[string]string // identity -> image reference
@@ -860,6 +891,7 @@ func (h *harness) deps() Deps {
 			return nil
 		},
 		Caffeinate: h.caff.start,
+		Serve:      h.serve,
 		Budget:     h.budget,
 	}
 }

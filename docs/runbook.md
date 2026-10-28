@@ -82,9 +82,22 @@ The pool keeps derived state only: its git mirrors under
 `local-ci/<identity>:<digest>`. Deleting any of it costs a fetch or a build.
 
 The agent restarts the pool when it exits with an error (`KeepAlive { SuccessfulExit = false }`, at
-most one start per 30 seconds). A cause that restarting cannot fix, such as a logged-out `gh`, makes
-the pool log `terminal: <reason>` and exit 0, so launchd does not spin; fix the cause and run the
-installer again (or `launchctl kickstart gui/$UID/com.local-ci-pool.pool`).
+most one start per 30 seconds). A cause that restarting cannot fix makes the pool log
+`terminal: <reason>` and exit 0, so launchd does not spin: a second pool (`already running`), too
+little Docker memory for one slot, a `LocalHostName` without letters or digits, a scale set held by
+another Mac, or a token GitHub refuses after the pool read it again (`gh login rejected`). Fix the
+cause and run the installer again (or `launchctl kickstart gui/$UID/com.local-ci-pool.pool`).
+
+A token `gh auth token` cannot give is not one of those causes: the pool keeps running and retries.
+`gh` exits 1 both when it is logged out and when its keychain lookup times out (60 seconds), which a
+stalled Mac can make it do, so the failure does not prove a logout. On 2026-10-21, a pool that took
+it for one exited 0 and stayed down for 42 hours with the login intact. At start the pool reads
+again after 2 seconds, doubling up to every 5 minutes, and logs
+`gh gives no token; retrying` each time; it probes Docker only once it has a token. Later, after a
+refusal dropped the cached token, a failed read leaves the affected project down until its next
+retry, or until the next discovery pass. Meanwhile `/healthz` answers 503 with `"login": false`, and
+no heartbeat is written, so workflows use hosted runners. If `gh` really is logged out, run
+`gh auth login`; the pool picks the token up on its next read, without a restart.
 
 ## Upgrade
 
@@ -222,7 +235,9 @@ curl -s 127.0.0.1:8737/healthz
 tail -f ~/Library/Logs/local-ci-pool/pool.log
 ```
 
-`/healthz` answers 200 while Docker answers and 503 otherwise, with the same JSON body:
+`/healthz` answers 200 while Docker answers and `gh` gives the pool a token, and 503 otherwise,
+with the same JSON body. It answers from the moment the pool binds its address, also while it waits
+for a token:
 
 | Field | Meaning |
 |---|---|
@@ -230,6 +245,7 @@ tail -f ~/Library/Logs/local-ci-pool/pool.log
 | `machine` | the machine name |
 | `slots`, `in_use`, `busy` | the slot limit; slots held by runners, including runners a killed previous run left running; runners known to be running a job, which excludes those left running |
 | `docker` | whether Docker answers |
+| `login` | `false` while the last read of the token from `gh` failed (see [Install](#install)); `/healthz` answers 503 then too |
 | `probe` | whether this is a probe run |
 | `budget` | the core budget: `state`, an `error` class when there is one, and `oldest_wait_s` (see [CI is waiting](#ci-is-waiting)) |
 | `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, a `reason` when not healthy, the budget's `waiting` and `admitted` counts, and `stuck` when a job is queued that GitHub does not offer the pool (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)) |
