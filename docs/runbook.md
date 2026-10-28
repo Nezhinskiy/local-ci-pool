@@ -28,10 +28,24 @@ holds your `gh` login and runs the code of your private repositories.
 
 ## Install
 
-Requirements: macOS, Docker Engine 28 or newer (verified on Docker Desktop), `gh` logged in with the
-scopes the repositories need (`repo`, `workflow`, `read:org`). The runner is mounted into job
-containers as an image, which needs Engine API 1.48 (Docker 28): the installer refuses an older
-engine and says why.
+Requirements: macOS; Docker Engine 28 or newer (verified on Docker Desktop) with at least 6 GB of
+memory and 2 CPUs; `gh` 2.49 or newer (the installer verifies the release with `gh attestation`),
+logged in as the account that owns the repositories. The runner is mounted into job containers as
+an image, which needs Engine API 1.48 (Docker 28): the installer refuses an older engine and says
+why. The pool's own calls need only the `repo` scope; the README's
+`gh auth login --scopes repo,workflow,read:org` adds `workflow` so that the same login can push
+workflow files over HTTPS, and `read:org` is part of every `gh` login.
+
+From a clone of this repository (`gh repo clone Nezhinskiy/local-ci-pool`):
+
+```sh
+gh auth status
+docker version --format '{{.Server.Version}} (API {{.Server.APIVersion}})'
+./install.sh            # or: ./install.sh --version vX.Y.Z
+```
+
+The installer always installs a published release (the latest, or `--version`), never the code of
+the clone it runs from.
 
 Under launchd `DOCKER_HOST` is unset, so the pool finds Docker as the `docker` CLI does: `DOCKER_HOST`
 first, then the current docker context, then the first of the known socket paths that exists. It
@@ -54,12 +68,6 @@ launchctl kickstart -k gui/$(id -u)/com.local-ci-pool.pool
 `-k` stops the pool the way any stop that comes from launchd does, giving it at most 60 seconds (see
 [launchd's 60-second limit](#launchds-60-second-limit), where that was measured); stop it with
 `SIGTERM` as shown there if a job is running.
-
-```sh
-gh auth status
-docker info
-./install.sh            # or: ./install.sh --version v0.1.0
-```
 
 To take CI jobs' cores from the machine's core budget as well, add `--budget-cpu 2`; see
 [the budget settings](#the-budget-settings).
@@ -199,7 +207,7 @@ read until it restarts. Restart it (or uninstall it), or revoke the token, to cu
 1. Docker Desktop > Settings > Resources: set the memory. A 10 GB slider gives 2 slots, 18 GB gives 4
    (with 10 CPUs). Below 6 GB the pool refuses to start.
 2. Docker Desktop > Settings > General: tick "Start Docker Desktop when you sign in".
-3. `gh auth login`.
+3. `gh auth login --scopes repo,workflow,read:org`, as the account that owns the repositories.
 4. Run the installer.
 5. Check [`/healthz`](#health-and-logs) and, within two minutes, the `CI_POOL_HB_<MACHINE>` variable
    in a served repository.
@@ -251,6 +259,31 @@ A project is also unhealthy, with the reason in `/healthz`, while:
 - three runners in a row went away without starting a job (they exited idle, or could not start,
   for example because an image was deleted under the pool). A job report clears it, and so does the
   preflight the next discovery pass runs for it.
+
+## A repository is not served
+
+`pool status` lists every repository the pool serves. One that is missing was skipped on the last
+discovery pass, which runs at start and then every 10 minutes. `pool.log` says why for most causes:
+
+```sh
+grep 'skipping repository' ~/Library/Logs/local-ci-pool/pool.log | tail
+```
+
+- **Public, or owned by an organization.** The pool lists only the private repositories the `gh`
+  account owns, so these never reach it and no line names them. Public repositories are refused by
+  design ([SECURITY.md](../SECURITY.md)); make the repository private, or serve it with another
+  runner.
+- **No marker on the default branch.** A marker on another branch is read only in
+  [probe mode](#probe-mode). The pool logs this at debug level, which `pool.log` leaves out.
+- **`skipping repository: invalid marker`**, with the reason: the JSON has another shape than
+  [the README's](../README.md#the-marker), an image without `@sha256:` and its 64-hex digest, both
+  forms at once, or a `dockerfile` outside its `inputs`.
+- **`skipping repository: identity collision`**: two repositories reduce to the same identity
+  (`my-repo` and `My_Repo`); the one named `kept` is served. Rename the other.
+- **`skipping repository: the marker could not be read`** or
+  **`the visibility re-check failed`**: a GitHub call failed; the next pass tries again.
+- **Committed a moment ago.** Wait for the next pass, or restart the pool when no job is running:
+  `launchctl kickstart -k gui/$(id -u)/com.local-ci-pool.pool`.
 
 ## Health and logs
 
@@ -309,7 +342,7 @@ fresh heartbeat, so the question is why this one did not.
    ```
 
    ```
-   pool v0.4.0 (f8c5ea0) on examplemacbo: docker ok, login ok, 7 slots, 0 in use, budget on
+   pool v0.5.0 (8eda50a) on examplemacbo: docker ok, login ok, 7 slots, 0 in use, budget on
      alice/alpha  healthy
      alice/beta   unhealthy: draining
        queued 12m0s: test https://github.com/alice/beta/actions/runs/1
@@ -325,7 +358,10 @@ fresh heartbeat, so the question is why this one did not.
    - `login lost`: `gh` cannot give the pool a token. The pool keeps retrying and writes no
      heartbeat meanwhile. Run `gh auth status`; if `gh` is logged out, run `gh auth login`.
    - `unhealthy: <reason>` under a project: that project writes no heartbeat; the reason says why (see
-     [Opting a project in or out](#opting-a-project-in-or-out)).
+     [Opting a project in or out](#opting-a-project-in-or-out)). `unhealthy: starting` is a project
+     whose image and preflight are still on their way, as on a first start.
+   - The repository is not listed at all: the pool does not serve it (see
+     [A repository is not served](#a-repository-is-not-served)).
    - `N waiting for cores`: the budget holds the jobs (see [CI is waiting](#ci-is-waiting)).
    - `queued <time>: <job> <run URL>`: GitHub has not offered the pool a job that has waited that
      long for a runner (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)).

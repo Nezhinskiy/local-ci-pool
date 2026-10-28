@@ -15,19 +15,36 @@ operations.
 - Private repositories of a personal account only. A public repository is refused.
 - macOS only, with Docker Engine 28 or newer. Verified on Docker Desktop.
 - The job runs in your marker image, not in GitHub's runner image, so the tools GitHub preinstalls
-  are not there unless your image has them.
+  are not there unless your image has them. The image must provide `bash`, glibc and a CA bundle
+  (a bare `ubuntu:24.04` lacks `ca-certificates`).
+- A job runs as a non-root user (the image's own non-root `USER`, otherwise uid 1001) under a 4 GiB
+  memory limit. Install what the job needs in the image, not with `sudo apt-get` in a step.
 - A Mac must be awake and logged in.
 
 ## Quickstart
 
-1. Log in to GitHub and start Docker (Engine 28 or newer):
+1. Log in to GitHub with the account that owns the repositories, and start Docker (Engine 28 or
+   newer, which is Engine API 1.48, with at least 6 GB of memory and 2 CPUs for one
+   [slot](#slots)). The installer needs a `gh` that has `gh attestation` (2.49 or newer):
 
    ```sh
    gh auth login --scopes repo,workflow,read:org
-   docker info
+   gh --version
+   docker version --format '{{.Server.Version}} (API {{.Server.APIVersion}})'
    ```
 
-2. Install the pool. The installer downloads the latest release, verifies its build provenance, and
+   The pool's own calls need only `repo`. `workflow` lets this login push the workflow of step 3
+   over HTTPS, and `read:org` is part of every `gh` login.
+
+2. Opt a repository in: commit [the marker](#the-marker), `.github/local-ci.json`, to the default
+   branch of a private repository that your account owns. The pool finds it when it starts, and a
+   marker committed later on its next discovery pass, within 10 minutes.
+
+3. Route a workflow through the [`route` action](#routing): the example there has a `route` job and
+   a `test` job that takes its `runs-on` from it. Until the pool is up, `route` falls back to the
+   hosted label, so committing this first is safe.
+
+4. Install the pool. The installer downloads the latest release, verifies its build provenance, and
    starts a launchd agent. `./install.sh --dry-run` shows what it would do first.
 
    ```sh
@@ -35,27 +52,29 @@ operations.
    ./install.sh
    ```
 
-3. Opt a repository in: commit [the marker](#the-marker), `.github/local-ci.json`, to its default
-   branch. The pool finds it on its next discovery pass, within 10 minutes.
-
-4. Route a workflow through the [`route` action](#routing): the example there has a `route` job and
-   a `test` job that takes its `runs-on` from it.
-
-5. Push, and check the pool and the run. The installed binary is not on your `PATH`:
+5. Wait until the project is healthy, then push a commit to trigger the workflow and check the run.
+   The first start downloads the runner and pulls or builds your image, so the project reads
+   `unhealthy: starting` for a while. The installed binary is not on your `PATH`:
 
    ```sh
    "$HOME/Library/Application Support/local-ci-pool/bin/pool" status
    ```
 
    ```
-   pool v0.4.0 (f8c5ea0) on examplemacbo: docker ok, login ok, 7 slots, 0 in use, budget on
+   pool v0.5.0 (8eda50a) on examplemacbo: docker ok, login ok, 7 slots, 0 in use
      alice/alpha  healthy
      alice/beta   healthy
    ```
 
-   `pool status` exits 0 when the pool is healthy, 1 when it answers 503 (Docker down or `gh`
-   login lost), and 3 when nothing answers. With `--json` it prints the `/healthz` body as it
-   is. When `test` ran on `alpha-local` and went green, the Mac ran your job.
+   A healthy project gets its heartbeat within two minutes: `gh variable list --repo OWNER/NAME`
+   shows `CI_POOL_HB_<MACHINE>`. A repository missing from the list is not served; see
+   [A repository is not served](docs/runbook.md#a-repository-is-not-served).
+
+   `pool status` exits 0 when the pool is up (whatever its projects' health), 1 when it answers 503
+   (Docker down or `gh` login lost), and 3 when nothing answers. With `--json` it prints the
+   `/healthz` body as it is. When `test` ran on `alpha-local` and went green, the Mac ran your job;
+   when it ran on the hosted label, the `route` job says why (see
+   [When it falls back](#when-it-falls-back)).
 
 ## How it works
 
@@ -80,7 +99,9 @@ build context (and so define the image tag):
 { "dockerfile": "ci/Dockerfile", "inputs": ["ci", "requirements.txt"] }
 ```
 
-The repository's identity is its name reduced to `[a-z0-9-]`, for example `alpha`.
+The repository's identity is its name reduced to `[a-z0-9-]`: lower-cased, every other character
+turned into `-`, runs of `-` collapsed and the ends trimmed. `alpha` stays `alpha`, and `My_Repo.js`
+becomes `my-repo-js`. Pass it to `route` as `identity`.
 
 ### Slots
 
@@ -136,16 +157,20 @@ available to a private repository of a personal account on 2026-10-28. Where you
 arm runners, or your Mac is an Intel one, pass `hosted-label: ubuntu-24.04` instead.
 
 Pin the action by its full commit SHA; Renovate's `github-actions` manager keeps it current. Take the
-SHA from a release that has `local-label` and the annotations below, v0.4.0 or later:
-`git rev-parse v0.4.0^{commit}`.
+SHA of the latest release (v0.4.0 or later has `local-label` and the annotations below), in your
+clone of this repository:
+
+```sh
+git rev-parse "$(gh release view --repo Nezhinskiy/local-ci-pool --json tagName --jq .tagName)^{commit}"
+```
 
 | Input | Meaning |
 |---|---|
 | `vars-json` | `${{ toJSON(vars) }}`, the repository variables, which carry the heartbeats |
-| `identity` | the repository identity, which is also the label prefix |
-| `hosted-label` | the label to use when no Mac is fresh |
-| `hosted-shards` | the shard count to use when no Mac is fresh |
-| `local-label` | the label to use when a Mac is fresh; default `<identity>-local` (see [below](#use-the-routing-with-another-runner)) |
+| `identity` | the repository identity, which is also the label prefix: 1 to 40 of `[a-z0-9-]` |
+| `hosted-label` | the label to use when no Mac is fresh: 1 to 64 of `[a-z0-9.-]` |
+| `hosted-shards` | the shard count to use when no Mac is fresh: 1 to 99 |
+| `local-label` | the label to use when a Mac is fresh, 1 to 64 of `[a-z0-9.-]`; default `<identity>-local` (see [below](#use-the-routing-with-another-runner)) |
 | `mode` | `auto` (default), or `hosted` to force the hosted label |
 
 | Output | Meaning |

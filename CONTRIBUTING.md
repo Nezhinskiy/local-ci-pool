@@ -2,6 +2,9 @@
 
 ## Tests
 
+- Building from source needs Go 1.27.3 or newer, the `go` line of `go.mod`; CI and the release use
+  the current stable Go. `go build ./cmd/pool` builds the binary. The installer never uses it: it
+  installs a published release.
 - Run `go test -race ./...` before every change. CI runs the same command.
 - CI also runs `gofmt -l .`, `go vet`, `staticcheck`, `govulncheck`, `actionlint` and `shellcheck`
   on every script. Run them locally with the same versions the workflow installs.
