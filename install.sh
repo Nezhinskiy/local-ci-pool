@@ -223,7 +223,7 @@ check_prerequisites() {
   # The runner is mounted as an image, which needs Engine API 1.48 (Docker 28).
   local api api_major api_minor
   api="$(docker version --format '{{.Server.APIVersion}}' 2> /dev/null)" || die "Docker is not answering; start Docker"
-  if ! [[ "$api" =~ ^([0-9]+)\.([0-9]+) ]]; then
+  if ! [[ "$api" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
     die "unexpected output of docker version: '$api'"
   fi
   api_major="${BASH_REMATCH[1]}"
