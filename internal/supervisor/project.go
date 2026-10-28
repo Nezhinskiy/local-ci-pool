@@ -382,7 +382,7 @@ func (pr *project) serveOnce() error {
 	// A slot may have changed since the capacity was counted.
 	pr.s.requestCapacity()
 	pr.log.Info("listening")
-	err = l.Run(pr.ctx, runner.NewAdapter(sc))
+	err = l.Run(pr.ctx, runner.NewAdapter(sc, sess))
 	pr.mu.Lock()
 	pr.listener = nil
 	pr.mu.Unlock()

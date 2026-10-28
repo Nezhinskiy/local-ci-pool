@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -610,4 +611,58 @@ func eventually(t *testing.T, what string, cond func() bool) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// eventLog is one ordered record of calls made to several fakes, so a test can
+// assert their order.
+type eventLog struct {
+	mu sync.Mutex
+	ev []string
+}
+
+func (l *eventLog) add(e string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.ev = append(l.ev, e)
+}
+
+func (l *eventLog) list() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.ev)
+}
+
+// fakeAcquirer stands in for the session's AcquireJobs. It records the request
+// IDs of every call, appends "acquire <ids>" to events when set, and acquires
+// every request unless err, or answer when set, says otherwise.
+type fakeAcquirer struct {
+	mu     sync.Mutex
+	ids    [][]int64
+	err    error
+	answer func(ctx context.Context) error
+	events *eventLog
+}
+
+func (f *fakeAcquirer) AcquireJobs(ctx context.Context, requestIDs []int64) ([]int64, error) {
+	f.mu.Lock()
+	f.ids = append(f.ids, slices.Clone(requestIDs))
+	err, answer, events := f.err, f.answer, f.events
+	f.mu.Unlock()
+	if events != nil {
+		events.add(fmt.Sprintf("acquire %v", requestIDs))
+	}
+	if answer != nil {
+		err = answer(ctx)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return slices.Clone(requestIDs), nil
+}
+
+// calls lists the request IDs of every AcquireJobs call so far.
+func (f *fakeAcquirer) calls() [][]int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.ids)
 }

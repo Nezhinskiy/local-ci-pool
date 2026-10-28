@@ -56,7 +56,7 @@ func listenOn(t *testing.T, a *fakeactions.Actions, set string, sc *Scaler) *cou
 	if err != nil {
 		t.Fatal(err)
 	}
-	ad := &countingAdapter{Adapter: NewAdapter(sc)}
+	ad := &countingAdapter{Adapter: NewAdapter(sc, sess)}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
