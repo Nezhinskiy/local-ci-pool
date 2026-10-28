@@ -188,6 +188,31 @@ func (s *Supervisor) forgetSurvivorLocked(name string) (release func(), ok bool)
 	return release, true
 }
 
+// removeSurvivors removes the containers of the survivors whose labels name
+// project, for a repository that turned public, and releases each one
+// removed, all within ctx. One whose removal fails is kept, and logged.
+func (s *Supervisor) removeSurvivors(ctx context.Context, project string) {
+	s.mu.Lock()
+	var names []string
+	for name, e := range s.survivors {
+		if e.project == project {
+			names = append(names, name)
+		}
+	}
+	s.mu.Unlock()
+	for _, name := range names {
+		c, cancel := context.WithTimeout(ctx, callTimeout)
+		err := runner.RemoveContainer(c, s.deps.Docker, name)
+		cancel()
+		if err != nil {
+			s.log.Warn("removing a survivor of a repository no longer private", "runner", name, "error", err.Error())
+			continue
+		}
+		s.log.Info("removed a survivor of a repository no longer private", "runner", name)
+		s.releaseSurvivor(name)
+	}
+}
+
 // survivorsOf counts the survivors whose labels name project. A survivor of
 // an older pool names none, so it counts for no project.
 func (s *Supervisor) survivorsOf(project string) int {

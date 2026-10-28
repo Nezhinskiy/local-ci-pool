@@ -427,7 +427,7 @@ func (pr *project) vet(ctx context.Context) error {
 	switch {
 	case public:
 		return errors.New(notPrivate)
-	case !at.IsZero() && pr.s.deps.Clock.Now().Sub(at) < visibleFor:
+	case fresh(at, pr.s.deps.Clock.Now()):
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, callTimeout)
@@ -440,6 +440,15 @@ func (pr *project) vet(ctx context.Context) error {
 		return fmt.Errorf("checking the repository's visibility: %w", err)
 	}
 	return err
+}
+
+// fresh reports whether an answer given at at is younger than visibleFor at
+// now. The age is read by wall clock: the monotonic clock stops while the Mac
+// sleeps, so an answer from before a night's sleep would read as seconds old.
+// A negative age (the wall clock set back) is stale.
+func fresh(at, now time.Time) bool {
+	age := now.Round(0).Sub(at.Round(0))
+	return !at.IsZero() && age >= 0 && age < visibleFor
 }
 
 // checkRepo asks GitHub whether the repository is still there, still under
@@ -697,6 +706,10 @@ func (pr *project) drain(life context.Context, deadline time.Time) bool {
 		pr.log.Warn("the listener did not stop within the drain's budget; going on")
 	}
 	pr.removeLeft(post)
+	public := pr.isPublic()
+	if public {
+		pr.s.removeSurvivors(post, pr.identity)
+	}
 	held := pr.closeSession(post)
 	if !held && pr.mayReopen() {
 		held = pr.reopenToDelete(post)
@@ -704,6 +717,12 @@ func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	if !held {
 		pr.log.Info("no session held; leaving the scale set")
 		return true
+	}
+	if public {
+		// GitHub counts the jobs of the runners just removed as running for
+		// a while yet: the delete is retried within the budget after the
+		// bound instead.
+		deadline = postEnd
 	}
 	pr.deleteScaleSet(life, post, deadline)
 	return true

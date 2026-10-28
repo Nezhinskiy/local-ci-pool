@@ -243,12 +243,14 @@ func (s *Scaler) activeLocked() int {
 // waiter goroutine admits it through the gate and then starts it; Desired never
 // waits on the gate.
 func (s *Scaler) Desired(ctx context.Context, count int) (int, error) {
+	// A survivor's job is vetted too: an idle survivor could take any job
+	// the count holds.
+	refused := count > 0 && !s.vetted(ctx)
 	// survivors takes the supervisor's lock: once per call, never under s.mu.
 	if s.survivors != nil {
 		count -= s.survivors()
 	}
 	count = max(count, 0)
-	refused := count > 0 && !s.vetted(ctx)
 	// Enabled reads the gate's settings: once per call, never under s.mu.
 	gated := s.gate != nil && s.gate.Enabled()
 	s.mu.Lock()

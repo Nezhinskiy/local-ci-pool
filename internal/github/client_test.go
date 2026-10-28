@@ -138,6 +138,28 @@ func TestRepoAndReadFile(t *testing.T) {
 	}
 }
 
+// An answer that names no repository or no visibility is an error, never a
+// public repository: a proxy's page or an empty object must not drain a
+// project.
+func TestRepoWithoutVisibilityOrNameIsAnError(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty object":    `{}`,
+		"no visibility":   `{"full_name":"o/alpha","name":"alpha","default_branch":"main"}`,
+		"null private":    `{"full_name":"o/alpha","private":null}`,
+		"no full name":    `{"name":"alpha","private":false}`,
+		"empty full name": `{"full_name":"","private":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, _, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, body)
+			})
+			if r, err := c.Repo(context.Background(), "o/alpha"); err == nil {
+				t.Fatalf("Repo = %+v, nil; want an error", r)
+			}
+		})
+	}
+}
+
 func TestRepoNamesAreValidated(t *testing.T) {
 	c, _, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("a request was sent for an invalid name: %s", r.URL)

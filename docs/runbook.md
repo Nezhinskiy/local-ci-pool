@@ -240,7 +240,9 @@ moment are lost with the containers; a job assigned to the pool at that time is 
   again while jobs are assigned. So for up to a minute after the change, a pull request from a fork
   could still target `<identity>-local` directly and run on this Mac. When a runner start or a
   listener call sees the change, the pool logs a WARN line, removes the project's job containers at
-  once, busy ones included, and deletes the scale set. `/healthz` and `pool status` then list the
+  once, busy ones and those a previous pool process left included, and deletes the scale set. While
+  GitHub still counts a removed job, the delete is retried for up to three minutes; a scale set left
+  after that has no session, so no runner starts for it. `/healthz` and `pool status` then list the
   project as unhealthy with the reason `the repository is no longer private`, until it is private
   and served again or the pool restarts. A discovery pass that sees the change first drains the
   project as for a removed marker; its capacity is zero from then on, so no new job reaches it.

@@ -94,6 +94,20 @@ func TestVetRunsBeforeEachMint(t *testing.T) {
 	}
 }
 
+// A job counted as a survivor's still makes Desired vet: an idle survivor of
+// the previous run could take a job the count holds.
+func TestDesiredVetsJobsItCountsAsSurvivors(t *testing.T) {
+	v := &fakeVet{}
+	h := newHarnessWith(NewSlots(2), func(c *ScalerConfig) {
+		c.Vet = v.vet
+		c.Survivors = func() int { return 1 }
+	})
+	desired(t, h.scaler, 1)
+	if n := v.count(); n != 1 {
+		t.Fatalf("%d vets with one assigned job, a survivor's, want 1", n)
+	}
+}
+
 // Desired vets while the scale set has assigned jobs, so a runner already
 // idle cannot take a job unnoticed; with none assigned it asks nothing.
 func TestDesiredVetsOnlyWithAssignedJobs(t *testing.T) {

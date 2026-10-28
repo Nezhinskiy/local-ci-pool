@@ -287,11 +287,20 @@ func (c *Client) Repo(ctx context.Context, full string) (Repo, error) {
 	if err != nil {
 		return Repo{}, err
 	}
-	var r repoJSON
+	// private is a pointer so that an answer without it (a proxy's page, an
+	// empty object) is an error, never a public repository.
+	var r struct {
+		repoJSON
+		Private *bool `json:"private"`
+	}
 	if err := json.Unmarshal(res.body, &r); err != nil {
 		return Repo{}, fmt.Errorf("github: decoding repository %s: %w", full, err)
 	}
-	return Repo(r), nil
+	if r.FullName == "" || r.Private == nil {
+		return Repo{}, fmt.Errorf("github: repository %s: the answer names no repository or no visibility", full)
+	}
+	r.repoJSON.Private = *r.Private
+	return Repo(r.repoJSON), nil
 }
 
 // ReadFile returns the raw content of path at ref ("" for the default

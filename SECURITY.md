@@ -10,9 +10,12 @@ container is code from those repositories. It is not a sandbox for untrusted cod
   runner for at most one minute: before each runner starts, the pool needs GitHub's answer that the
   repository is private, and it caches that answer for one minute. While the project has jobs
   assigned, the pool also asks again at its listener's next call (about every 50 seconds) once
-  the answer is a minute old. When the answer is "not private", it refuses the runner, stops and
-  removes the project's job containers at once, busy ones included, and deletes the scale set. A
-  failed check refuses the runner too; it is never read as private.
+  the answer is a minute old. The age is read by wall clock, so a sleep of the Mac does not keep an
+  old answer fresh. When the answer is "not private", it refuses the runner, stops and removes the
+  project's job containers at once, busy ones and those a previous pool process left included, and
+  deletes the scale set, retrying for up to three minutes while GitHub still counts a removed job.
+  A failed check, or an answer that names no visibility, refuses the runner too; it is never read
+  as private.
 - Repository owner, pool operator and the account behind the GitHub login are the same person.
 
 ## Blast radius

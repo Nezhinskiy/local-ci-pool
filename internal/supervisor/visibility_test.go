@@ -136,7 +136,58 @@ func TestVisibilityFlipRemovesContainersAtOnce(t *testing.T) {
 	h.actions.Assign(alphaSet, 1)      // a fork's pull request targets the label
 	h.eventually("the busy runner's container removed", func() bool { return !h.docker.has(r) })
 	h.eventually("the project refused", func() bool { return h.refused(alphaRepo) })
+	// GitHub counts the removed runner's job as running for a while after
+	// its container is gone, and refuses the delete; then it lets go.
+	h.eventually("a delete refused", func() bool { return h.actions.Count("DELETE scaleset "+alphaSet) >= 1 })
+	h.actions.ClearBusy()
+	h.eventually("the scale set deleted once GitHub lets go of the job", func() bool { return h.actions.ScaleSet(alphaSet) == nil })
 	if n := h.actions.Count("JIT " + alphaSet); n != 1 {
 		t.Fatalf("%d JIT configurations minted, want 1", n)
+	}
+}
+
+// A flip removes the project's survivors of the previous run too, and frees
+// their slots; the job counted as a survivor's is vetted like any other.
+func TestVisibilityFlipRemovesTheProjectsSurvivors(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.cfg.DiscoverEvery = 24 * time.Hour
+	h.cfg.Drain = 24 * time.Hour
+	h.docker.add(survivorA, labelled(survivorA, "alpha", "2"))
+	h.docker.add(survivorB, labelled(survivorB, "beta", "2")) // another project's
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.gh.edit(func() { h.gh.repos[alphaRepo].private = false })
+	time.Sleep(120 * time.Millisecond) // the cached answer is stale
+	h.actions.IgnoreCapacity(alphaSet) // both slots are the survivors'
+	h.actions.Assign(alphaSet, 1)      // the survivor's job, or a fork's it could take
+	h.eventually("the survivor's container removed", func() bool { return !h.docker.has(survivorA) })
+	h.eventually("its slot freed", func() bool { return h.sup.Snapshot().InUse == 1 })
+	if !h.docker.has(survivorB) {
+		t.Fatal("another project's survivor was removed")
+	}
+}
+
+// A cached answer's age is read by wall clock: the monotonic clock stops
+// while the Mac sleeps, so an answer from before a night's sleep would read
+// as seconds old. An answer from the future (the wall clock set back) is
+// stale.
+func TestVisibilityAgeIsWallClock(t *testing.T) {
+	at := time.Now()
+	for _, c := range []struct {
+		name string
+		now  time.Time
+		want bool
+	}{
+		{"just asked", at.Add(time.Second), true},
+		{"a TTL later", at.Add(visibleFor), false},
+		{"after a night's sleep", at.Round(0).Add(8 * time.Hour), false},
+		{"the wall clock set back", at.Round(0).Add(-time.Hour), false},
+	} {
+		if got := fresh(at, c.now); got != c.want {
+			t.Errorf("%s: fresh = %v, want %v", c.name, got, c.want)
+		}
+	}
+	if fresh(time.Time{}, at) {
+		t.Error("no answer reads as fresh")
 	}
 }
