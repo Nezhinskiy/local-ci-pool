@@ -49,6 +49,17 @@ func wedge(t *testing.T, h *harness, pid int) (unlock func(), holder *coreslot.G
 	return unlock, holder, steps
 }
 
+// waitWaiting waits for the runner waiting line of runner name. The gate logs it once Enqueue has
+// returned, so the Admit is past the wedge check and its Enqueue has left the admission section.
+func waitWaiting(t *testing.T, h *harness, name string) {
+	t.Helper()
+	eventually(t, name+"'s runner waiting line", func() bool {
+		return slices.ContainsFunc(h.log.lines("runner waiting for the budget"), func(l string) bool {
+			return strings.HasPrefix(l, "runner="+name+" ")
+		})
+	})
+}
+
 func lastLine(h *harness, msg string) string {
 	lines := h.log.lines(msg)
 	if len(lines) == 0 {
@@ -149,8 +160,11 @@ func TestNewAdmitWhileWedgedProceedsWhenFree(t *testing.T) {
 	unlock, holder, _ := wedge(t, h, 4242)
 
 	unlock()
+	// No snapshot of the test's own runs while r2 decides: a snapshot probes admit.lock and the
+	// tickets with a momentary flock, so one taken alongside r2's would show r2 the section held
+	// under the wedge's body, or show the test r1's withdrawn ticket live.
 	ch := admitAsync(context.Background(), h, alpha("r2"))
-	waitTickets(t, h.dir, 3)
+	waitWaiting(t, h, "r2")
 	if got := h.g.State().State; got != "on" {
 		t.Fatalf("State().State = %q after a new Admit saw the section free; want on", got)
 	}
@@ -169,7 +183,26 @@ func TestFullBudgetIsNotAWedge(t *testing.T) {
 	dir := stateDir(t, cpu4)
 	h := newGate(t, dir, on3)
 	hold(t, dir, "holder:x", 4)
-	ch := admitAsync(context.Background(), h, alpha("r1"))
+	// r1 waits without polling coreslot. A poll enters the admission section, and on the manual
+	// clock the ticks are moments apart in real time: one entry that a stalled goroutine keeps
+	// across 25 ticks, or across one tick of LongWait, reads as a wedge.
+	h.cc.wrapWaiter = func(w waiter) waiter {
+		return waiterFunc(func(ctx context.Context) (*coreslot.Grant, error) {
+			<-ctx.Done()
+			return w.Wait(ctx)
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := admitAsync(ctx, h, alpha("r1"))
+	// Before the holder is closed and the state directory removed: r1 withdraws its ticket, rather
+	// than being admitted into a directory being removed.
+	t.Cleanup(func() {
+		cancel()
+		if r := waitResult(t, ch); !errors.Is(r.err, context.Canceled) {
+			t.Errorf("r1 = %+v, %v; want context.Canceled", r.ad, r.err)
+		}
+	})
+	waitWaiting(t, h, "r1") // its Enqueue has left the section
 	waitTickets(t, dir, 3)
 
 	for range 25 { // past WedgeAfter
