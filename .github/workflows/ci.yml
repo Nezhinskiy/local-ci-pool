@@ -44,7 +44,7 @@ jobs:
       - name: govulncheck
         run: govulncheck ./...
       - name: shellcheck
-        run: shellcheck install.sh route/route.sh runner/entrypoint.sh scripts/deny-list.sh
+        run: shellcheck install.sh route/route.sh route/heartbeat.sh runner/entrypoint.sh scripts/bench-report.sh scripts/deny-list.sh
       - name: go test
         run: go test -race ./...
       - name: actionlint

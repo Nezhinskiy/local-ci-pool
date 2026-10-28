@@ -122,7 +122,9 @@ jobs:
     runs-on: ${{ needs.route.outputs.label }}
     strategy:
       matrix:
-        # `shards` is 1 to 4: this maps it to that many matrix entries.
+        # `shards` is 1 to 4 from a Mac, and `hosted-shards` when it falls back:
+        # this map has entries up to 4, so keep `hosted-shards` at 4 or less
+        # (or extend the map) or the matrix is null exactly on fallback.
         shard: ${{ fromJSON('{"1":[1],"2":[1,2],"3":[1,2,3],"4":[1,2,3,4]}')[needs.route.outputs.shards] }}
     steps:
       - run: echo "shard ${{ matrix.shard }} of ${{ needs.route.outputs.shards }}"
@@ -149,7 +151,7 @@ SHA from a release that has `local-label` and the annotations below, v0.4.0 or l
 | Output | Meaning |
 |---|---|
 | `label` | use it directly in `runs-on`, without `fromJSON` |
-| `shards` | how many parallel shards to run: the sum of the fresh machines' slots, at most 4 |
+| `shards` | how many parallel shards to run: the sum of the fresh machines' slots, at most 4, or `hosted-shards` (1 to 99) when no Mac is fresh |
 | `local` | `true` when a Mac was selected, `false` otherwise |
 
 A heartbeat is the variable `CI_POOL_HB_<MACHINE>` with the value `"<unix epoch> <slots>"`. It is

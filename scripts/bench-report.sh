@@ -66,6 +66,7 @@ for f in "${files[@]}"; do
   fi
 done
 
+# shellcheck disable=SC2016 # the $names are jq variables, not shell ones
 jq -s -r '
   def secs: fromdateiso8601;
   def clean: gsub("[\u0000-\u001f\u007f-\u009f|]"; "?");

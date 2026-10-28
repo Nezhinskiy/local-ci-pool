@@ -35,7 +35,16 @@ engine and says why.
 
 Under launchd `DOCKER_HOST` is unset, so the pool finds Docker as the `docker` CLI does: `DOCKER_HOST`
 first, then the current docker context, then the first of the known socket paths that exists. It
-chooses once, when it starts. After you switch Docker runtimes while the old one keeps running, make
+chooses once, when it starts. The launchd job never sees a `DOCKER_HOST` exported in your shell, so
+if your engine is reachable only that way, with no docker context and no known socket, the installer
+checks that engine and the pool then cannot find it (`docker down` in `pool status`). Give the
+`docker` CLI a context for that host, and the pool follows it:
+
+```sh
+docker context create NAME --docker host=$DOCKER_HOST && docker context use NAME
+```
+
+After you switch Docker runtimes while the old one keeps running, make
 the pool choose again:
 
 ```sh
@@ -344,7 +353,7 @@ fresh heartbeat, so the question is why this one did not.
    `terminal: gh logged out` and exited 0, which launchd never restarts. It stayed down for 42 hours
    with the login intact. `gh` exits 1 both when it is logged out and when its keychain lookup times
    out, so that status proves nothing. The annotations did not exist yet; a run after 42 hours of
-   that would show `is 1d 18h old` in the second warning above. Since v0.3.2 the pool does not exit
+   that would show `is 1d 18h old` in the first warning above. Since v0.3.2 the pool does not exit
    on a token it cannot read: it retries, and `pool status` shows `login lost` while `gh` cannot
    give a token (see [Install](#install)).
 

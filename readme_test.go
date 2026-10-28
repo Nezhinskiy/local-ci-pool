@@ -9,13 +9,17 @@ import (
 	"testing"
 )
 
-// The README shows what a run says when the routing falls back. Those lines
-// must be the ones route/route.sh prints, so the test runs the script for the
-// three cases the README describes and looks for each annotation in the file,
+// The README and the runbook show what a run says when the routing falls back.
+// Those lines must be the ones route/route.sh prints, so the test runs the script for the
+// three cases the README describes and looks for each annotation in both files,
 // character for character. The hosted label is the one the README's own
 // example passes, so a changed example forces the quoted lines to change too.
 func TestReadmeQuotesRouteMessages(t *testing.T) {
 	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runbook, err := os.ReadFile(filepath.Join("docs", "runbook.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,6 +44,9 @@ func TestReadmeQuotesRouteMessages(t *testing.T) {
 			}
 			if !strings.Contains(string(readme), lines[0]) {
 				t.Errorf("README.md does not contain the line route.sh prints:\n%s", lines[0])
+			}
+			if !strings.Contains(string(runbook), lines[0]) {
+				t.Errorf("docs/runbook.md does not contain the line route.sh prints:\n%s", lines[0])
 			}
 		})
 	}
