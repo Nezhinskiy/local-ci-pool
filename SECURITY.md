@@ -26,8 +26,10 @@ container is code from those repositories. It is not a sandbox for untrusted cod
 - A job runs as a non-root user, outside group root. The image's `USER` is kept unless it is root,
   and root is refused in every spelling: `root`, any number Docker reads as 0 (`0`, `00`, `+0`,
   `0000:0`), and a passwd name with uid 0, which the preflight catches by reading the effective uid
-  from the kernel. Such an image runs as `1001:1001` instead. A group of root (`1000:0`, or a passwd
-  entry whose primary group is 0) becomes group 1001 with the same user. The preflight empties
+  from the kernel. Such an image runs as `1001:1001` instead. A group of root (`1000:0`, a passwd
+  entry whose primary group is 0, or a member of group root in `/etc/group`, which Docker adds as a
+  supplementary group) becomes group 1001 with the same user; with a group given, Docker adds no
+  supplementary groups. The preflight empties
   `BASH_ENV` and `ENV`, so an image's start-up file cannot print a uid line before the entrypoint's.
   The check still guards against an image that is root by mistake, not one built to be: the uid is
   reported from inside the image, so such an image can fake it (with its own `bash`, say), and a
