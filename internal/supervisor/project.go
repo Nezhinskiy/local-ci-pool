@@ -369,7 +369,7 @@ func (pr *project) serveOnce() error {
 	if pr.draining {
 		maxRunners = 0
 	}
-	l, err := listener.New(sess, listener.Config{ScaleSetID: pr.scaleSetID, MaxRunners: maxRunners, Logger: pr.log.With("component", "listener")})
+	l, err := listener.New(sess, listener.Config{ScaleSetID: pr.scaleSetID, MaxRunners: maxRunners, Logger: slog.New(dropPoll(pr.log.With("component", "listener").Handler()))})
 	if err == nil {
 		pr.listener, pr.up, pr.reason = l, true, ""
 		pr.advertised = maxRunners
