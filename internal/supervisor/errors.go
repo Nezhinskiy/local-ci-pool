@@ -52,11 +52,11 @@ func loginRejected(err error) error {
 func isTokenRead(err error) bool { return errors.Is(err, ghauth.ErrNoToken) }
 
 // isUnauthorized reports whether err is an authentication failure: the GitHub
-// client's ErrUnauthorized, or a scale set API error whose response was a 401.
-// The status is matched in the message text, which actions/scaleset v0.5.0
-// writes as status="401 Unauthorized" on every response error. A 401 on
-// the message queue is the queue token expiring, which the library refreshes
-// itself, so MessageQueueTokenExpiredError never counts.
+// client's ErrUnauthorized, or a scale set API error whose response was a 401,
+// which actions/scaleset v0.5.0 wraps in its UnauthorizedError. A 401 on the
+// message queue is the queue token expiring, which the library refreshes
+// itself, so MessageQueueTokenExpiredError never counts; it is checked first
+// because that error also wraps UnauthorizedError.
 func isUnauthorized(err error) bool {
 	switch {
 	case err == nil, errors.Is(err, scaleset.MessageQueueTokenExpiredError):
@@ -64,15 +64,13 @@ func isUnauthorized(err error) bool {
 	case errors.Is(err, github.ErrUnauthorized):
 		return true
 	}
-	return strings.Contains(err.Error(), `status="401 `)
+	return errors.Is(err, scaleset.UnauthorizedError)
 }
 
-// isNotFound reports whether a scale set API call answered 404: the scale set
-// was deleted under the pool. The status is matched in the message for the
-// same reason as in isUnauthorized.
-func isNotFound(err error) bool {
-	return err != nil && strings.Contains(err.Error(), `status="404 `)
-}
+// isNotFound reports whether a scale set API call answered 404, which
+// actions/scaleset wraps in its NotFoundError: the scale set was deleted under
+// the pool.
+func isNotFound(err error) bool { return errors.Is(err, scaleset.NotFoundError) }
 
 // isSessionConflict reports whether a session create was refused because the
 // scale set already has a session: a 409 with
