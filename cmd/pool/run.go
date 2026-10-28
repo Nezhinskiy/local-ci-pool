@@ -28,6 +28,8 @@ const (
 	exitOK    = 0
 	exitError = 1
 	exitUsage = 2
+	// exitNotRunning is status finding nothing at the health address.
+	exitNotRunning = 3
 )
 
 const usage = `usage: pool <command>
@@ -35,6 +37,7 @@ const usage = `usage: pool <command>
 commands:
   run [--probe --only-repo OWNER/NAME [--marker-ref REF] [--health-addr ADDR]]
                  serve the private repositories that opted in
+  status [--json] [--health-addr ADDR]  show the running pool's state
   forget         delete this Mac's heartbeat variable from every repository
   version        print the version and the commit
   print-defaults print the built-in defaults as JSON
@@ -69,6 +72,10 @@ type forgetter struct {
 type services struct {
 	newPool      func(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, error)
 	newForgetter func(log *slog.Logger) (forgetter, error)
+	// fetchHealth asks the health endpoint at addr for the pool's state. It
+	// returns the status and the body for any answer, and an error only when
+	// nothing answers.
+	fetchHealth func(ctx context.Context, addr string) (status int, body []byte, err error)
 }
 
 // run executes one command line and returns the process exit code.
@@ -81,6 +88,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, svc servi
 	switch cmd {
 	case "run":
 		return cmdRun(ctx, rest, stderr, svc)
+	case "status":
+		return cmdStatus(ctx, rest, stdout, stderr, svc)
 	case "forget":
 		return cmdForget(ctx, rest, stdout, stderr, svc)
 	case "version":
