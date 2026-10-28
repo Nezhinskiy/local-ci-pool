@@ -13,19 +13,25 @@ import (
 	"github.com/Nezhinskiy/local-ci-pool/internal/fakeactions"
 )
 
-// countingAdapter is the Adapter, recording every count the listener passes
-// to Desired.
+// countingAdapter is the Adapter, recording every count it passes to Desired:
+// from a message's statistics, the initial session's, or the cache on an idle
+// poll.
 type countingAdapter struct {
 	*Adapter
 	mu     sync.Mutex
 	counts []int
 }
 
-func (c *countingAdapter) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
-	c.mu.Lock()
-	c.counts = append(c.counts, count)
-	c.mu.Unlock()
-	return c.Adapter.HandleDesiredRunnerCount(ctx, count)
+func newCountingAdapter(a *Adapter) *countingAdapter {
+	c := &countingAdapter{Adapter: a}
+	desired := a.desired
+	a.desired = func(ctx context.Context, count int) (int, error) {
+		c.mu.Lock()
+		c.counts = append(c.counts, count)
+		c.mu.Unlock()
+		return desired(ctx, count)
+	}
+	return c
 }
 
 func (c *countingAdapter) seen() []int {
@@ -42,7 +48,7 @@ func listenOn(t *testing.T, a *fakeactions.Actions, set string, sc *Scaler) *cou
 		GitHubConfigURL:     a.ConfigURL("example/alpha"),
 		PersonalAccessToken: "token",
 		SystemInfo:          scaleset.SystemInfo{System: "local-ci-pool-test"},
-	}, scaleset.WithRetryMax(0))
+	}, scaleset.WithRetry(scaleset.RetryConfig{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +62,7 @@ func listenOn(t *testing.T, a *fakeactions.Actions, set string, sc *Scaler) *cou
 	if err != nil {
 		t.Fatal(err)
 	}
-	ad := &countingAdapter{Adapter: NewAdapter(sc, sess)}
+	ad := newCountingAdapter(NewAdapter(sc, sess))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

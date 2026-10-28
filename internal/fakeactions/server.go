@@ -1,7 +1,7 @@
 // Package fakeactions is a fake of the GitHub Actions scale set service for
 // tests. It answers the real scaleset.Client and drives the real listener.Run.
 //
-// This file is copied from github.com/actions/scaleset v0.4.0,
+// This file is copied from github.com/actions/scaleset v0.5.0,
 // internal/testserver/server.go, Copyright GitHub, Inc., MIT License; see
 // third_party/NOTICE. Changes: the package name, this header, New renamed
 // newServer (New returns the scripted service of actions.go, which is the
@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v4"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // newServer returns a new httptest.Server that handles the
@@ -48,6 +48,12 @@ func NewUnstarted(t testing.TB, handler http.Handler, options ...actionsServerOp
 	}
 
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// handle fetchAccessToken (GitHub App installation access token)
+		if strings.HasSuffix(r.URL.Path, "/access_tokens") && strings.Contains(r.URL.Path, "/app/installations/") {
+			server.installationAccessTokenHandler(w, r)
+			return
+		}
+
 		// handle getRunnerRegistrationToken
 		if strings.HasSuffix(r.URL.Path, "/runners/registration-token") {
 			server.runnerRegistrationTokenHandler(w, r)
@@ -88,6 +94,12 @@ func WithActionsRegistrationTokenHandler(h http.HandlerFunc) actionsServerOption
 	}
 }
 
+func WithInstallationAccessTokenHandler(h http.HandlerFunc) actionsServerOption {
+	return func(s *actionsServer) {
+		s.installationAccessTokenHandler = h
+	}
+}
+
 type actionsServer struct {
 	*httptest.Server
 
@@ -95,9 +107,17 @@ type actionsServer struct {
 	token                          string
 	runnerRegistrationTokenHandler http.HandlerFunc
 	actionRegistrationTokenHandler http.HandlerFunc
+	installationAccessTokenHandler http.HandlerFunc
 }
 
 func (s *actionsServer) setDefaults(t testing.TB) {
+	if s.installationAccessTokenHandler == nil {
+		s.installationAccessTokenHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"token":"ghs_installation_token","expires_at":"2099-01-01T00:00:00Z"}`))
+		}
+	}
+
 	if s.runnerRegistrationTokenHandler == nil {
 		s.runnerRegistrationTokenHandler = func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusCreated)

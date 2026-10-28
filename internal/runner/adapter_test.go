@@ -18,18 +18,23 @@ func TestAdapterDrivesTheScaler(t *testing.T) {
 	var a listener.Scaler = NewAdapter(h.scaler, &fakeAcquirer{})
 	ctx := context.Background()
 
-	n, err := a.HandleDesiredRunnerCount(ctx, 2)
-	if err != nil || n != 2 {
-		t.Fatalf("HandleDesiredRunnerCount(2) = %d, %v", n, err)
+	if err := a.Scale(ctx, &scaleset.RunnerScaleSetMessage{MessageID: 1, Statistics: stats(2)}); err != nil {
+		t.Fatal(err)
 	}
-	name := h.starter.started()[0]
-	if err := a.HandleJobStarted(ctx, &scaleset.JobStarted{RunnerName: name}); err != nil {
+	names := h.starter.started()
+	if len(names) != 2 {
+		t.Fatalf("started %v on 2 assigned jobs, want 2 runners", names)
+	}
+	name := names[0]
+	if err := a.Scale(ctx, &scaleset.RunnerScaleSetMessage{MessageID: 2, Statistics: stats(2),
+		JobStartedMessages: []*scaleset.JobStarted{{RunnerName: name}}}); err != nil {
 		t.Fatal(err)
 	}
 	if slots.Busy() != 1 {
 		t.Fatalf("Busy %d after JobStarted, want 1", slots.Busy())
 	}
-	if err := a.HandleJobCompleted(ctx, &scaleset.JobCompleted{RunnerName: name}); err != nil {
+	if err := a.Scale(ctx, &scaleset.RunnerScaleSetMessage{MessageID: 3, Statistics: stats(1),
+		JobCompletedMessages: []*scaleset.JobCompleted{{RunnerName: name}}}); err != nil {
 		t.Fatal(err)
 	}
 	if slots.Busy() != 0 || slots.InUse() != 2 {
@@ -38,17 +43,13 @@ func TestAdapterDrivesTheScaler(t *testing.T) {
 
 	// Messages for runners of an earlier process, with an empty name, or
 	// with no payload at all, are logged and change nothing.
-	for _, err := range []error{
-		a.HandleJobStarted(ctx, &scaleset.JobStarted{}),
-		a.HandleJobCompleted(ctx, &scaleset.JobCompleted{}),
-		a.HandleJobStarted(ctx, &scaleset.JobStarted{RunnerName: "alpha-old"}),
-		a.HandleJobCompleted(ctx, &scaleset.JobCompleted{RunnerName: "alpha-old"}),
-		a.HandleJobStarted(ctx, nil),
-		a.HandleJobCompleted(ctx, nil),
-	} {
-		if err != nil {
-			t.Fatalf("a stale message failed the listener: %v", err)
-		}
+	if err := a.Scale(ctx, &scaleset.RunnerScaleSetMessage{
+		MessageID:            4,
+		Statistics:           stats(1),
+		JobStartedMessages:   []*scaleset.JobStarted{{}, {RunnerName: "alpha-old"}, nil},
+		JobCompletedMessages: []*scaleset.JobCompleted{{}, {RunnerName: "alpha-old"}, nil},
+	}); err != nil {
+		t.Fatalf("a stale message failed the listener: %v", err)
 	}
 	if slots.Busy() != 0 || slots.InUse() != 2 || h.scaler.Idle() != 1 {
 		t.Fatalf("busy %d in use %d idle %d after stale messages, want 0 2 1", slots.Busy(), slots.InUse(), h.scaler.Idle())
@@ -58,10 +59,10 @@ func TestAdapterDrivesTheScaler(t *testing.T) {
 func TestAdapterJobStartedNamesTheJob(t *testing.T) {
 	h := newHarness(NewSlots(1))
 	a := NewAdapter(h.scaler, &fakeAcquirer{})
-	if err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+	if err := a.Scale(context.Background(), &scaleset.RunnerScaleSetMessage{MessageID: 1, JobStartedMessages: []*scaleset.JobStarted{{
 		RunnerName:     "alpha-1",
 		JobMessageBase: scaleset.JobMessageBase{JobDisplayName: "unit (2)"},
-	}); err != nil {
+	}}}); err != nil {
 		t.Fatal(err)
 	}
 	for _, line := range h.logs.lines() {
@@ -364,7 +365,7 @@ func TestScaleContextPerMessageKind(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	scale(t, a, cancelled, &scaleset.RunnerScaleSetMessage{MessageID: initialMessageID, Statistics: stats(1)})
+	scale(t, a, cancelled, &scaleset.RunnerScaleSetMessage{MessageID: listener.InitialMessageID, Statistics: stats(1)})
 	if got := h.starter.started(); len(got) != 0 {
 		t.Fatalf("the initial message under a cancelled ctx started %v", got)
 	}

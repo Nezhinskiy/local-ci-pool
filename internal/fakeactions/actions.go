@@ -477,15 +477,28 @@ func (a *Actions) serve(w http.ResponseWriter, r *http.Request) {
 	case m[2] == "sessions" && r.Method == http.MethodDelete:
 		a.deleteSession(w, id, m[3])
 	case m[2] == "acquirejobs":
-		var ids []int64
-		_ = json.NewDecoder(r.Body).Decode(&ids)
-		writeJSON(w, http.StatusOK, map[string]any{"count": len(ids), "value": ids})
+		a.acquireJobs(w, r, id)
 	case m[2] == "generatejitconfig":
 		a.generateJIT(w, r, id)
 	default:
 		a.t.Errorf("fakeactions: unexpected request %s %s", r.Method, r.URL.Path)
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+// acquireJobs acquires every request asked for, and logs
+// "POST acquirejobs <set> <n>".
+func (a *Actions) acquireJobs(w http.ResponseWriter, r *http.Request, id int) {
+	var ids []int64
+	_ = json.NewDecoder(r.Body).Decode(&ids)
+	a.mu.Lock()
+	name := ""
+	if ss := a.scaleSets[id]; ss != nil {
+		name = ss.Name
+	}
+	a.logLocked("POST acquirejobs %s %d", name, len(ids))
+	a.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"count": len(ids), "value": ids})
 }
 
 func (a *Actions) getScaleSet(w http.ResponseWriter, name string) {

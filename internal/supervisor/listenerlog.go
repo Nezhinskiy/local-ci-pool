@@ -5,13 +5,14 @@ import (
 	"log/slog"
 )
 
-// listenerPollMsg is the Info line actions/scaleset v0.4.0's listener writes
+// listenerPollMsg is the Info line actions/scaleset v0.5.0's listener writes
 // before every poll for the next message: one line per poll per scale set, and
-// nearly all of the daemon's log. The listener's other Info
-// lines (Acquiring jobs, Jobs acquired) are the only record that GitHub handed
-// the scale set a job before a runner started, so only this one is dropped. If
-// upstream renames it the line comes back: the failure mode is noise, never
-// lost data.
+// nearly all of the daemon's log. The listener's only other Info line is
+// Handling initial session statistics, which is kept. The record that GitHub
+// handed the scale set a job before a runner started (Acquiring jobs, Jobs
+// acquired) now comes from the pool's Adapter, through the scaler's logger. If
+// upstream renames the poll line it comes back: the failure mode is noise,
+// never lost data.
 const listenerPollMsg = "Getting next message"
 
 // dropPoll wraps h so that an Info record whose message is listenerPollMsg is

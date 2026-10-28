@@ -1,7 +1,7 @@
 Third-party notices
 ===================
 
-This repository adapts code from github.com/actions/scaleset (v0.4.0), which is
+This repository adapts code from github.com/actions/scaleset (v0.5.0), which is
 distributed under the MIT License reproduced below.
 
 Files derived from actions/scaleset
@@ -9,8 +9,8 @@ Files derived from actions/scaleset
 
 Each carries a header naming its upstream path and its changes.
 
-  - internal/runner/adapter.go: the listener handler shape (the three
-    listener.Scaler methods and the fields they log) is adapted from
+  - internal/runner/adapter.go: the listener handler shape (the
+    listener.Scaler method Scale and the fields it logs) is adapted from
     examples/dockerscaleset/scaler.go. It is the only adapted file; the rest
     of the pool, including its runner bookkeeping, is this repository's own.
   - internal/fakeactions/server.go: copied, with the changes its header lists,

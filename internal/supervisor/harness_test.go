@@ -841,7 +841,7 @@ func (h *harness) deps() Deps {
 		Docker:  h.docker,
 		GitHub:  h.gh,
 		Token:   h.tok,
-		Clients: NewClientFactory(h.actions.URL, scaleset.WithRetryMax(0)),
+		Clients: NewClientFactory(h.actions.URL, scaleset.WithRetry(scaleset.RetryConfig{})),
 		Clock:   h.clock,
 		Log:     slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Detect: func(context.Context) (machine.Machine, string, error) {

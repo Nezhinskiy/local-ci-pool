@@ -278,7 +278,7 @@ waits](docs/runbook.md#ci-is-waiting).
 
 ## Development
 
-Supported upstream: `actions/scaleset v0.4.0`, pinned exactly.
+Supported upstream: `actions/scaleset v0.5.0`, pinned exactly.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). The code that adapts `actions/scaleset` is credited in
 [third_party/NOTICE](third_party/NOTICE). This project is released under the [MIT License](LICENSE).

@@ -1,9 +1,10 @@
 package runner
 
-// The handler shape below (the three listener.Scaler methods and the fields
-// they log) is adapted from github.com/actions/scaleset v0.4.0,
+// The handler shape below (the listener.Scaler method Scale, acquiring first,
+// and the fields it logs) is adapted from github.com/actions/scaleset v0.5.0,
 // examples/dockerscaleset/scaler.go, Copyright GitHub, Inc., MIT License; see
-// third_party/NOTICE. The runner bookkeeping is the pool's own (Scaler).
+// third_party/NOTICE. The statistics cache, the acquire policy and the runner
+// bookkeeping are the pool's own (Scaler).
 
 import (
 	"context"
@@ -15,7 +16,7 @@ import (
 	"github.com/actions/scaleset/listener"
 )
 
-// Adapter is the listener.Scaler of actions/scaleset v0.4.0 for a Scaler. It
+// Adapter is the listener.Scaler of actions/scaleset v0.5.0 for a Scaler. It
 // is the only type that implements that interface, so a change of the upstream
 // interface touches this file alone.
 type Adapter struct {
@@ -26,6 +27,8 @@ type Adapter struct {
 	// converges on it.
 	count int
 	seen  bool
+	// desired is s.Desired; tests wrap it to see the count it receives.
+	desired func(ctx context.Context, count int) (int, error)
 }
 
 // JobAcquirer acquires the job requests GitHub offers the scale set. The
@@ -34,13 +37,11 @@ type JobAcquirer interface {
 	AcquireJobs(ctx context.Context, requestIDs []int64) ([]int64, error)
 }
 
-// initialMessageID is the MessageID of the synthetic message carrying the
-// session's statistics that the listener hands Scale before polling.
-const initialMessageID = -1
-
 // NewAdapter returns the listener.Scaler for s, which acquires the jobs it is
 // offered through jobs. The listener builds one per run.
-func NewAdapter(s *Scaler, jobs JobAcquirer) *Adapter { return &Adapter{s: s, jobs: jobs} }
+func NewAdapter(s *Scaler, jobs JobAcquirer) *Adapter {
+	return &Adapter{s: s, jobs: jobs, desired: s.Desired}
+}
 
 // Scale handles one poll: a nil msg is an idle poll. It acquires every job
 // offered, first, then marks the runners the message reports started and
@@ -59,7 +60,7 @@ func NewAdapter(s *Scaler, jobs JobAcquirer) *Adapter { return &Adapter{s: s, jo
 func (a *Adapter) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage) error {
 	if msg == nil {
 		if a.seen {
-			_, _ = a.s.Desired(ctx, a.count)
+			_, _ = a.desired(ctx, a.count)
 		}
 		return nil
 	}
@@ -67,7 +68,7 @@ func (a *Adapter) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage
 		return err
 	}
 	handle := ctx
-	if msg.MessageID != initialMessageID {
+	if msg.MessageID != listener.InitialMessageID {
 		handle = context.WithoutCancel(ctx)
 	}
 	for _, j := range msg.JobStartedMessages {
@@ -80,7 +81,7 @@ func (a *Adapter) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage
 		a.count, a.seen = msg.Statistics.TotalAssignedJobs, true
 	}
 	if a.seen {
-		_, _ = a.s.Desired(handle, a.count)
+		_, _ = a.desired(handle, a.count)
 	}
 	return nil
 }
@@ -140,24 +141,6 @@ func (a *Adapter) jobCompleted(jobInfo *scaleset.JobCompleted) {
 		slog.String("result", jobInfo.Result),
 	)
 	a.s.Completed(jobInfo.RunnerName)
-}
-
-// HandleDesiredRunnerCount implements listener.Scaler.
-func (a *Adapter) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
-	return a.s.Desired(ctx, count)
-}
-
-// HandleJobStarted implements listener.Scaler. It never fails the listener.
-func (a *Adapter) HandleJobStarted(_ context.Context, jobInfo *scaleset.JobStarted) error {
-	a.jobStarted(jobInfo)
-	return nil
-}
-
-// HandleJobCompleted implements listener.Scaler. It never fails the listener;
-// the runner's slot is released when its container exits.
-func (a *Adapter) HandleJobCompleted(_ context.Context, jobInfo *scaleset.JobCompleted) error {
-	a.jobCompleted(jobInfo)
-	return nil
 }
 
 var _ listener.Scaler = (*Adapter)(nil)

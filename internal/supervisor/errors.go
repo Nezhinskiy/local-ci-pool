@@ -53,8 +53,8 @@ func isTokenRead(err error) bool { return errors.Is(err, ghauth.ErrNoToken) }
 
 // isUnauthorized reports whether err is an authentication failure: the GitHub
 // client's ErrUnauthorized, or a scale set API error whose response was a 401.
-// actions/scaleset v0.4.0 has no typed status error; it writes the status into
-// the message as status="401 Unauthorized", so that text is matched. A 401 on
+// The status is matched in the message text, which actions/scaleset v0.5.0
+// writes as status="401 Unauthorized" on every response error. A 401 on
 // the message queue is the queue token expiring, which the library refreshes
 // itself, so MessageQueueTokenExpiredError never counts.
 func isUnauthorized(err error) bool {

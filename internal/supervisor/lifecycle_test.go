@@ -385,3 +385,15 @@ func TestDrainJoinSharesTheBudgetAfterTheBound(t *testing.T) {
 		t.Fatalf("the stop took %v, want about the drain bound plus afterBound, not the join bound %v", took, joinBound)
 	}
 }
+
+// The pool acquires the job GitHub offers its scale set: under
+// actions/scaleset's Scaler the listener no longer does, so a pool that
+// stopped would leave every job unassigned.
+func TestPoolAcquiresTheJobsItIsOffered(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.actions.Assign(alphaSet, 1)
+	h.delivered(alphaSet)
+	h.eventually("the job acquired", func() bool { return h.actions.Count("POST acquirejobs "+alphaSet+" 1") == 1 })
+}
