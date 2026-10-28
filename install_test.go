@@ -74,7 +74,10 @@ exit 0
 	"docker": `#!/bin/sh
 echo "docker $*" >> "$STUB_LOG"
 [ "${STUB_DOCKER_EXIT:-0}" = 0 ] || exit "$STUB_DOCKER_EXIT"
-echo "${STUB_DOCKER_INFO:-19327352832 10}"
+case "$1" in
+version) echo "${STUB_DOCKER_API:-1.51}" ;;
+*) echo "${STUB_DOCKER_INFO:-19327352832 10}" ;;
+esac
 `,
 	"launchctl": `#!/bin/sh
 echo "launchctl $*" >> "$STUB_LOG"
@@ -551,6 +554,43 @@ func TestInstallRefusesBeforeDownloading(t *testing.T) {
 			out, err := e.install()
 			if err == nil || !strings.Contains(out, tc.want) {
 				t.Fatalf("want a refusal mentioning %q, got %v\n%s", tc.want, err, out)
+			}
+			if index(e.calls(), "gh release download ") >= 0 || exists(filepath.Join(e.home, "Library")) {
+				t.Errorf("the installer went on after refusing; calls %v", e.calls())
+			}
+		})
+	}
+}
+
+// The runner is mounted as an image, which needs Docker Engine API 1.48
+// (Docker 28). The versions compare as numbers: 1.100 is newer than 1.48.
+func TestInstallChecksTheEngineAPIVersion(t *testing.T) {
+	for _, tc := range []struct {
+		api  string
+		pass bool
+	}{
+		{"1.47", false},
+		{"1.9", false},
+		{"0.99", false},
+		{"1.48", true},
+		{"1.51", true},
+		{"1.100", true},
+		{"2.0", true},
+	} {
+		t.Run(tc.api, func(t *testing.T) {
+			e := newEnv(t)
+			e.vars["STUB_DOCKER_API"] = tc.api
+			out, err := e.install("--dry-run")
+			const refusal = "is older than 1.48 (Docker 28), which the runner's image mount needs; update Docker"
+			if tc.pass {
+				if err != nil || strings.Contains(out, refusal) {
+					t.Fatalf("API %s should pass: %v\n%s", tc.api, err, out)
+				}
+				return
+			}
+			want := "Docker Engine API " + tc.api + " " + refusal
+			if err == nil || !strings.Contains(out, want) {
+				t.Fatalf("API %s: want a refusal %q, got %v\n%s", tc.api, want, err, out)
 			}
 			if index(e.calls(), "gh release download ") >= 0 || exists(filepath.Join(e.home, "Library")) {
 				t.Errorf("the installer went on after refusing; calls %v", e.calls())

@@ -68,19 +68,21 @@ func newRealForgetter(*slog.Logger) (forgetter, error) {
 	return forgetter{source: gh, deleter: gh, machine: machine.LocalName}, nil
 }
 
-// newDockerClient connects the way the docker CLI does by default. Under
-// launchd DOCKER_HOST is unset, and a Mac whose Docker Desktop does not link
-// /var/run/docker.sock has its socket under ~/.docker/run instead.
+// newDockerClient connects the way the docker CLI does: under launchd
+// DOCKER_HOST is unset, and the socket of Docker Desktop, OrbStack or Colima
+// may be reachable only through the current docker context or a path under
+// the home directory.
 func newDockerClient() (*client.Client, error) {
 	opts := []client.Opt{client.FromEnv}
-	if os.Getenv("DOCKER_HOST") == "" {
-		if _, err := os.Stat("/var/run/docker.sock"); err != nil {
-			if home, herr := os.UserHomeDir(); herr == nil {
-				sock := filepath.Join(home, ".docker", "run", "docker.sock")
-				if _, err := os.Stat(sock); err == nil {
-					opts = append(opts, client.WithHost("unix://"+sock))
-				}
-			}
+	if home, err := os.UserHomeDir(); err == nil {
+		sockets := []string{
+			"/var/run/docker.sock",
+			filepath.Join(home, ".docker", "run", "docker.sock"),
+			filepath.Join(home, ".orbstack", "run", "docker.sock"),
+			filepath.Join(home, ".colima", "default", "docker.sock"),
+		}
+		if h := dockerHost(os.Getenv, home, sockets); h != "" {
+			opts = append(opts, client.WithHost(h))
 		}
 	}
 	return client.New(opts...)

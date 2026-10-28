@@ -212,18 +212,29 @@ check_prerequisites() {
   [ "$(uname -s)" = Darwin ] || die "the pool runs on macOS only"
   command -v gh > /dev/null 2>&1 || die "gh is not installed; run: brew install gh"
   gh auth status > /dev/null 2>&1 || die "gh is not logged in; run: gh auth login"
-  command -v docker > /dev/null 2>&1 || die "docker is not installed; install Docker Desktop"
+  command -v docker > /dev/null 2>&1 || die "docker is not installed; install Docker (Engine 28 or newer)"
 
   local info mem cpus
-  info="$(docker info --format '{{.MemTotal}} {{.NCPU}}' 2> /dev/null)" || die "Docker is not answering; start Docker Desktop"
+  info="$(docker info --format '{{.MemTotal}} {{.NCPU}}' 2> /dev/null)" || die "Docker is not answering; start Docker"
   read -r mem cpus <<< "$info"
   if ! [[ "$mem" =~ ^[0-9]+$ && "$cpus" =~ ^[0-9]+$ ]]; then
     die "unexpected output of docker info: '$info'"
   fi
+  # The runner is mounted as an image, which needs Engine API 1.48 (Docker 28).
+  local api api_major api_minor
+  api="$(docker version --format '{{.Server.APIVersion}}' 2> /dev/null)" || die "Docker is not answering; start Docker"
+  if ! [[ "$api" =~ ^([0-9]+)\.([0-9]+) ]]; then
+    die "unexpected output of docker version: '$api'"
+  fi
+  api_major="${BASH_REMATCH[1]}"
+  api_minor="${BASH_REMATCH[2]}"
+  if [ "$api_major" -lt 1 ] || { [ "$api_major" -eq 1 ] && [ "$api_minor" -lt 48 ]; }; then
+    die "Docker Engine API $api is older than 1.48 (Docker 28), which the runner's image mount needs; update Docker"
+  fi
   SLOTS="$(slots_for "$mem" "$cpus")"
   MACHINE="$(machine_name)"
   if [ "$SLOTS" -lt 1 ]; then
-    die "Docker has $((mem / (1 << 30))) GiB of memory and $cpus CPUs, which is too little for one runner slot (6 GB and 2 CPUs); raise Docker Desktop's memory limit"
+    die "Docker has $((mem / (1 << 30))) GiB of memory and $cpus CPUs, which is too little for one runner slot (6 GB and 2 CPUs); raise the Docker VM's memory limit"
   fi
   say "machine: $MACHINE ($SLOTS slots; heartbeat variable CI_POOL_HB_$(printf '%s' "$MACHINE" | tr '[:lower:]' '[:upper:]'))"
 
