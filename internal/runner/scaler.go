@@ -20,7 +20,7 @@ import (
 const namePrefix = "local-ci-"
 
 // Every call the scaler makes runs under the listener's context, which the
-// listener strips of cancellation while it handles a message, so each is
+// Adapter strips of cancellation while it handles a message, so each is
 // bounded here instead. They are variables so tests can shorten them.
 var (
 	// launchTimeout bounds one runner's start: minting its JIT configuration,

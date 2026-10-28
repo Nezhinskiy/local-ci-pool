@@ -122,15 +122,24 @@ func TestListenerAcksOnlyAfterScale(t *testing.T) {
 }
 
 func TestListenerAcksAMessageWhoseAcquireFailed(t *testing.T) {
-	h := newHarness(NewSlots(4))
-	c := &scriptedClient{events: &eventLog{}, acquireErr: errBoom, msgs: []*scaleset.RunnerScaleSetMessage{
-		{MessageID: 4, Statistics: stats(1), JobAvailableMessages: available(71)},
-	}}
-	done := runListener(t, h, c)
-	eventually(t, "message 4 acked", func() bool { return c.acked(4) })
-	keepsRunning(t, done)
-	if got := c.events.list(); slices.Index(got, "acquire [71]") < 0 {
-		t.Fatalf("events %q, want the acquire of 71", got)
+	for name, acquireErr := range map[string]error{
+		"error": errBoom,
+		// The HTTP client's own timeout matches context.DeadlineExceeded
+		// while the listener's ctx is live.
+		"deadline with a live ctx": fmt.Errorf("posting: %w", context.DeadlineExceeded),
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(NewSlots(4))
+			c := &scriptedClient{events: &eventLog{}, acquireErr: acquireErr, msgs: []*scaleset.RunnerScaleSetMessage{
+				{MessageID: 4, Statistics: stats(1), JobAvailableMessages: available(71)},
+			}}
+			done := runListener(t, h, c)
+			eventually(t, "message 4 acked", func() bool { return c.acked(4) })
+			keepsRunning(t, done)
+			if got := c.events.list(); slices.Index(got, "acquire [71]") < 0 {
+				t.Fatalf("events %q, want the acquire of 71", got)
+			}
+		})
 	}
 }
 

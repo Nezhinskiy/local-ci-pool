@@ -193,12 +193,21 @@ func TestScaleReturnsTheContextError(t *testing.T) {
 			t.Fatalf("busy %d, started %v after the failed acquire; want 0 and [a]", slots.Busy(), h.starter.started())
 		}
 	})
-	t.Run("deadline", func(t *testing.T) {
+	// A slow acquire under a live ctx, such as the HTTP client's own timeout
+	// (it matches context.DeadlineExceeded), is an acquire failure like any
+	// other: logged, and the message handled.
+	t.Run("deadline with a live ctx", func(t *testing.T) {
 		h := newHarness(NewSlots(4))
 		a := NewAdapter(h.scaler, &fakeAcquirer{err: fmt.Errorf("posting: %w", context.DeadlineExceeded)})
 		err := a.Scale(context.Background(), &scaleset.RunnerScaleSetMessage{MessageID: 1, Statistics: stats(1), JobAvailableMessages: available(32)})
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("Scale on an acquire deadline = %v, want context.DeadlineExceeded", err)
+		if err != nil {
+			t.Fatalf("Scale on a slow acquire under a live ctx = %v, want nil", err)
+		}
+		if indexOf(h.logs.lines(), "level=WARN", "acquiring jobs failed", "runnerRequestIds=[32]") < 0 {
+			t.Fatalf("no acquire failure warning in %q", h.logs.lines())
+		}
+		if got := h.starter.started(); len(got) != 1 {
+			t.Fatalf("started %v, want the message's Desired to start one runner", got)
 		}
 	})
 }
@@ -317,7 +326,7 @@ func TestScaleMessageWithoutStatisticsKeepsTheLastCount(t *testing.T) {
 // again. The job events change nothing the second time. The statistics it
 // carries replace the cached count, even when they are older (an accepted
 // risk: a message redelivered across sessions would carry stale statistics).
-func TestScaleRedeliveredMessageChangesNothing(t *testing.T) {
+func TestScaleRedeliveredMessageRepeatsOnlyTheAcquire(t *testing.T) {
 	slots := NewSlots(4)
 	h := newHarness(slots)
 	h.scaler.names = scripted("a", "b", "c")

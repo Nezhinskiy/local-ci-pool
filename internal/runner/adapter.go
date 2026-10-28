@@ -8,7 +8,6 @@ package runner
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 
@@ -38,7 +37,8 @@ type JobAcquirer interface {
 }
 
 // NewAdapter returns the listener.Scaler for s, which acquires the jobs it is
-// offered through jobs. The listener builds one per run.
+// offered through jobs. The supervisor builds one per listener run
+// (project.serveOnce).
 func NewAdapter(s *Scaler, jobs JobAcquirer) *Adapter {
 	return &Adapter{s: s, jobs: jobs, desired: s.Desired}
 }
@@ -50,7 +50,9 @@ func NewAdapter(s *Scaler, jobs JobAcquirer) *Adapter {
 //
 // It returns an error only when ctx is done during the acquisition, before
 // anything else in the message ran, so the listener stops without acking it.
-// Any other acquire failure is logged and the message handled: GitHub
+// Any other acquire failure, a slow one whose error matches
+// context.DeadlineExceeded under a live ctx included, is logged and the
+// message handled: GitHub
 // completes an assigned request that no runner acquired after 5 minutes and
 // reissues it. Job events never fail it.
 //
@@ -101,7 +103,7 @@ func (a *Adapter) acquire(ctx context.Context, offered []*scaleset.JobAvailable)
 	a.s.log.Info("Acquiring jobs", slog.Int("count", len(ids)), slog.Any("runnerRequestIds", ids))
 	acquired, err := a.jobs.AcquireJobs(ctx, ids)
 	if err != nil {
-		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if ctx.Err() != nil {
 			return fmt.Errorf("acquiring jobs: %w", err)
 		}
 		a.s.log.Warn("acquiring jobs failed; GitHub reissues an unacquired request after 5 minutes",
