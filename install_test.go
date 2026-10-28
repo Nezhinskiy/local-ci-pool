@@ -599,6 +599,24 @@ func TestInstallChecksTheEngineAPIVersion(t *testing.T) {
 	}
 }
 
+// An answer that is not an API version fails closed, before anything is
+// downloaded: a prefix such as "1.48abc" does not count as 1.48.
+func TestInstallRefusesAnUnreadableEngineVersion(t *testing.T) {
+	for _, api := range []string{"garbage", "1.48abc"} {
+		t.Run("api="+api, func(t *testing.T) {
+			e := newEnv(t)
+			e.vars["STUB_DOCKER_API"] = api
+			out, err := e.install()
+			if err == nil || !strings.Contains(out, "unexpected output of docker version: '"+api+"'") {
+				t.Fatalf("want a refusal, got %v\n%s", err, out)
+			}
+			if index(e.calls(), "gh release download ") >= 0 || exists(filepath.Join(e.home, "Library")) {
+				t.Errorf("the installer went on after refusing; calls %v", e.calls())
+			}
+		})
+	}
+}
+
 // The installer prints the same slot count the pool computes (memory rounded
 // to the nearest GiB, then the CPU and the cap).
 func TestInstallSlotsMatchThePool(t *testing.T) {

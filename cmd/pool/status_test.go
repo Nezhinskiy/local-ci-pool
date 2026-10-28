@@ -183,3 +183,33 @@ func TestStatusUnreadableBodyIsOneLine(t *testing.T) {
 		t.Fatalf("exit %d, stdout %q, stderr %q, want one \"pool: …\" line", code, stdout, stderr)
 	}
 }
+
+// A job's name is chosen by whoever can write to the repository: ESC and
+// newlines in it must not reach the terminal or forge a row.
+func TestStatusPrintsNoControlCharacters(t *testing.T) {
+	snap := statusFixture()
+	snap.Machine = "mac\x1b[2J"
+	snap.Projects[1].Reason = "bad\r\x9b0m"
+	snap.Projects[1].Stuck[0].Job = "\x1b]0;x\x07\n  fake  healthy"
+	svc, _ := statusServices(http.StatusOK, snap, nil)
+	_, stdout, _ := do(t, svc, "status")
+	for i := 0; i < len(stdout); i++ {
+		if c := stdout[i]; (c < 0x20 && c != '\n') || c == 0x7f {
+			t.Fatalf("control byte %#x in the output:\n%q", c, stdout)
+		}
+	}
+	if strings.Contains(stdout, "\x9b") || strings.Contains(stdout, "\u009b") {
+		t.Errorf("a C1 control reached the output: %q", stdout)
+	}
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.TrimSpace(line) == "fake  healthy" {
+			t.Errorf("a job name forged the line %q", line)
+		}
+	}
+	if n := strings.Count(stdout, "\n"); n != 4 {
+		t.Errorf("%d lines, want 4 (the layout's own):\n%q", n, stdout)
+	}
+	if want := `\u001b]0;x\u0007\u000a  fake  healthy`; !strings.Contains(stdout, want) {
+		t.Errorf("the escaped job name %q is missing:\n%q", want, stdout)
+	}
+}

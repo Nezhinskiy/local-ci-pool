@@ -58,9 +58,27 @@ func cmdStatus(ctx context.Context, args []string, stdout, stderr io.Writer, svc
 	return code
 }
 
+// clean makes s safe to print on a terminal: every control character (below
+// 0x20, 0x7f, and the C1 range 0x80 to 0x9f) becomes its \uXXXX escape. Job
+// names come from the GitHub API and are chosen by anyone who can write to a
+// served repository; a newline or an escape sequence in one must not forge
+// lines or drive the terminal.
+func clean(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			fmt.Fprintf(&b, `\u%04x`, r)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // formatStatus lays the snapshot out: one line for the pool, one per project
 // with the repository column padded to the longest, and a line under a project
-// for each job that waits too long for a runner.
+// for each job that waits too long for a runner. Every string from the
+// snapshot goes through clean.
 func formatStatus(s supervisor.Snapshot) string {
 	var b strings.Builder
 	docker, login := "ok", "ok"
@@ -71,27 +89,27 @@ func formatStatus(s supervisor.Snapshot) string {
 		login = "lost"
 	}
 	fmt.Fprintf(&b, "pool %s (%s) on %s: docker %s, login %s, %d slots, %d in use",
-		s.Version, s.Commit, s.Machine, docker, login, s.Slots, s.InUse)
+		clean(s.Version), clean(s.Commit), clean(s.Machine), docker, login, s.Slots, s.InUse)
 	if s.Budget.State != "off" {
-		fmt.Fprintf(&b, ", budget %s", s.Budget.State)
+		fmt.Fprintf(&b, ", budget %s", clean(s.Budget.State))
 	}
 	b.WriteByte('\n')
 
 	width := 0
 	for _, p := range s.Projects {
-		width = max(width, len(p.Repo))
+		width = max(width, len(clean(p.Repo)))
 	}
 	for _, p := range s.Projects {
 		state := "healthy"
 		if !p.Healthy {
-			state = "unhealthy: " + p.Reason
+			state = "unhealthy: " + clean(p.Reason)
 		}
 		if p.Waiting > 0 {
 			state += fmt.Sprintf(", %d waiting for cores", p.Waiting)
 		}
-		fmt.Fprintf(&b, "  %-*s  %s\n", width, p.Repo, state)
+		fmt.Fprintf(&b, "  %-*s  %s\n", width, clean(p.Repo), state)
 		for _, j := range p.Stuck {
-			fmt.Fprintf(&b, "    queued %s: %s %s\n", time.Duration(j.QueuedS)*time.Second, j.Job, j.RunURL)
+			fmt.Fprintf(&b, "    queued %s: %s %s\n", time.Duration(j.QueuedS)*time.Second, clean(j.Job), clean(j.RunURL))
 		}
 	}
 	return b.String()
