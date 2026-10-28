@@ -6,10 +6,13 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
+	"github.com/Nezhinskiy/local-ci-pool/internal/health"
 	"github.com/Nezhinskiy/local-ci-pool/internal/supervisor"
 )
 
@@ -256,6 +259,48 @@ func TestStatusRefusesJSONThatIsNotTheSnapshot(t *testing.T) {
 		if code != exitError || stdout != "" || strings.Count(stderr, "\n") != 1 || !strings.HasPrefix(stderr, "pool: ") {
 			t.Errorf("%v: exit %d, stdout %q, stderr %q, want one \"pool: …\" line", args, code, stdout, stderr)
 		}
+	}
+}
+
+// fetchHealth sends the token the pool on that port wrote, so pool status
+// gets the full reasons; without one it sends none.
+func TestFetchHealthSendsTheToken(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte(`{"version":"v9.9.9"}`))
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	if _, _, err := fetchHealth(context.Background(), addr); err != nil {
+		t.Fatal(err)
+	}
+	path := health.TokenPath(supportDir(), addr)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("cafe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fetchHealth(context.Background(), addr); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "" || got[1] != "Bearer cafe" {
+		t.Fatalf("Authorization headers %q, want none, then the token", got)
+	}
+}
+
+func TestStatusSaysWhenTheBodyIsRedacted(t *testing.T) {
+	snap := supervisor.Snapshot{Version: "v0.1.0", Docker: true, Login: true, Redacted: true, Budget: budget.State{State: "off"},
+		Projects: []supervisor.ProjectHealth{{Repo: "example/beta", Reason: "preflight", Class: "preflight"}}}
+	body, _ := json.Marshal(snap)
+	svc := services{fetchHealth: func(context.Context, string) (int, []byte, error) { return http.StatusOK, body, nil }}
+	_, stdout, _ := do(t, svc, "status")
+	if !strings.Contains(stdout, "unhealthy: preflight") || !strings.Contains(stdout, "classes only") {
+		t.Fatalf("stdout %q", stdout)
 	}
 }
 

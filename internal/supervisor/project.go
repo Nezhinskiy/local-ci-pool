@@ -519,6 +519,7 @@ func (pr *project) start(ctx context.Context, name, jit string, need int) error 
 		Instance: pr.s.instance,
 		Project:  pr.identity,
 		Need:     need,
+		CPUs:     runner.CPUCap(need, pr.s.machine.FP.CPUs, pr.s.machine.Slots),
 		Mount:    m.Spec,
 		JIT:      jit,
 	})
@@ -898,13 +899,17 @@ func (pr *project) health() ProjectHealth {
 	case pr.public:
 		h.Reason = notPrivate
 	case pr.draining:
-		h.Reason = "draining"
-	case pr.failed || !pr.up:
-		h.Reason = pr.reason
+		h.Reason, h.Class = "draining", "draining"
+	case pr.failed:
+		h.Reason, h.Class = pr.reason, "setup"
+	case !pr.up && pr.reason == "starting":
+		h.Reason, h.Class = pr.reason, "starting"
+	case !pr.up:
+		h.Reason, h.Class = pr.reason, "down"
 	case pr.imgErr != "":
-		h.Reason = pr.imgErr
+		h.Reason, h.Class = pr.imgErr, "image"
 	case pr.mountErr != "":
-		h.Reason = pr.mountErr
+		h.Reason, h.Class = pr.mountErr, "preflight"
 	default:
 		h.Healthy = true
 	}
@@ -918,7 +923,7 @@ func (pr *project) health() ProjectHealth {
 	}
 	if h.Healthy && sc != nil {
 		if n := sc.NoJobExits(); n >= noJobLimit {
-			h.Healthy = false
+			h.Healthy, h.Class = false, "runners"
 			h.Reason = fmt.Sprintf("%d runners in a row went away without starting a job: the image or the runner is broken; this clears on the next job or passed preflight", n)
 		}
 	}

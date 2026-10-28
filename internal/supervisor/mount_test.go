@@ -22,7 +22,7 @@ func TestNewRunnerThatFailsThePreflightIsNotAdopted(t *testing.T) {
 	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
 	h.eventually("alpha held back on the old runner", func() bool {
 		a, _ := h.health(alphaRepo)
-		return !a.Healthy && strings.Contains(a.Reason, "runner 2.339.0 failed the preflight") &&
+		return !a.Healthy && a.Class == "preflight" && strings.Contains(a.Reason, "runner 2.339.0 failed the preflight") &&
 			strings.Contains(a.Reason, "stay on runner 2.338.0") && strings.Contains(a.Reason, "GLIBC_2.38")
 	})
 	h.eventually("both runner mounts kept", func() bool { return h.lastPrune() == "2.338.0,2.339.0" })
@@ -67,7 +67,7 @@ func TestRunnersExitingWithoutAJobMarkTheProjectUnhealthy(t *testing.T) {
 	h.docker.exit(rs[2])
 	h.eventually("alpha unhealthy", func() bool {
 		a, _ := h.health(alphaRepo)
-		return !a.Healthy && strings.Contains(a.Reason, "3 runners in a row went away without starting a job")
+		return !a.Healthy && a.Class == "runners" && strings.Contains(a.Reason, "3 runners in a row went away without starting a job")
 	})
 	// JobStarted reaches the listener late; a short job's runner may exit first.
 	h.actions.Started(alphaSet, rs[0])
@@ -107,7 +107,7 @@ func TestNoJobExitsClearOnAPassedPreflight(t *testing.T) {
 	}
 	h.eventually("alpha unhealthy with the preflight's reason", func() bool {
 		a, _ := h.health(alphaRepo)
-		return !a.Healthy && strings.Contains(a.Reason, "bash: not found")
+		return !a.Healthy && a.Class == "image" && strings.Contains(a.Reason, "bash: not found")
 	})
 	h.setCheckErr(img, nil)
 	h.eventually("alpha healthy after a passed preflight", func() bool { return h.healthy(alphaRepo) })

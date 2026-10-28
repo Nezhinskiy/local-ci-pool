@@ -250,8 +250,8 @@ type Deps struct {
 	Prune func(ctx context.Context, keep []string) error
 	// Ensure makes a project's image available (image.Ensure).
 	Ensure func(ctx context.Context, p discovery.Project) (string, error)
-	// Check preflights an image with the mount and returns its run user
-	// (image.Preflight, image.RunUser).
+	// Check preflights an image with the mount and returns its run user,
+	// never root (image.Preflight).
 	Check func(ctx context.Context, ref string, m runnermount.Mount) (string, error)
 	// Caffeinate keeps the Mac awake until stop is called
 	// (caffeinate -i -w <pid>).
@@ -280,6 +280,9 @@ type Snapshot struct {
 	// Budget is the budget's state: {State: "off"} when none is wired.
 	Budget   budget.State    `json:"budget"`
 	Projects []ProjectHealth `json:"projects"`
+	// Redacted is set on the body /healthz serves without the pool's token:
+	// each reason is cut to its Class, and images and stuck jobs are left out.
+	Redacted bool `json:"redacted,omitempty"`
 }
 
 // ProjectHealth is one project's state. Healthy means its listener runs on an
@@ -289,7 +292,10 @@ type ProjectHealth struct {
 	Identity string `json:"identity"`
 	Image    string `json:"image"`
 	Reason   string `json:"reason"`
-	Healthy  bool   `json:"healthy"`
+	// Class is the kind of Reason, one of a fixed set: starting, draining,
+	// setup, down, image, preflight, runners. Empty while healthy.
+	Class   string `json:"class,omitempty"`
+	Healthy bool   `json:"healthy"`
 	// Waiting is the project's runners waiting for the budget.
 	Waiting int `json:"waiting"`
 	// Admitted is the project's runners and survivors that hold an
@@ -976,10 +982,11 @@ func (s *Supervisor) prune(ctx context.Context) {
 
 // checkImage is the default Deps.Check.
 func (s *Supervisor) checkImage(ctx context.Context, ref string, m runnermount.Mount) (string, error) {
-	if err := image.Preflight(ctx, s.deps.Docker, ref, m); err != nil {
+	user, err := image.Preflight(ctx, s.deps.Docker, ref, m)
+	if err != nil {
 		return "", fmt.Errorf("preflight failed: %w", err)
 	}
-	return image.RunUser(ctx, s.deps.Docker, ref)
+	return user, nil
 }
 
 // subscribeHook asks for a reconcile whenever WatchExits subscribes: die

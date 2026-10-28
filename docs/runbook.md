@@ -110,8 +110,13 @@ Run `./install.sh --dry-run` first if you want to see what it would do. The inst
 
 The pool writes no configuration. `config.toml` is yours; the installer creates it only when asked.
 The pool keeps derived state only: its git mirrors under
-`~/Library/Caches/local-ci-pool`, and the Docker images `local-ci/runner:<version>` and
-`local-ci/<identity>:<digest>`. Deleting any of it costs a fetch or a build.
+`~/Library/Caches/local-ci-pool`, the Docker images `local-ci-pool/runner:<version>` (the runner
+trees) and `local-ci/<identity>:<digest>` (the job images), the Docker network
+`local-ci-pool-main` that every job container joins, and the health token
+`~/Library/Application Support/local-ci-pool/health-<port>.token`. Deleting any of it costs a
+fetch, a build or a restart. Releases before the runner trees moved kept them under
+`local-ci/runner:<version>`, where a repository named `runner` had its job images too; the first
+start of a newer pool removes the old trees there and leaves job images alone.
 
 The agent restarts the pool when it exits with an error (`KeepAlive { SuccessfulExit = false }`, at
 most one start per 30 seconds). A cause that restarting cannot fix makes the pool log
@@ -296,13 +301,21 @@ grep 'skipping repository' ~/Library/Logs/local-ci-pool/pool.log | tail
 ## Health and logs
 
 ```sh
-curl -s 127.0.0.1:8737/healthz
+"$HOME/Library/Application Support/local-ci-pool/bin/pool" status --json
 tail -f ~/Library/Logs/local-ci-pool/pool.log
 ```
 
 `/healthz` answers 200 while Docker answers and `gh` gives the pool a token, and 503 otherwise,
 with the same JSON body. It answers from the moment the pool binds its address, also while it waits
-for a token:
+for a token. A request without the pool's health token gets the redacted body, which a job can read
+too (see below): `"redacted": true`, each `reason` cut to its `class`, and no `image` or `stuck`.
+`pool status` sends the token; with `curl`, send it yourself:
+
+```sh
+curl -s -H "Authorization: Bearer $(cat "$HOME/Library/Application Support/local-ci-pool/health-8737.token")" 127.0.0.1:8737/healthz
+```
+
+The fields:
 
 | Field | Meaning |
 |---|---|
@@ -313,7 +326,8 @@ for a token:
 | `login` | `false` while the last read of the token from `gh` failed (see [Install](#install)); `/healthz` answers 503 then too |
 | `probe` | whether this is a probe run |
 | `budget` | the core budget: `state`, an `error` class when there is one, and `oldest_wait_s` (see [CI is waiting](#ci-is-waiting)) |
-| `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, a `reason` when not healthy, the budget's `waiting` and `admitted` counts, and `stuck` when a job is queued that GitHub does not offer the pool (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)) |
+| `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, a `reason` and its `class` (`starting`, `draining`, `setup`, `down`, `image`, `preflight` or `runners`) when not healthy, the budget's `waiting` and `admitted` counts, and `stuck` when a job is queued that GitHub does not offer the pool (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)) |
+| `redacted` | `true` on the body served without the token; absent otherwise |
 
 `pool status` reads the same endpoint and prints it as text (see [CI went hosted](#ci-went-hosted)).
 
@@ -326,7 +340,10 @@ the listener keeps running: GitHub reissues an unacquired request after 5 minute
 
 The endpoint binds `127.0.0.1:8737` and answers only requests whose `Host` is a loopback name. A job
 can still reach it through Docker Desktop's host gateway address with a forged `Host`, and so learn
-which repositories the pool serves; see [SECURITY.md](../SECURITY.md). Binding it is also the
+which repositories the pool serves and the class of each one's trouble, but not its reason; see
+[SECURITY.md](../SECURITY.md). The pool writes a new token at each start, once it holds the
+address, so a second pool that exits with `already running` leaves the first one's token alone.
+When `pool status` cannot read the token, it says so under the projects and shows the classes. Binding it is also the
 single-instance lock: a second pool on the same Mac exits with `terminal: already running`. The log is not rotated; stop the pool and delete the file when it grows
 large.
 
@@ -447,10 +464,11 @@ at most the whole budget). The grant is fixed for the job's life, and `pool.log`
 **The grant reaches the job** as `CORESLOT_CPU` in its environment (and as the container label
 `local-ci-pool.need`). A workflow sizes its parallelism to it, for example
 `pytest -n "${CORESLOT_CPU:-2}"` or `make -j "${CORESLOT_CPU:-2}"`; the default covers a job that
-runs without the budget, where the variable is unset. The budget counts only the cores granted: a
-job that uses more than its grant, because it ignores `CORESLOT_CPU`, undercounts, and the Mac is
-oversubscribed by the difference. Before this release a job always got all of `cpu`, so a workflow
-that assumed that must read `CORESLOT_CPU` now.
+runs without the budget, where the variable is unset. The container is capped at its grant (Docker's
+`--cpus`), so a job that ignores `CORESLOT_CPU` runs slower rather than oversubscribing the Mac.
+Before this release a job always got all of `cpu`, so a workflow that assumed that must read
+`CORESLOT_CPU` now. Without the budget, each container is capped at its slot's share of the Docker
+VM's CPUs (CPUs divided by slots), and has a limit of 4096 processes and threads either way.
 
 **Creating it.** `./install.sh --budget-cpu 2` creates `~/.config/local-ci-pool/config.toml` (mode
 0600) when the installed pool would read no file, and never changes one that exists: it prints

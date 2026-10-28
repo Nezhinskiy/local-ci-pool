@@ -115,7 +115,7 @@ func TestRealMount(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("runner %s mount %+v", m.Version, m.Spec)
-	if m.Spec.Type != mount.TypeImage || !m.Spec.ReadOnly || m.Spec.Target != "/opt/local-ci" || m.Spec.Source != "local-ci/runner:"+m.Version {
+	if m.Spec.Type != mount.TypeImage || !m.Spec.ReadOnly || m.Spec.Target != "/opt/local-ci" || m.Spec.Source != "local-ci-pool/runner:"+m.Version {
 		t.Fatalf("unexpected mount %+v", m.Spec)
 	}
 	if gh.downloads.Load() != 1 {
@@ -159,16 +159,14 @@ func TestRealMount(t *testing.T) {
 
 	// 4. Preflight: the bare Ubuntu has no CA bundle and must fail for that
 	// reason; the Playwright image must report the runner version.
-	err = image.Preflight(ctx, cli, bareUbuntu, m)
+	_, err = image.Preflight(ctx, cli, bareUbuntu, m)
 	t.Logf("bare Ubuntu preflight: %v", err)
 	if err == nil || !strings.Contains(err.Error(), "image has no CA bundle") {
 		t.Errorf("preflight of an image without a CA bundle: %v", err)
 	}
 	if haveImage(ctx, cli, playwright) {
-		user, err := image.RunUser(ctx, cli, playwright)
-		t.Logf("Playwright run user: %q, %v", user, err)
-		version, err := image.PreflightVersion(ctx, cli, playwright, m)
-		t.Logf("Playwright preflight: %q, %v", version, err)
+		user, version, err := image.PreflightVersion(ctx, cli, playwright, m)
+		t.Logf("Playwright preflight: user %q, version %q, %v", user, version, err)
 		if err != nil || version != m.Version {
 			t.Errorf("preflight of the Playwright image = %q, %v; want %s", version, err, m.Version)
 		}
@@ -177,11 +175,20 @@ func TestRealMount(t *testing.T) {
 	}
 
 	// 5. Prune removes an older unused runner image and spares the current one
-	// and any image a container mounts.
+	// and any image a container mounts. It also removes the trees an older pool
+	// left under local-ci/runner, so it does not run where such a pool may
+	// still be installed: its next job would find no tree.
+	olds, err := cli.ImageList(ctx, client.ImageListOptions{Filters: make(client.Filters).Add("reference", "local-ci/runner:*").Add("label", "local-ci-pool.runner-sha256")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(olds.Items) > 0 {
+		t.Skipf("skipping Prune: runner trees under local-ci/runner may belong to an installed pool")
+	}
 	cleanup := func(tag string) {
 		_, _ = cli.ImageRemove(context.WithoutCancel(ctx), tag, client.ImageRemoveOptions{Force: true})
 	}
-	const stale, busy = "local-ci/runner:0.0.1-smoke-stale", "local-ci/runner:0.0.2-smoke-busy"
+	const stale, busy = "local-ci-pool/runner:0.0.1-smoke-stale", "local-ci-pool/runner:0.0.2-smoke-busy"
 	for _, tag := range []string{stale, busy} {
 		if _, err := cli.ImageTag(ctx, client.ImageTagOptions{Source: m.Spec.Source, Target: tag}); err != nil {
 			t.Fatal(err)
@@ -201,7 +208,7 @@ func TestRealMount(t *testing.T) {
 	if err := runnermount.Prune(ctx, cli, m.Version); err != nil {
 		t.Fatal(err)
 	}
-	left, err := cli.ImageList(ctx, client.ImageListOptions{Filters: make(client.Filters).Add("reference", "local-ci/runner:*")})
+	left, err := cli.ImageList(ctx, client.ImageListOptions{Filters: make(client.Filters).Add("reference", "local-ci-pool/runner:*")})
 	if err != nil {
 		t.Fatal(err)
 	}

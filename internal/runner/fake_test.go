@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"github.com/actions/scaleset"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 )
 
@@ -38,10 +40,41 @@ type fakeDocker struct {
 	startErr    error
 	attachErr   error
 	events      func(ctx context.Context, opts client.EventsListOptions) client.EventsResult
+	// networks are the networks that exist, by name; networkCreates the
+	// create calls.
+	networks       map[string]network.Inspect
+	networkCreates []client.NetworkCreateOptions
+	networkErr     error // every NetworkInspect fails with it
 }
 
 func newFakeDocker() *fakeDocker {
 	return &fakeDocker{stdin: map[string]*bytes.Buffer{}, stdinDone: map[string]chan struct{}{}}
+}
+
+func (f *fakeDocker) NetworkInspect(_ context.Context, name string, _ client.NetworkInspectOptions) (client.NetworkInspectResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "network-inspect")
+	if f.networkErr != nil {
+		return client.NetworkInspectResult{}, f.networkErr
+	}
+	n, ok := f.networks[name]
+	if !ok {
+		return client.NetworkInspectResult{}, cerrdefs.ErrNotFound.WithMessage("network " + name + " not found")
+	}
+	return client.NetworkInspectResult{Network: n}, nil
+}
+
+func (f *fakeDocker) NetworkCreate(_ context.Context, name string, o client.NetworkCreateOptions) (client.NetworkCreateResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "network-create")
+	f.networkCreates = append(f.networkCreates, o)
+	if f.networks == nil {
+		f.networks = map[string]network.Inspect{}
+	}
+	f.networks[name] = network.Inspect{Network: network.Network{Name: name, Driver: o.Driver, Internal: o.Internal, Options: o.Options}}
+	return client.NetworkCreateResult{ID: "net-" + name}, nil
 }
 
 func (f *fakeDocker) record(call string) {

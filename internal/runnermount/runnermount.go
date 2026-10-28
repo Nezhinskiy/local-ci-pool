@@ -1,5 +1,5 @@
 // Package runnermount builds the read-only runner tree every job container
-// mounts. The tree is an image, local-ci/runner:<version>, built FROM scratch
+// mounts. The tree is an image, local-ci-pool/runner:<version>, built FROM scratch
 // from the actions/runner release tarball plus the pool's entrypoint, and it is
 // mounted with an image mount. The tarball is verified against both hashes
 // GitHub publishes before anything is built.
@@ -16,9 +16,11 @@ import (
 	"io"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/moby/moby/api/types/image"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
 
@@ -28,8 +30,13 @@ import (
 )
 
 const (
-	// Repository is the image repository of the runner trees.
-	Repository = "local-ci/runner"
+	// Repository is the image repository of the runner trees. Job images
+	// are local-ci/<identity>, so no repository name can reach it.
+	Repository = "local-ci-pool/runner"
+	// oldRepository held the trees before, next to the job images, where the
+	// job images of a repository named runner collided with them. Prune
+	// removes the trees left there.
+	oldRepository = "local-ci/runner"
 	// Target is where a job container sees the tree.
 	Target = "/opt/local-ci"
 
@@ -283,11 +290,13 @@ func cleanName(name string) (string, error) {
 	return clean, nil
 }
 
-// Prune removes the local-ci/runner images other than those in keep that no
-// container uses. Each keep is a version ("2.338.0") or a full reference: the
+// Prune removes the local-ci-pool/runner images other than those in keep that
+// no container uses. Each keep is a version ("2.338.0") or a full reference: the
 // newest version, and any older one a project still runs on because its image
 // failed the preflight with the newest. Images of other
-// repositories are never touched. A failure on one image does not stop the
+// repositories are never touched, except the trees an older pool left under
+// local-ci/runner: a tag there that names a version on an image with the
+// runner label. A failure on one image does not stop the
 // others; the errors are joined.
 //
 // Rebuilding a version (a new entrypoint, say) moves its tag to the new image
@@ -296,7 +305,7 @@ func cleanName(name string) (string, error) {
 // image, so once the tag has moved no container can be tied to an untagged image
 // by name; and Docker removes a mounted image by ID without complaint. The
 // untagged ones are therefore removed only when no container mounts any
-// local-ci/runner image at all.
+// runner image at all.
 func Prune(ctx context.Context, d Docker, keep ...string) error {
 	kept := map[string]bool{}
 	for _, k := range keep {
@@ -310,6 +319,10 @@ func Prune(ctx context.Context, d Docker, keep ...string) error {
 		return fmt.Errorf("listing runner images: %w", err)
 	}
 	images := listed.Items
+	old, err := d.ImageList(ctx, client.ImageListOptions{Filters: make(client.Filters).Add("reference", oldRepository+":*")})
+	if err != nil {
+		return fmt.Errorf("listing runner images: %w", err)
+	}
 	found, err := d.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
 		return fmt.Errorf("listing containers: %w", err)
@@ -329,7 +342,7 @@ func Prune(ctx context.Context, d Docker, keep ...string) error {
 	runnerMounted := false
 	for _, c := range containers {
 		for _, m := range c.Mounts {
-			if m.Type == mount.TypeImage && strings.HasPrefix(m.Name, Repository+":") {
+			if m.Type == mount.TypeImage && (strings.HasPrefix(m.Name, Repository+":") || strings.HasPrefix(m.Name, oldRepository+":")) {
 				runnerMounted = true
 			}
 		}
@@ -347,21 +360,36 @@ func Prune(ctx context.Context, d Docker, keep ...string) error {
 			errs = append(errs, fmt.Errorf("removing untagged %s: %w", img.ID, err))
 		}
 	}
+	remove := func(img image.Summary, tag string) {
+		if inUse[img.ID] || inUse[tag] {
+			return
+		}
+		if _, err := d.ImageRemove(ctx, tag, client.ImageRemoveOptions{}); err != nil {
+			errs = append(errs, fmt.Errorf("removing %s: %w", tag, err))
+		}
+	}
 	for _, img := range images {
 		for _, tag := range img.RepoTags {
-			if !strings.HasPrefix(tag, Repository+":") || kept[tag] {
-				continue
+			if strings.HasPrefix(tag, Repository+":") && !kept[tag] {
+				remove(img, tag)
 			}
-			if inUse[img.ID] || inUse[tag] {
-				continue
-			}
-			if _, err := d.ImageRemove(ctx, tag, client.ImageRemoveOptions{}); err != nil {
-				errs = append(errs, fmt.Errorf("removing %s: %w", tag, err))
+		}
+	}
+	for _, img := range old.Items {
+		if img.Labels[labelRunnerSHA] == "" {
+			continue
+		}
+		for _, tag := range img.RepoTags {
+			if v, ok := strings.CutPrefix(tag, oldRepository+":"); ok && versionTag.MatchString(v) {
+				remove(img, tag)
 			}
 		}
 	}
 	return errors.Join(errs...)
 }
+
+// versionTag is a runner version; a job image's tag is 12 hex and has no dot.
+var versionTag = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 
 var (
 	_ Docker        = (*client.Client)(nil)

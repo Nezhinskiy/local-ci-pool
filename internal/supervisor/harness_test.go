@@ -19,6 +19,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/api/types/system"
 	"github.com/moby/moby/client"
 
@@ -125,6 +126,14 @@ func (f *fakeDocker) ContainerCreate(ctx context.Context, o client.ContainerCrea
 		f.containers[o.Name] = c
 	}
 	return client.ContainerCreateResult{ID: o.Name}, nil
+}
+
+// The runners' network always exists: a bridge where containers cannot reach
+// each other.
+func (f *fakeDocker) NetworkInspect(_ context.Context, name string, _ client.NetworkInspectOptions) (client.NetworkInspectResult, error) {
+	return client.NetworkInspectResult{Network: network.Inspect{Network: network.Network{
+		Name: name, Driver: "bridge", Options: map[string]string{"com.docker.network.bridge.enable_icc": "false"},
+	}}}, nil
 }
 
 func (f *fakeDocker) ContainerAttach(context.Context, string, client.ContainerAttachOptions) (client.ContainerAttachResult, error) {
