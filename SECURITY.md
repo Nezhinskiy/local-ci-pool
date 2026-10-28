@@ -34,8 +34,10 @@ container is code from those repositories. It is not a sandbox for untrusted cod
 - A job runs as a non-root user. The image's `USER` is kept unless it is root, and root is refused
   in every spelling: `root`, any number Docker reads as 0 (`0`, `00`, `+0`, `0000:0`), and a passwd
   name with uid 0, which the preflight catches by reading the effective uid from the kernel. Such an
-  image runs as uid 1001 instead. A setuid program in the image, such as a passwordless `sudo`, still
-  lets a job step become root inside its container; keep it out of the images you serve.
+  image runs as uid 1001 instead. The check guards against an image that is root by mistake: the
+  uid is reported from inside the image, so one built to be root can fake it, and a setuid program
+  in the image, such as a passwordless `sudo`, lets a job step become root inside its container
+  anyway. Keep those out of the images you serve.
 - Job containers join the pool's own bridge network, `local-ci-pool-main`, where traffic between
   containers is off (`com.docker.network.bridge.enable_icc=false`). A job cannot reach a port that
   another job opened, of its own repository or another, and cannot reach containers on Docker's

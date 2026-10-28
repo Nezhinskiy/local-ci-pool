@@ -188,7 +188,12 @@ var versionLine = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+`)
 // PreflightVersion is Preflight that also returns the runner version the image
 // printed. The run starts as RunUser of the image; when the entrypoint reports
 // that it runs as uid 0 (a passwd name such as toor), it runs again as
-// DefaultUser, and that is the user returned. A job never runs as root.
+// DefaultUser, and that is the user returned. A job never starts as root.
+//
+// The uid line is printed inside the image, so this guards against an image
+// that is root by mistake, not one built to be: such an image could fake the
+// line, as it could ship a setuid sudo. Its author already runs the job's code,
+// which the threat model in SECURITY.md accepts.
 func PreflightVersion(ctx context.Context, d Docker, ref string, m runnermount.Mount) (user, version string, err error) {
 	user, err = RunUser(ctx, d, ref)
 	if err != nil {
