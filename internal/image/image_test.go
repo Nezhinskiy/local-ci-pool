@@ -174,25 +174,29 @@ func withUser(user string) dockerimage.InspectResponse {
 
 func TestRunUser(t *testing.T) {
 	for in, want := range map[string]string{
-		"":            "1001",
-		"root":        "1001",
-		"0":           "1001",
-		"root:root":   "1001",
-		"0:0":         "1001",
-		"00":          "1001",
-		"0000":        "1001",
-		"0000:0":      "1001",
-		"+0":          "1001",
-		"-0":          "1001",
-		"00:1000":     "1001",
-		"1000:0":      "1000:0",
-		"010":         "010",
+		"":            "1001:1001",
+		"root":        "1001:1001",
+		"0":           "1001:1001",
+		"root:root":   "1001:1001",
+		"0:0":         "1001:1001",
+		"00":          "1001:1001",
+		"0000":        "1001:1001",
+		"0000:0":      "1001:1001",
+		"+0":          "1001:1001",
+		"-0":          "1001:1001",
+		"00:1000":     "1001:1001",
 		"runner":      "runner",
 		"pwuser":      "pwuser",
 		"1000":        "1000",
 		"runner:ci":   "runner:ci",
 		"rootless":    "rootless",
+		"010":         "010",
 		"10001:10001": "10001:10001",
+		// A non-root user in group root keeps the user, not the group.
+		"1000:0":      "1000:1001",
+		"1000:00":     "1000:1001",
+		"runner:root": "runner:1001",
+		"runner:":     "runner:1001",
 	} {
 		d := &fakeDocker{images: map[string]dockerimage.InspectResponse{"img": withUser(in)}}
 		got, err := RunUser(context.Background(), d, "img")
@@ -202,7 +206,7 @@ func TestRunUser(t *testing.T) {
 	}
 	// An image with no config at all, and one that is missing.
 	d := &fakeDocker{images: map[string]dockerimage.InspectResponse{"bare": {}}}
-	if got, err := RunUser(context.Background(), d, "bare"); err != nil || got != "1001" {
+	if got, err := RunUser(context.Background(), d, "bare"); err != nil || got != "1001:1001" {
 		t.Errorf("no config: %q, %v", got, err)
 	}
 	if _, err := RunUser(context.Background(), d, "missing"); err == nil {
@@ -391,10 +395,10 @@ var runnerMount = runnermount.Mount{
 func TestPreflightRunsTheEntrypointInThePreflightMode(t *testing.T) {
 	d := &fakeDocker{
 		images: map[string]dockerimage.InspectResponse{"img": withUser("")},
-		logs:   frames(t, "local-ci: uid 1001\n2.338.0\n", ""),
+		logs:   frames(t, "local-ci: uid 1001 gid 1001\n2.338.0\n", ""),
 	}
 	user, version, err := PreflightVersion(context.Background(), d, "img", runnerMount)
-	if err != nil || version != "2.338.0" || user != "1001" {
+	if err != nil || version != "2.338.0" || user != "1001:1001" {
 		t.Fatalf("user %q, version %q, %v", user, version, err)
 	}
 	if _, err := Preflight(context.Background(), d, "img", runnerMount); err != nil {
@@ -405,10 +409,11 @@ func TestPreflightRunsTheEntrypointInThePreflightMode(t *testing.T) {
 	if strings.Join(c.Entrypoint, " ") != "/opt/local-ci/entrypoint.sh" || strings.Join(c.Cmd, " ") != "--preflight" {
 		t.Errorf("entrypoint %v cmd %v: the entrypoint must be set as Entrypoint, not only Cmd", c.Entrypoint, c.Cmd)
 	}
-	if c.User != "1001" {
-		t.Errorf("user = %q, want 1001 for an image without a user", c.User)
+	if c.User != "1001:1001" {
+		t.Errorf("user = %q, want 1001:1001 for an image without a user", c.User)
 	}
-	if strings.Join(c.Env, " ") != "HOME=/tmp/home" || c.Image != "img" {
+	// BASH_ENV and ENV are emptied: an image's would run before the entrypoint.
+	if strings.Join(c.Env, " ") != "HOME=/tmp/home BASH_ENV= ENV=" || c.Image != "img" {
 		t.Errorf("env %v image %q", c.Env, c.Image)
 	}
 	if len(h.Mounts) != 1 || h.Mounts[0] != runnerMount.Spec {
@@ -423,7 +428,7 @@ func TestPreflightRunsTheEntrypointInThePreflightMode(t *testing.T) {
 }
 
 func TestPreflightKeepsAnImageUser(t *testing.T) {
-	d := &fakeDocker{images: map[string]dockerimage.InspectResponse{"img": withUser("pwuser")}, logs: frames(t, "local-ci: uid 1001\n2.338.0\n", "")}
+	d := &fakeDocker{images: map[string]dockerimage.InspectResponse{"img": withUser("pwuser")}, logs: frames(t, "local-ci: uid 1001 gid 1001\n2.338.0\n", "")}
 	user, err := Preflight(context.Background(), d, "img", runnerMount)
 	if err != nil {
 		t.Fatal(err)
@@ -497,7 +502,7 @@ func TestPreflightRequiresAVersion(t *testing.T) {
 }
 
 func TestPreflightReadsTheVersionFromEitherStream(t *testing.T) {
-	d := &fakeDocker{images: map[string]dockerimage.InspectResponse{"img": withUser("")}, logs: frames(t, "local-ci: uid 1001\n", "2.338.0\n")}
+	d := &fakeDocker{images: map[string]dockerimage.InspectResponse{"img": withUser("")}, logs: frames(t, "local-ci: uid 1001 gid 1001\n", "2.338.0\n")}
 	if _, v, err := PreflightVersion(context.Background(), d, "img", runnerMount); err != nil || v != "2.338.0" {
 		t.Fatalf("version = %q, %v", v, err)
 	}
@@ -510,19 +515,38 @@ func TestPreflightRunsAsDefaultUserWhenTheImageUserIsRoot(t *testing.T) {
 	d := &fakeDocker{
 		images: map[string]dockerimage.InspectResponse{"img": withUser("toor")},
 		logsFor: map[string][]byte{
-			"toor": frames(t, "local-ci: uid 0\n2.338.0\n", ""),
-			"1001": frames(t, "local-ci: uid 1001\n2.338.0\n", ""),
+			"toor":      frames(t, "local-ci: uid 0 gid 0\n2.338.0\n", ""),
+			"1001:1001": frames(t, "local-ci: uid 1001 gid 1001\n2.338.0\n", ""),
 		},
 	}
 	user, version, err := PreflightVersion(context.Background(), d, "img", runnerMount)
-	if err != nil || user != "1001" || version != "2.338.0" {
-		t.Fatalf("user %q, version %q, %v; want 1001 after a root run", user, version, err)
+	if err != nil || user != "1001:1001" || version != "2.338.0" {
+		t.Fatalf("user %q, version %q, %v; want 1001:1001 after a root run", user, version, err)
 	}
-	if !slices.Equal(d.users, []string{"toor", "1001"}) {
-		t.Fatalf("ran as %v, want toor, then 1001", d.users)
+	if !slices.Equal(d.users, []string{"toor", "1001:1001"}) {
+		t.Fatalf("ran as %v, want toor, then 1001:1001", d.users)
 	}
 	if len(d.removed) != 2 {
 		t.Errorf("removed %v, want both preflight containers", d.removed)
+	}
+}
+
+// A passwd entry whose primary group is root passes RunUser too; the gid in
+// the uid line decides, and the user keeps its uid with defaultGroup.
+func TestPreflightRunsWithDefaultGroupWhenTheGroupIsRoot(t *testing.T) {
+	d := &fakeDocker{
+		images: map[string]dockerimage.InspectResponse{"img": withUser("runner")},
+		logsFor: map[string][]byte{
+			"runner":      frames(t, "local-ci: uid 1500 gid 0\n2.338.0\n", ""),
+			"runner:1001": frames(t, "local-ci: uid 1500 gid 1001\n2.338.0\n", ""),
+		},
+	}
+	user, _, err := PreflightVersion(context.Background(), d, "img", runnerMount)
+	if err != nil || user != "runner:1001" {
+		t.Fatalf("user %q, %v; want runner:1001", user, err)
+	}
+	if !slices.Equal(d.users, []string{"runner", "runner:1001"}) {
+		t.Fatalf("ran as %v, want runner, then runner:1001", d.users)
 	}
 }
 
@@ -533,10 +557,14 @@ func TestPreflightRefusesRootOrNoUid(t *testing.T) {
 		want string
 	}{
 		// DefaultUser itself reporting uid 0 cannot be fixed by a rerun.
-		"default user as root": {"", frames(t, "local-ci: uid 0\n2.338.0\n", ""), "runs as root"},
+		"default user as root": {"", frames(t, "local-ci: uid 0 gid 0\n2.338.0\n", ""), "runs as root"},
+		// The group stays root even with defaultGroup.
+		"group root after a rerun": {"pwuser", frames(t, "local-ci: uid 1000 gid 0\n2.338.0\n", ""), "group root"},
+		// An entrypoint that reports no gid (this release's first form).
+		"uid only": {"pwuser", frames(t, "local-ci: uid 1000\n2.338.0\n", ""), "printed no uid"},
 		// An entrypoint that does not report the uid (an older runner tree).
 		"no uid line": {"pwuser", frames(t, "2.338.0\n", ""), "printed no uid"},
-		"bad uid":     {"pwuser", frames(t, "local-ci: uid x\n2.338.0\n", ""), "printed no uid"},
+		"bad uid":     {"pwuser", frames(t, "local-ci: uid x gid 1001\n2.338.0\n", ""), "printed no uid"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			d := &fakeDocker{images: map[string]dockerimage.InspectResponse{"img": withUser(c.user)}, logs: c.logs}

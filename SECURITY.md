@@ -27,21 +27,29 @@ container is code from those repositories. It is not a sandbox for untrusted cod
   `contents: write` should stay on hosted runners, so that no token that can move a default branch
   reaches the Mac.
 - A job container mounts only the runner image mount, read-only: no host volumes and no Docker socket.
-  It runs with `--init`, a 4 GiB memory limit, a limit of 4096 processes and threads, and a CPU cap
-  (its core-budget grant, or else its slot's share of the Docker VM's CPUs), and is removed after its
-  job. The consequence is that nothing inside a job can use Docker (`services:`, a job `container:`,
+  It runs with `--init`, a 4 GiB memory limit and a limit of 4096 processes and threads, and is
+  removed after its job. With the core budget on, it is also capped at its grant of CPUs; with the
+  budget off, it has no CPU cap, and busy jobs share the VM's CPUs by the kernel's equal default
+  weights. The consequence is that nothing inside a job can use Docker (`services:`, a job `container:`,
   Docker container actions, `docker build`); see [What does not work](README.md#what-does-not-work).
-- A job runs as a non-root user. The image's `USER` is kept unless it is root, and root is refused
-  in every spelling: `root`, any number Docker reads as 0 (`0`, `00`, `+0`, `0000:0`), and a passwd
-  name with uid 0, which the preflight catches by reading the effective uid from the kernel. Such an
-  image runs as uid 1001 instead. The check guards against an image that is root by mistake: the
-  uid is reported from inside the image, so one built to be root can fake it, and a setuid program
-  in the image, such as a passwordless `sudo`, lets a job step become root inside its container
-  anyway. Keep those out of the images you serve.
-- Job containers join the pool's own bridge network, `local-ci-pool-main`, where traffic between
-  containers is off (`com.docker.network.bridge.enable_icc=false`). A job cannot reach a port that
-  another job opened, of its own repository or another, and cannot reach containers on Docker's
-  default bridge either. It can still reach the internet, your LAN through the Docker VM, and
+- A job runs as a non-root user, outside group root. The image's `USER` is kept unless it is root,
+  and root is refused in every spelling: `root`, any number Docker reads as 0 (`0`, `00`, `+0`,
+  `0000:0`), and a passwd name with uid 0, which the preflight catches by reading the effective uid
+  from the kernel. Such an image runs as `1001:1001` instead. A group of root (`1000:0`, or a passwd
+  entry whose primary group is 0) becomes group 1001 with the same user. The preflight empties
+  `BASH_ENV` and `ENV`, so an image's start-up file cannot print a uid line before the entrypoint's.
+  The check still guards against an image that is root by mistake, not one built to be: the uid is
+  reported from inside the image, so such an image can fake it (with its own `bash`, say), and a
+  setuid program in the image, such as a passwordless `sudo`, lets a job step become root inside
+  its container anyway. The pool does not set `no-new-privileges`, which would stop that, because
+  it would also break every image whose jobs rely on `sudo`. Keep such programs out of the images
+  you serve.
+- Job containers join one bridge network per pool instance, shared by every project the instance
+  serves: `local-ci-pool-main` for the installed pool, `local-ci-pool-probe-<owner>` for a probe.
+  It is not one network per project. Traffic between the containers on it is off
+  (`com.docker.network.bridge.enable_icc=false`), so a job cannot reach a port that another job
+  opened, of its own repository or another, and cannot reach containers on Docker's default bridge
+  either. The network takes the default bridge's MTU, where Docker puts a daemon-wide `mtu`. It can still reach the internet, your LAN through the Docker VM, and
   services on the Mac itself (see the residual below).
 - Release binaries are built by this repository's CI and carry build provenance. Verify one with
   `gh attestation verify` before you run it.

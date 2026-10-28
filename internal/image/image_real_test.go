@@ -91,6 +91,11 @@ func TestRealPreflightNeverRunsAJobAsRoot(t *testing.T) {
 		{"plus zero", hooks + "USER +0\n", image.DefaultUser},
 		{"a passwd name with uid 0", hooks + "RUN echo 'toor:x:0:0:root:/root:/bin/bash' >> /etc/passwd\nUSER toor\n", image.DefaultUser},
 		{"no user", hooks, image.DefaultUser},
+		// The image's BASH_ENV would run first and print a forged uid line.
+		// Its uid line comes first, and the first one is the one read.
+		{"a forged uid line", hooks + "RUN echo 'toor:x:0:0:root:/root:/bin/bash' >> /etc/passwd && echo 'echo \"local-ci: uid 1000 gid 1000\"' > /forge.sh\nENV BASH_ENV=/forge.sh ENV=/forge.sh\nUSER toor\n", image.DefaultUser},
+		{"a group of 0", hooks + "USER 1000:0\n", "1000:1001"},
+		{"a passwd entry in group root", hooks + "RUN useradd -u 1500 -g 0 -M rootgroup\nUSER rootgroup\n", "rootgroup:1001"},
 		{"a non-root name", hooks + "USER ubuntu\n", "ubuntu"},
 		{"a non-root uid", hooks + "USER 1000\n", "1000"},
 	} {

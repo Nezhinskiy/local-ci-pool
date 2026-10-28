@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
 )
@@ -38,7 +39,7 @@ func TestStartRunnerContract(t *testing.T) {
 	if id != "id-1" {
 		t.Fatalf("id %q, want the created container's id", id)
 	}
-	if got := d.callLog(); !slices.Equal(got, []string{"network-inspect", "network-create", "create", "attach", "start"}) {
+	if got := d.callLog(); !slices.Equal(got, []string{"network-inspect:local-ci-pool-main", "network-inspect:bridge", "network-create", "create", "attach", "start"}) {
 		t.Fatalf("calls %v, want the network ensured, then create, attach, start", got)
 	}
 	if len(d.creates) != 1 {
@@ -166,8 +167,8 @@ func TestStartRunnerRemovesTheContainerWhenItCannotStart(t *testing.T) {
 		setup func(*fakeDocker)
 		calls []string
 	}{
-		{"attach", func(d *fakeDocker) { d.attachErr = errors.New("attach refused") }, []string{"network-inspect", "network-create", "create", "attach", "remove"}},
-		{"start", func(d *fakeDocker) { d.startErr = errors.New("start refused") }, []string{"network-inspect", "network-create", "create", "attach", "start", "remove"}},
+		{"attach", func(d *fakeDocker) { d.attachErr = errors.New("attach refused") }, []string{"network-inspect:local-ci-pool-main", "network-inspect:bridge", "network-create", "create", "attach", "remove"}},
+		{"start", func(d *fakeDocker) { d.startErr = errors.New("start refused") }, []string{"network-inspect:local-ci-pool-main", "network-inspect:bridge", "network-create", "create", "attach", "start", "remove"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			d := newFakeDocker()
@@ -201,6 +202,56 @@ func TestStartRunnerCreatesTheNetworkOnce(t *testing.T) {
 	}
 	if o.Labels["local-ci-pool"] != "main" {
 		t.Fatalf("network labels %v, want the instance", o.Labels)
+	}
+}
+
+// The network takes the default bridge's MTU, where Docker puts a
+// daemon-wide mtu; without one it sets none.
+func TestStartRunnerNetworkTakesTheBridgeMTU(t *testing.T) {
+	d := newFakeDocker()
+	d.networks = map[string]network.Inspect{"bridge": {Network: network.Network{Driver: "bridge", Options: map[string]string{"com.docker.network.driver.mtu": "1400"}}}}
+	if _, err := StartRunner(context.Background(), d, testSpec()); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.networkCreates[0].Options["com.docker.network.driver.mtu"]; got != "1400" {
+		t.Fatalf("mtu %q, want the bridge's 1400", got)
+	}
+	d = newFakeDocker()
+	if _, err := StartRunner(context.Background(), d, testSpec()); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := d.networkCreates[0].Options["com.docker.network.driver.mtu"]; ok {
+		t.Fatalf("mtu %q without a bridge to take it from", got)
+	}
+}
+
+// Another process creating the network between the inspect and the create is
+// not a failure: the network it made is inspected and checked like any.
+func TestStartRunnerNetworkCreatedElsewhereMeanwhile(t *testing.T) {
+	for name, c := range map[string]struct {
+		made    network.Network
+		wantErr bool
+	}{
+		"as the pool makes it": {network.Network{Driver: "bridge", Options: map[string]string{"com.docker.network.bridge.enable_icc": "false"}}, false},
+		"with icc on":          {network.Network{Driver: "bridge", Options: map[string]string{}}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := newFakeDocker()
+			d.networkCreateHook = func(n string) error {
+				d.networks = map[string]network.Inspect{n: {Network: c.made}}
+				return cerrdefs.ErrConflict.WithMessage("network with name " + n + " already exists")
+			}
+			_, err := StartRunner(context.Background(), d, testSpec())
+			if (err != nil) != c.wantErr {
+				t.Fatalf("StartRunner: %v, want an error %v", err, c.wantErr)
+			}
+			if !c.wantErr && !slices.Contains(d.callLog(), "start") {
+				t.Fatalf("calls %v, want the runner started", d.callLog())
+			}
+			if c.wantErr && slices.Contains(d.callLog(), "create") {
+				t.Fatalf("calls %v, want no container", d.callLog())
+			}
+		})
 	}
 }
 
@@ -251,18 +302,20 @@ func TestStartRunnerWithoutACPUCap(t *testing.T) {
 
 func TestCPUCap(t *testing.T) {
 	for _, c := range []struct {
-		need, cpus, slots int
-		want              float64
+		need, cpus int
+		want       float64
 	}{
-		{0, 8, 4, 2}, // the slot's share
-		{0, 10, 3, 10.0 / 3},
-		{3, 8, 4, 3},  // the budget's grant
-		{12, 8, 4, 8}, // a grant above the VM: Docker refuses more than it has
-		{0, 0, 4, 0},  // nothing known: no cap
-		{0, 8, 0, 0},
+		{3, 8, 3},  // the budget's grant
+		{12, 8, 8}, // a grant above the VM: Docker refuses more than it has
+		{1, 8, 1},
+		// Without a grant there is no hard cap: a lone job keeps the VM, and
+		// busy jobs share it by the kernel's default weights.
+		{0, 8, 0},
+		{0, 10, 0},
+		{3, 0, 0}, // nothing known about the VM
 	} {
-		if got := CPUCap(c.need, c.cpus, c.slots); got != c.want {
-			t.Errorf("CPUCap(%d, %d, %d) = %v, want %v", c.need, c.cpus, c.slots, got, c.want)
+		if got := CPUCap(c.need, c.cpus); got != c.want {
+			t.Errorf("CPUCap(%d, %d) = %v, want %v", c.need, c.cpus, got, c.want)
 		}
 	}
 }
