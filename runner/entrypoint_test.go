@@ -80,6 +80,9 @@ func newRig(t *testing.T) *rig {
 	r.write(filepath.Join(r.mount, "run.sh"), stubRun, 0o755)
 	r.write(filepath.Join(r.mount, "bin", "Runner.Listener"), stubListener, 0o755)
 	r.ldconfig(false)
+	// The kernel's view of the process, as in /proc/self/status: real,
+	// effective, saved and filesystem uids.
+	r.write(filepath.Join(r.dir, "status"), "Name:\tbash\nUid:\t1001\t1234\t1001\t1001\nGid:\t0\t0\t0\t0\n", 0o644)
 	// A broken entrypoint must not leave the stub listener running.
 	t.Cleanup(func() {
 		if b, err := os.ReadFile(filepath.Join(r.out, "listener.pid")); err == nil {
@@ -124,6 +127,7 @@ func (r *rig) cmd(stdin string, args ...string) *exec.Cmd {
 		"LOCAL_CI_TEST_HOOKS=1",
 		"LOCAL_CI_MOUNT=" + r.mount,
 		"LOCAL_CI_ROOT=" + r.root,
+		"LOCAL_CI_PROC_STATUS=" + filepath.Join(r.dir, "status"),
 		"OUT=" + r.out,
 	}
 	cmd.Stdin = strings.NewReader(stdin)
@@ -385,12 +389,14 @@ func TestEntrypointPreflightPrintsTheVersion(t *testing.T) {
 	caFile := filepath.Join(r.dir, "ca.crt")
 	r.write(caFile, "-----BEGIN CERTIFICATE-----\n", 0o644)
 	cmd := r.cmd("", "--preflight") // no JIT on stdin: preflight never reads one
-	cmd.Env = append(cmd.Env, "LOCAL_CI_CA_PATHS="+filepath.Join(r.dir, "missing")+" "+caFile)
+	cmd.Env = append(cmd.Env, "LOCAL_CI_CA_PATHS="+filepath.Join(r.dir, "missing")+" "+caFile, "EUID=0")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("preflight: %v\n%s", err, out)
 	}
-	if strings.TrimSpace(string(out)) != "2.338.0" {
+	// The effective uid comes first, from the kernel's status, not from
+	// bash's $EUID, which an image's ENV sets.
+	if strings.TrimSpace(string(out)) != "local-ci: uid 1234\n2.338.0" {
 		t.Fatalf("output = %q", out)
 	}
 	if r.read("argv") != "" {
@@ -448,7 +454,7 @@ func TestEntrypointPreflightSetsInvariantWithoutIcu(t *testing.T) {
 	r.write(filepath.Join(r.mount, "bin", "Runner.Listener"), "#!/bin/sh\necho \"2.338.0 ${DOTNET_SYSTEM_GLOBALIZATION_INVARIANT:-unset}\"\n", 0o755)
 	caFile := filepath.Join(r.dir, "ca.crt")
 	r.write(caFile, "x\n", 0o644)
-	for withICU, want := range map[bool]string{false: "2.338.0 1", true: "2.338.0 unset"} {
+	for withICU, want := range map[bool]string{false: "local-ci: uid 1234\n2.338.0 1", true: "local-ci: uid 1234\n2.338.0 unset"} {
 		r.ldconfig(withICU)
 		cmd := r.cmd("", "--preflight")
 		cmd.Env = append(cmd.Env, "LOCAL_CI_CA_PATHS="+caFile)

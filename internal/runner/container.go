@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
@@ -35,6 +36,13 @@ const (
 	homeDir    = "/tmp/home"
 	shmSize    = 1 << 30
 	memory     = 4 << 30
+	// pidsLimit caps a job's processes and threads, so a fork or thread bomb
+	// stops in its own container and not at the VM's threads-max, where
+	// every other job and Docker itself would fail with it.
+	pidsLimit = 4096
+
+	// iccOption turns off traffic between the containers of a bridge.
+	iccOption = "com.docker.network.bridge.enable_icc"
 
 	// cleanupTimeout bounds removing a container that could not be started.
 	cleanupTimeout = 30 * time.Second
@@ -51,6 +59,8 @@ var extraHosts = []string{"host.docker.internal:127.0.0.1", "gateway.docker.inte
 // Docker is the part of the Docker API this package uses. *client.Client
 // satisfies it.
 type Docker interface {
+	NetworkInspect(ctx context.Context, networkID string, options client.NetworkInspectOptions) (client.NetworkInspectResult, error)
+	NetworkCreate(ctx context.Context, name string, options client.NetworkCreateOptions) (client.NetworkCreateResult, error)
 	ContainerCreate(ctx context.Context, options client.ContainerCreateOptions) (client.ContainerCreateResult, error)
 	ContainerAttach(ctx context.Context, containerID string, options client.ContainerAttachOptions) (client.ContainerAttachResult, error)
 	ContainerStart(ctx context.Context, containerID string, options client.ContainerStartOptions) (client.ContainerStartResult, error)
@@ -65,16 +75,70 @@ type ContainerRemover interface {
 
 // ContainerSpec is one runner container. Name is both the runner name and the
 // container name; Mount is the runner tree (runnermount.Mount.Spec); User is
-// image.RunUser of the image. Project is the project's identity; Need is the
-// cores the budget gate admitted the runner for, 0 when it did not. A
-// positive Need reaches the job as CORESLOT_CPU, so a workflow can size its
-// parallelism to its grant.
+// the user the preflight found, never root (image.Preflight). Project is the
+// project's identity; Need is the cores the budget gate admitted the runner
+// for, 0 when it did not. A positive Need reaches the job as CORESLOT_CPU, so a
+// workflow can size its parallelism to its grant. CPUs caps the CPUs the
+// container may use (CPUCap); 0 sets no cap.
 type ContainerSpec struct {
 	Image, User, Name, Instance string
 	Project                     string
 	Need                        int
+	CPUs                        float64
 	Mount                       mount.Mount
 	JIT                         string
+}
+
+// CPUCap is the CPUs one runner may use: its budget grant when the gate
+// admitted it for one, otherwise its slot's share of the VM, cpus / slots. A
+// grant is cut to the VM's CPUs, more than which Docker refuses. With no CPUs
+// or no slots known it is 0, no cap.
+func CPUCap(need, cpus, slots int) float64 {
+	switch {
+	case cpus <= 0 || slots <= 0:
+		return 0
+	case need > 0:
+		return float64(min(need, cpus))
+	}
+	return float64(cpus) / float64(slots)
+}
+
+// NetworkName is the bridge network the runners of an instance join.
+func NetworkName(instance string) string { return "local-ci-pool-" + instance }
+
+// networkMu keeps two starts from creating the network at once.
+var networkMu sync.Mutex
+
+// EnsureNetwork makes sure the instance's network exists: a bridge with
+// outbound traffic, where containers cannot reach each other, so a job cannot
+// reach a service that a concurrent job, of its own project or another, has
+// open. A network of that name with other settings is refused, not used.
+//
+// The network outlives the pool: the runners a previous run left running are
+// on it, and it is reused on the next start.
+func EnsureNetwork(ctx context.Context, d Docker, instance string) error {
+	name := NetworkName(instance)
+	networkMu.Lock()
+	defer networkMu.Unlock()
+	got, err := d.NetworkInspect(ctx, name, client.NetworkInspectOptions{})
+	switch {
+	case err == nil:
+		n := got.Network
+		if n.Driver != "bridge" || n.Internal || n.Options[iccOption] != "false" {
+			return fmt.Errorf("network %s exists with other settings (driver %s, internal %v, %s=%q); remove it with docker network rm %s", name, n.Driver, n.Internal, iccOption, n.Options[iccOption], name)
+		}
+		return nil
+	case !cerrdefs.IsNotFound(err):
+		return fmt.Errorf("inspecting network %s: %w", name, err)
+	}
+	if _, err := d.NetworkCreate(ctx, name, client.NetworkCreateOptions{
+		Driver:  "bridge",
+		Options: map[string]string{iccOption: "false"},
+		Labels:  map[string]string{LabelInstance: instance},
+	}); err != nil {
+		return fmt.Errorf("creating network %s: %w", name, err)
+	}
+	return nil
 }
 
 func (s ContainerSpec) validate() error {
@@ -103,12 +167,16 @@ func (s ContainerSpec) validate() error {
 
 // StartRunner creates and starts one runner container and hands it the JIT
 // configuration on stdin, the only place the configuration ever goes. The
-// container mounts the runner tree and nothing else, and removes itself when it
-// exits. A container that was created but could not be started is removed
-// before the error is returned.
+// container mounts the runner tree and nothing else, joins the instance's
+// network (EnsureNetwork), and removes itself when it exits. A container that
+// was created but could not be started is removed before the error is
+// returned.
 func StartRunner(ctx context.Context, d Docker, s ContainerSpec) (id string, err error) {
 	if err := s.validate(); err != nil {
 		return "", err
+	}
+	if err := EnsureNetwork(ctx, d, s.Instance); err != nil {
+		return "", fmt.Errorf("runner %s: %w", s.Name, err)
 	}
 	labels := map[string]string{LabelInstance: s.Instance, LabelRunner: s.Name, LabelProject: s.Project}
 	env := []string{"HOME=" + homeDir}
@@ -117,6 +185,7 @@ func StartRunner(ctx context.Context, d Docker, s ContainerSpec) (id string, err
 		env = append(env, EnvCPU+"="+strconv.Itoa(s.Need))
 	}
 	init := true
+	pids := int64(pidsLimit)
 	created, err := d.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Name: s.Name,
 		Config: &container.Config{
@@ -130,9 +199,14 @@ func StartRunner(ctx context.Context, d Docker, s ContainerSpec) (id string, err
 			Labels:      labels,
 		},
 		HostConfig: &container.HostConfig{
-			Init:       &init,
-			ShmSize:    shmSize,
-			Resources:  container.Resources{Memory: memory},
+			Init:        &init,
+			ShmSize:     shmSize,
+			NetworkMode: container.NetworkMode(NetworkName(s.Instance)),
+			Resources: container.Resources{
+				Memory:    memory,
+				PidsLimit: &pids,
+				NanoCPUs:  int64(s.CPUs * 1e9),
+			},
 			AutoRemove: true,
 			Mounts:     []mount.Mount{s.Mount},
 			// Docker mounts a tmpfs noexec unless told otherwise, and tools

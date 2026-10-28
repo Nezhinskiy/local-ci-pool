@@ -51,7 +51,7 @@ func newRealPool(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, erro
 		// The mirrors are derived state: deleting them costs a fetch.
 		Mirror: mirror.Mirror{Root: filepath.Join(cache, "local-ci-pool", "mirror")},
 		Log:    log,
-		Serve:  health.Serve(func() supervisor.Snapshot { return sup.Snapshot() }, log),
+		Serve:  health.Serve(func() supervisor.Snapshot { return sup.Snapshot() }, supportDir(), log),
 		// The settings file's path by the default rule. New reads nothing
 		// and opens nothing: coreslot opens at the first admission.
 		Budget: budgetDep(budget.New(budget.Config{Log: log})),
@@ -87,14 +87,31 @@ func newDockerClient() (*client.Client, error) {
 	return client.New(opts...)
 }
 
-// fetchHealth is GET http://<addr>/healthz. A 503 is an answer, with the body
-// that says why; only a pool that does not answer is an error.
+// supportDir is the pool's directory under Application Support, where the
+// installer puts the binary and the pool its health token; "" when the
+// configuration directory is unknown.
+func supportDir() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "local-ci-pool")
+}
+
+// fetchHealth is GET http://<addr>/healthz, with the pool's health token when
+// it can be read, for the body with the full reasons. A 503 is an answer, with
+// the body that says why; only a pool that does not answer is an error.
 func fetchHealth(ctx context.Context, addr string) (int, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/healthz", nil)
 	if err != nil {
 		return 0, nil, err
+	}
+	if dir := supportDir(); dir != "" {
+		if token := health.ReadToken(dir, addr); token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
 	}
 	// A redirect is an answer, not something to follow: the address was
 	// checked to be loopback, and wherever it sends us was not.

@@ -180,17 +180,32 @@ func (f *fakeDocker) ImageBuild(_ context.Context, r io.Reader, o client.ImageBu
 	return client.ImageBuildResult{Body: io.NopCloser(strings.NewReader(body))}, nil
 }
 
-// ImageList answers the two queries Prune makes: untagged images (filter
-// "dangling") and tagged ones (filter "reference").
+// ImageList answers the queries Prune makes: untagged images (filter
+// "dangling") and tagged ones (filter "reference", a "repository:*" pattern).
 func (f *fakeDocker) ImageList(_ context.Context, o client.ImageListOptions) (client.ImageListResult, error) {
 	_, dangling := o.Filters["dangling"]
 	var items []image.Summary
 	for _, img := range f.list {
-		if (len(img.RepoTags) == 0) == dangling {
-			items = append(items, img)
+		if (len(img.RepoTags) == 0) != dangling {
+			continue
 		}
+		if refs, ok := o.Filters["reference"]; ok && !matchesReference(img.RepoTags, refs) {
+			continue
+		}
+		items = append(items, img)
 	}
 	return client.ImageListResult{Items: items}, nil
+}
+
+func matchesReference(tags []string, patterns map[string]bool) bool {
+	for p := range patterns {
+		for _, tag := range tags {
+			if strings.HasPrefix(tag, strings.TrimSuffix(p, "*")) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (f *fakeDocker) ImageRemove(_ context.Context, ref string, _ client.ImageRemoveOptions) (client.ImageRemoveResult, error) {
@@ -264,7 +279,7 @@ func TestEnsureBuildsFromScratchWithEntrypoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantMount := mount.Mount{Type: mount.TypeImage, Source: "local-ci/runner:2.338.0", Target: "/opt/local-ci", ReadOnly: true}
+	wantMount := mount.Mount{Type: mount.TypeImage, Source: "local-ci-pool/runner:2.338.0", Target: "/opt/local-ci", ReadOnly: true}
 	if m.Version != "2.338.0" || m.Spec != wantMount {
 		t.Fatalf("mount = %+v, want version 2.338.0 and %+v", m, wantMount)
 	}
@@ -312,7 +327,7 @@ func TestEnsureBuildsFromScratchWithEntrypoint(t *testing.T) {
 	}
 
 	o := d.opts
-	if len(o.Tags) != 1 || o.Tags[0] != "local-ci/runner:2.338.0" || o.Dockerfile != dockerfileName {
+	if len(o.Tags) != 1 || o.Tags[0] != "local-ci-pool/runner:2.338.0" || o.Dockerfile != dockerfileName {
 		t.Errorf("build options: tags %v dockerfile %q", o.Tags, o.Dockerfile)
 	}
 	if o.NetworkMode != "none" {
@@ -340,10 +355,10 @@ func TestEnsureReusesAnImageBuiltFromTheSameInputs(t *testing.T) {
 		have       map[string]client.ImageInspectResult
 		wantBuilds int
 	}{
-		"current":               {map[string]client.ImageInspectResult{"local-ci/runner:2.338.0": labelled(sum, entrypointSHA())}, 0},
-		"older entrypoint":      {map[string]client.ImageInspectResult{"local-ci/runner:2.338.0": labelled(sum, "old")}, 1},
-		"different runner hash": {map[string]client.ImageInspectResult{"local-ci/runner:2.338.0": labelled("old", entrypointSHA())}, 1},
-		"unlabelled":            {map[string]client.ImageInspectResult{"local-ci/runner:2.338.0": {InspectResponse: image.InspectResponse{Config: &dockerspec.DockerOCIImageConfig{}}}}, 1},
+		"current":               {map[string]client.ImageInspectResult{"local-ci-pool/runner:2.338.0": labelled(sum, entrypointSHA())}, 0},
+		"older entrypoint":      {map[string]client.ImageInspectResult{"local-ci-pool/runner:2.338.0": labelled(sum, "old")}, 1},
+		"different runner hash": {map[string]client.ImageInspectResult{"local-ci-pool/runner:2.338.0": labelled("old", entrypointSHA())}, 1},
+		"unlabelled":            {map[string]client.ImageInspectResult{"local-ci-pool/runner:2.338.0": {InspectResponse: image.InspectResponse{Config: &dockerspec.DockerOCIImageConfig{}}}}, 1},
 		"absent":                {nil, 1},
 	}
 	for name, tc := range cases {
@@ -369,7 +384,7 @@ func TestEnsureReuseNeedsBothHashesToAgree(t *testing.T) {
 	tarball, sum := runnerTarball(t)
 	other := strings.Repeat("b", 64)
 	d := &fakeDocker{images: map[string]client.ImageInspectResult{
-		"local-ci/runner:2.338.0": {InspectResponse: image.InspectResponse{Config: &dockerspec.DockerOCIImageConfig{ImageConfig: ocispec.ImageConfig{Labels: map[string]string{labelRunnerSHA: sum, labelEntrypointSHA: entrypointSHA()}}}}},
+		"local-ci-pool/runner:2.338.0": {InspectResponse: image.InspectResponse{Config: &dockerspec.DockerOCIImageConfig{ImageConfig: ocispec.ImageConfig{Labels: map[string]string{labelRunnerSHA: sum, labelEntrypointSHA: entrypointSHA()}}}}},
 	}}
 	gh := &fakeGH{rel: github.RunnerRelease{Version: "2.338.0", URL: "u", DigestSHA256: sum, BodySHA256: other}, tarball: tarball}
 	if _, err := Ensure(context.Background(), d, gh, "arm64"); err == nil || !strings.Contains(err.Error(), "body marker") {
@@ -426,24 +441,24 @@ func summary(id string, tags ...string) image.Summary { return image.Summary{ID:
 func TestPrune(t *testing.T) {
 	d := &fakeDocker{
 		list: []image.Summary{
-			summary("sha256:cur", "local-ci/runner:2.338.0"),
-			summary("sha256:old1", "local-ci/runner:2.337.0"),
-			summary("sha256:old2", "local-ci/runner:2.336.0"),
-			summary("sha256:busy", "local-ci/runner:2.335.0"),
-			summary("sha256:mounted", "local-ci/runner:2.334.0"),
+			summary("sha256:cur", "local-ci-pool/runner:2.338.0"),
+			summary("sha256:old1", "local-ci-pool/runner:2.337.0"),
+			summary("sha256:old2", "local-ci-pool/runner:2.336.0"),
+			summary("sha256:busy", "local-ci-pool/runner:2.335.0"),
+			summary("sha256:mounted", "local-ci-pool/runner:2.334.0"),
 			summary("sha256:other", "local-ci/other:1"),
 			summary("sha256:dangling"),
-			summary("sha256:multi", "local-ci/runner:2.333.0", "keepme:latest"),
+			summary("sha256:multi", "local-ci-pool/runner:2.333.0", "keepme:latest"),
 		},
 		containers: []container.Summary{
 			{ImageID: "sha256:busy", Image: "ubuntu"},
-			{ImageID: "sha256:job", Image: "ubuntu", Mounts: []container.MountPoint{{Type: mount.TypeImage, Name: "local-ci/runner:2.334.0", Source: "/var/lib/docker/overlay2/x/merged"}}},
+			{ImageID: "sha256:job", Image: "ubuntu", Mounts: []container.MountPoint{{Type: mount.TypeImage, Name: "local-ci-pool/runner:2.334.0", Source: "/var/lib/docker/overlay2/x/merged"}}},
 		},
 	}
 	if err := Prune(context.Background(), d, "2.338.0"); err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]bool{"local-ci/runner:2.337.0": true, "local-ci/runner:2.336.0": true, "local-ci/runner:2.333.0": true}
+	want := map[string]bool{"local-ci-pool/runner:2.337.0": true, "local-ci-pool/runner:2.336.0": true, "local-ci-pool/runner:2.333.0": true}
 	if len(d.removed) != len(want) {
 		t.Fatalf("removed %v, want %v", d.removed, want)
 	}
@@ -459,15 +474,15 @@ func TestPrune(t *testing.T) {
 func TestPruneKeepsEveryVersionInUse(t *testing.T) {
 	d := &fakeDocker{
 		list: []image.Summary{
-			summary("sha256:new", "local-ci/runner:2.339.0"),
-			summary("sha256:held", "local-ci/runner:2.338.0"),
-			summary("sha256:old", "local-ci/runner:2.337.0"),
+			summary("sha256:new", "local-ci-pool/runner:2.339.0"),
+			summary("sha256:held", "local-ci-pool/runner:2.338.0"),
+			summary("sha256:old", "local-ci-pool/runner:2.337.0"),
 		},
 	}
 	if err := Prune(context.Background(), d, "2.339.0", "2.338.0"); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(d.removed, ",") != "local-ci/runner:2.337.0" {
+	if strings.Join(d.removed, ",") != "local-ci-pool/runner:2.337.0" {
 		t.Fatalf("removed %v, want only 2.337.0", d.removed)
 	}
 }
@@ -475,17 +490,17 @@ func TestPruneKeepsEveryVersionInUse(t *testing.T) {
 func TestPruneAcceptsAFullReferenceAndJoinsErrors(t *testing.T) {
 	d := &fakeDocker{
 		list: []image.Summary{
-			summary("sha256:cur", "local-ci/runner:2.338.0"),
-			summary("sha256:old1", "local-ci/runner:2.337.0"),
-			summary("sha256:old2", "local-ci/runner:2.336.0"),
+			summary("sha256:cur", "local-ci-pool/runner:2.338.0"),
+			summary("sha256:old1", "local-ci-pool/runner:2.337.0"),
+			summary("sha256:old2", "local-ci-pool/runner:2.336.0"),
 		},
-		removeErrOn: "local-ci/runner:2.337.0",
+		removeErrOn: "local-ci-pool/runner:2.337.0",
 	}
-	err := Prune(context.Background(), d, "local-ci/runner:2.338.0")
+	err := Prune(context.Background(), d, "local-ci-pool/runner:2.338.0")
 	if err == nil || !strings.Contains(err.Error(), "2.337.0") {
 		t.Fatalf("want the removal error, got %v", err)
 	}
-	if strings.Join(d.removed, ",") != "local-ci/runner:2.337.0,local-ci/runner:2.336.0" {
+	if strings.Join(d.removed, ",") != "local-ci-pool/runner:2.337.0,local-ci-pool/runner:2.336.0" {
 		t.Fatalf("removed %v: a failure must not stop the others", d.removed)
 	}
 }
@@ -511,7 +526,7 @@ func labelled(id string) image.Summary {
 
 func TestPruneRemovesUntaggedRebuiltRunnerImages(t *testing.T) {
 	d := &fakeDocker{list: []image.Summary{
-		summary("sha256:cur", "local-ci/runner:2.338.0"),
+		summary("sha256:cur", "local-ci-pool/runner:2.338.0"),
 		labelled("sha256:rebuilt-old"),
 		summary("sha256:foreign-dangling"), // untagged but not ours: no labels
 	}}
@@ -523,11 +538,43 @@ func TestPruneRemovesUntaggedRebuiltRunnerImages(t *testing.T) {
 	}
 }
 
+func labelledTag(id string, tags ...string) image.Summary {
+	img := labelled(id)
+	img.RepoTags = tags
+	return img
+}
+
+// The runner trees moved from local-ci/runner, where a repository named runner
+// had its job images too, to their own repository. Prune removes the trees left
+// under the old name, and never a job image there: those carry no runner label
+// and have 12-hex tags, not versions.
+func TestPruneRemovesTheRunnerTreesOfTheOldRepository(t *testing.T) {
+	d := &fakeDocker{
+		list: []image.Summary{
+			summary("sha256:cur", "local-ci-pool/runner:2.338.0"),
+			labelledTag("sha256:legacy", "local-ci/runner:2.338.0"),
+			labelledTag("sha256:legacy-busy", "local-ci/runner:2.337.0"),
+			summary("sha256:job", "local-ci/runner:0123456789ab"),
+			labelledTag("sha256:job-labelled", "local-ci/runner:abcdef012345"),
+			summary("sha256:other", "local-ci/alpha:0123456789ab"),
+		},
+		containers: []container.Summary{
+			{ImageID: "sha256:survivor", Mounts: []container.MountPoint{{Type: mount.TypeImage, Name: "local-ci/runner:2.337.0"}}},
+		},
+	}
+	if err := Prune(context.Background(), d, "2.338.0"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(d.removed, ",") != "local-ci/runner:2.338.0" {
+		t.Fatalf("removed %v, want only the unused old-repository tree", d.removed)
+	}
+}
+
 func TestPruneKeepsUntaggedImagesWhileAContainerMountsARunnerImage(t *testing.T) {
 	d := &fakeDocker{
 		list: []image.Summary{labelled("sha256:rebuilt-old")},
 		containers: []container.Summary{
-			{ImageID: "sha256:job", Mounts: []container.MountPoint{{Type: mount.TypeImage, Name: "local-ci/runner:2.338.0"}}},
+			{ImageID: "sha256:job", Mounts: []container.MountPoint{{Type: mount.TypeImage, Name: "local-ci-pool/runner:2.338.0"}}},
 		},
 	}
 	if err := Prune(context.Background(), d, "2.338.0"); err != nil {
@@ -539,5 +586,12 @@ func TestPruneKeepsUntaggedImagesWhileAContainerMountsARunnerImage(t *testing.T)
 	d.containers = []container.Summary{{ImageID: "sha256:rebuilt-old"}}
 	if err := Prune(context.Background(), d, "2.338.0"); err != nil || len(d.removed) != 0 {
 		t.Fatalf("an image a container runs from was removed: %v, %v", d.removed, err)
+	}
+	// A survivor of an older pool mounts its tree under the old repository.
+	d.containers = []container.Summary{
+		{ImageID: "sha256:job", Mounts: []container.MountPoint{{Type: mount.TypeImage, Name: "local-ci/runner:2.338.0"}}},
+	}
+	if err := Prune(context.Background(), d, "2.338.0"); err != nil || len(d.removed) != 0 {
+		t.Fatalf("removed %v, %v: a survivor may mount an old-repository tree", d.removed, err)
 	}
 }

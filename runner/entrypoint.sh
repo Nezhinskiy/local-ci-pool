@@ -14,20 +14,22 @@
 # runner as an argument only. It is never exported, so no process environment
 # carries it.
 #
-# LOCAL_CI_MOUNT, LOCAL_CI_ROOT and LOCAL_CI_CA_PATHS exist for the tests and
-# are honoured only when LOCAL_CI_TEST_HOOKS=1 is also set. A job image can set
-# any ENV it likes, so without that sentinel an image-controlled variable could
-# redirect the runner root or fake a CA bundle.
+# LOCAL_CI_MOUNT, LOCAL_CI_ROOT, LOCAL_CI_CA_PATHS and LOCAL_CI_PROC_STATUS
+# exist for the tests and are honoured only when LOCAL_CI_TEST_HOOKS=1 is also
+# set. A job image can set any ENV it likes, so without that sentinel an image-controlled variable could
+# redirect the runner root, fake a CA bundle or fake the uid.
 
 set -eu
 
 mount_dir=/opt/local-ci
 root_dir=/tmp/runner
 ca_paths="/etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt"
+proc_status=/proc/self/status
 if [ "${LOCAL_CI_TEST_HOOKS:-}" = 1 ]; then
 	mount_dir=${LOCAL_CI_MOUNT:-$mount_dir}
 	root_dir=${LOCAL_CI_ROOT:-$root_dir}
 	ca_paths=${LOCAL_CI_CA_PATHS:-$ca_paths}
+	proc_status=${LOCAL_CI_PROC_STATUS:-$proc_status}
 fi
 
 mode=job
@@ -82,6 +84,14 @@ if has_icu; then
 fi
 
 if [ "$mode" = preflight ]; then
+	# The effective uid, for the pool to refuse root in whatever spelling the
+	# image's USER gave it (00, +0, a passwd name with uid 0). It is read from
+	# the kernel: bash takes $EUID from the environment, which the image sets.
+	while read -r key _ euid _; do
+		if [ "$key" = Uid: ]; then
+			echo "local-ci: uid $euid"
+		fi
+	done <"$proc_status"
 	# A runner in an image with no CA bundle retries its TLS handshake forever
 	# while `--version` still passes, so the bundle is part of the check.
 	ca_ok=

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -156,7 +157,9 @@ func TagDigest(inputsDigest, dockerfile string) string {
 }
 
 // RunUser is the user a job runs as: the image's own USER unless that is empty
-// or root, in which case DefaultUser.
+// or root, in which case DefaultUser. Root is "root" or any number Docker reads
+// as 0 ("0", "00", "+0"). A passwd name with uid 0 only a run can tell; the
+// preflight does (PreflightVersion).
 func RunUser(ctx context.Context, d Docker, ref string) (string, error) {
 	info, err := d.ImageInspect(ctx, ref)
 	if err != nil {
@@ -167,31 +170,51 @@ func RunUser(ctx context.Context, d Docker, ref string) (string, error) {
 		user = info.Config.User
 	}
 	name, _, _ := strings.Cut(user, ":")
-	switch name {
-	case "", "root", "0":
+	if n, err := strconv.Atoi(name); name == "" || name == "root" || (err == nil && n == 0) {
 		return DefaultUser, nil
 	}
 	return user, nil
 }
 
 // Preflight runs the runner's own start path once in the image, with the runner
-// mount, and fails when it cannot start.
-func Preflight(ctx context.Context, d Docker, ref string, m runnermount.Mount) error {
-	_, err := PreflightVersion(ctx, d, ref, m)
-	return err
+// mount, fails when it cannot start, and returns the user the job runs as.
+func Preflight(ctx context.Context, d Docker, ref string, m runnermount.Mount) (string, error) {
+	user, _, err := PreflightVersion(ctx, d, ref, m)
+	return user, err
 }
 
 var versionLine = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+`)
 
 // PreflightVersion is Preflight that also returns the runner version the image
-// printed. The entrypoint is run with --preflight and set as Entrypoint, never
-// only as Cmd, so an ENTRYPOINT of the image cannot wrap it. The run is
-// bounded; a failure carries the last lines of output.
-func PreflightVersion(ctx context.Context, d Docker, ref string, m runnermount.Mount) (string, error) {
-	user, err := RunUser(ctx, d, ref)
+// printed. The run starts as RunUser of the image; when the entrypoint reports
+// that it runs as uid 0 (a passwd name such as toor), it runs again as
+// DefaultUser, and that is the user returned. A job never runs as root.
+func PreflightVersion(ctx context.Context, d Docker, ref string, m runnermount.Mount) (user, version string, err error) {
+	user, err = RunUser(ctx, d, ref)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
+	uid, version, err := preflightAs(ctx, d, ref, m, user)
+	if err == nil && uid == 0 && user != DefaultUser {
+		user = DefaultUser
+		uid, version, err = preflightAs(ctx, d, ref, m, user)
+	}
+	switch {
+	case err != nil:
+		return "", "", err
+	case uid == 0:
+		return "", "", fmt.Errorf("preflight of %s: user %s runs as root", ref, user)
+	}
+	return user, version, nil
+}
+
+var uidLine = regexp.MustCompile(`^local-ci: uid ([0-9]+)$`)
+
+// preflightAs runs the entrypoint with --preflight as user and returns the
+// effective uid and the runner version it printed. The entrypoint is set as
+// Entrypoint, never only as Cmd, so an ENTRYPOINT of the image cannot wrap it.
+// The run is bounded; a failure carries the last lines of output.
+func preflightAs(ctx context.Context, d Docker, ref string, m runnermount.Mount, user string) (int, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, preflightTimeout)
 	defer cancel()
 
@@ -215,7 +238,7 @@ func PreflightVersion(ctx context.Context, d Docker, ref string, m runnermount.M
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("preflight of %s: creating the container: %w", ref, err)
+		return 0, "", fmt.Errorf("preflight of %s: creating the container: %w", ref, err)
 	}
 	id := created.ID
 	// The container is removed even if the run was cancelled or timed out.
@@ -226,7 +249,7 @@ func PreflightVersion(ctx context.Context, d Docker, ref string, m runnermount.M
 	}()
 
 	if _, err := d.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
-		return "", fmt.Errorf("preflight of %s: starting the container: %w", ref, err)
+		return 0, "", fmt.Errorf("preflight of %s: starting the container: %w", ref, err)
 	}
 
 	waiting := d.ContainerWait(ctx, id, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
@@ -237,7 +260,7 @@ func PreflightVersion(ctx context.Context, d Docker, ref string, m runnermount.M
 	case status = <-statusCh:
 	case err := <-errCh:
 		if ctx.Err() == nil {
-			return "", fmt.Errorf("preflight of %s: waiting for the container: %w", ref, err)
+			return 0, "", fmt.Errorf("preflight of %s: waiting for the container: %w", ref, err)
 		}
 		timedOut = true
 	case <-ctx.Done():
@@ -247,18 +270,27 @@ func PreflightVersion(ctx context.Context, d Docker, ref string, m runnermount.M
 	out := containerOutput(context.WithoutCancel(ctx), d, id)
 	switch {
 	case timedOut:
-		return "", fmt.Errorf("preflight of %s timed out after %s:\n%s", ref, preflightTimeout, lastLines(out, failureLines))
+		return 0, "", fmt.Errorf("preflight of %s timed out after %s:\n%s", ref, preflightTimeout, lastLines(out, failureLines))
 	case status.Error != nil && status.Error.Message != "":
-		return "", fmt.Errorf("preflight of %s failed: %s:\n%s", ref, status.Error.Message, lastLines(out, failureLines))
+		return 0, "", fmt.Errorf("preflight of %s failed: %s:\n%s", ref, status.Error.Message, lastLines(out, failureLines))
 	case status.StatusCode != 0:
-		return "", fmt.Errorf("preflight of %s failed (exit %d):\n%s", ref, status.StatusCode, lastLines(out, failureLines))
+		return 0, "", fmt.Errorf("preflight of %s failed (exit %d):\n%s", ref, status.StatusCode, lastLines(out, failureLines))
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	version := strings.TrimSpace(lines[len(lines)-1])
 	if !versionLine.MatchString(version) {
-		return "", fmt.Errorf("preflight of %s exited 0 but printed no runner version:\n%s", ref, lastLines(out, failureLines))
+		return 0, "", fmt.Errorf("preflight of %s exited 0 but printed no runner version:\n%s", ref, lastLines(out, failureLines))
 	}
-	return version, nil
+	for _, l := range lines {
+		if mm := uidLine.FindStringSubmatch(strings.TrimSpace(l)); mm != nil {
+			uid, err := strconv.Atoi(mm[1])
+			if err != nil {
+				break
+			}
+			return uid, version, nil
+		}
+	}
+	return 0, "", fmt.Errorf("preflight of %s as user %s printed no uid:\n%s", ref, user, lastLines(out, failureLines))
 }
 
 // containerOutput returns the container's combined stdout and stderr, in the

@@ -119,5 +119,8 @@ func formatStatus(s supervisor.Snapshot) string {
 			fmt.Fprintf(&b, "    queued %s: %s %s\n", time.Duration(j.QueuedS)*time.Second, clean(j.Job), clean(j.RunURL))
 		}
 	}
+	if s.Redacted {
+		b.WriteString("reasons shown as classes only: the pool's health token could not be read; run pool status as the user the pool runs as\n")
+	}
 	return b.String()
 }

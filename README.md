@@ -18,7 +18,10 @@ operations.
   are not there unless your image has them. The image must provide `bash`, glibc and a CA bundle
   (a bare `ubuntu:24.04` lacks `ca-certificates`).
 - A job runs as a non-root user (the image's own non-root `USER`, otherwise uid 1001) under a 4 GiB
-  memory limit. Install what the job needs in the image, not with `sudo apt-get` in a step.
+  memory limit, a 4096-process limit and a CPU cap (its slot's share of Docker's CPUs, or its core
+  budget grant). Install what the job needs in the image, not with `sudo apt-get` in a step.
+- Jobs cannot reach each other's ports: each container joins a bridge network with traffic between
+  containers turned off.
 - A Mac must be awake and logged in.
 
 ## Quickstart

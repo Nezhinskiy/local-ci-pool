@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
 )
 
 const testJIT = "eyJzZWNyZXQiOiJqaXQtY29uZmlnIn0="
@@ -21,8 +22,9 @@ func testSpec() ContainerSpec {
 		Name:     "local-ci-alpha-1",
 		Instance: "main",
 		Project:  "alpha",
-		Mount:    mount.Mount{Type: mount.TypeImage, Source: "local-ci/runner:2.338.0", Target: "/opt/local-ci", ReadOnly: true},
+		Mount:    mount.Mount{Type: mount.TypeImage, Source: "local-ci-pool/runner:2.338.0", Target: "/opt/local-ci", ReadOnly: true},
 		JIT:      testJIT,
+		CPUs:     2.5,
 	}
 }
 
@@ -36,8 +38,8 @@ func TestStartRunnerContract(t *testing.T) {
 	if id != "id-1" {
 		t.Fatalf("id %q, want the created container's id", id)
 	}
-	if got := d.callLog(); !slices.Equal(got, []string{"create", "attach", "start"}) {
-		t.Fatalf("calls %v, want create, attach, start", got)
+	if got := d.callLog(); !slices.Equal(got, []string{"network-inspect", "network-create", "create", "attach", "start"}) {
+		t.Fatalf("calls %v, want the network ensured, then create, attach, start", got)
 	}
 	if len(d.creates) != 1 {
 		t.Fatalf("%d creates, want 1", len(d.creates))
@@ -86,6 +88,17 @@ func TestStartRunnerContract(t *testing.T) {
 	}
 	if hc.Privileged || len(hc.CapAdd) != 0 || len(hc.Devices) != 0 || hc.NetworkMode.IsHost() || hc.PidMode.IsHost() {
 		t.Fatalf("the container is not confined: %+v", hc)
+	}
+	// Every runner of the instance joins its own bridge, where containers
+	// cannot reach each other (L1 of the security review).
+	if hc.NetworkMode != "local-ci-pool-main" {
+		t.Fatalf("NetworkMode %q, want the instance's network", hc.NetworkMode)
+	}
+	if hc.PidsLimit == nil || *hc.PidsLimit != 4096 {
+		t.Fatalf("PidsLimit %v, want 4096", hc.PidsLimit)
+	}
+	if hc.NanoCPUs != 2_500_000_000 {
+		t.Fatalf("NanoCPUs %d, want the spec's 2.5 CPUs", hc.NanoCPUs)
 	}
 	if want := []string{"host.docker.internal:127.0.0.1", "gateway.docker.internal:127.0.0.1"}; !slices.Equal(hc.ExtraHosts, want) {
 		t.Fatalf("ExtraHosts %q, want %q", hc.ExtraHosts, want)
@@ -153,8 +166,8 @@ func TestStartRunnerRemovesTheContainerWhenItCannotStart(t *testing.T) {
 		setup func(*fakeDocker)
 		calls []string
 	}{
-		{"attach", func(d *fakeDocker) { d.attachErr = errors.New("attach refused") }, []string{"create", "attach", "remove"}},
-		{"start", func(d *fakeDocker) { d.startErr = errors.New("start refused") }, []string{"create", "attach", "start", "remove"}},
+		{"attach", func(d *fakeDocker) { d.attachErr = errors.New("attach refused") }, []string{"network-inspect", "network-create", "create", "attach", "remove"}},
+		{"start", func(d *fakeDocker) { d.startErr = errors.New("start refused") }, []string{"network-inspect", "network-create", "create", "attach", "start", "remove"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			d := newFakeDocker()
@@ -169,6 +182,88 @@ func TestStartRunnerRemovesTheContainerWhenItCannotStart(t *testing.T) {
 				t.Fatalf("removed %v, want a forced remove of id-1", got)
 			}
 		})
+	}
+}
+
+func TestStartRunnerCreatesTheNetworkOnce(t *testing.T) {
+	d := newFakeDocker()
+	for range 2 {
+		if _, err := StartRunner(context.Background(), d, testSpec()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(d.networkCreates) != 1 {
+		t.Fatalf("%d network creates, want 1", len(d.networkCreates))
+	}
+	o := d.networkCreates[0]
+	if o.Driver != "bridge" || o.Internal || o.Options["com.docker.network.bridge.enable_icc"] != "false" {
+		t.Fatalf("network %+v, want a bridge with outbound traffic and no traffic between containers", o)
+	}
+	if o.Labels["local-ci-pool"] != "main" {
+		t.Fatalf("network labels %v, want the instance", o.Labels)
+	}
+}
+
+// A network of that name that lets containers talk to each other, or has no
+// way out, is not used.
+func TestStartRunnerRefusesAForeignNetwork(t *testing.T) {
+	for name, n := range map[string]network.Network{
+		"icc on":   {Driver: "bridge", Options: map[string]string{}},
+		"internal": {Driver: "bridge", Internal: true, Options: map[string]string{"com.docker.network.bridge.enable_icc": "false"}},
+		"overlay":  {Driver: "overlay", Options: map[string]string{"com.docker.network.bridge.enable_icc": "false"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := newFakeDocker()
+			d.networks = map[string]network.Inspect{"local-ci-pool-main": {Network: n}}
+			_, err := StartRunner(context.Background(), d, testSpec())
+			if err == nil || !strings.Contains(err.Error(), "local-ci-pool-main") {
+				t.Fatalf("StartRunner on a %s network: %v", name, err)
+			}
+			if slices.Contains(d.callLog(), "create") {
+				t.Fatalf("a container was created: %v", d.callLog())
+			}
+		})
+	}
+}
+
+func TestStartRunnerNetworkInspectFailure(t *testing.T) {
+	d := newFakeDocker()
+	d.networkErr = errors.New("daemon gone")
+	if _, err := StartRunner(context.Background(), d, testSpec()); err == nil || !strings.Contains(err.Error(), "daemon gone") {
+		t.Fatalf("got %v", err)
+	}
+	if slices.Contains(d.callLog(), "create") {
+		t.Fatalf("a container was created: %v", d.callLog())
+	}
+}
+
+func TestStartRunnerWithoutACPUCap(t *testing.T) {
+	d := newFakeDocker()
+	s := testSpec()
+	s.CPUs = 0
+	if _, err := StartRunner(context.Background(), d, s); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.creates[0].HostConfig.NanoCPUs; got != 0 {
+		t.Fatalf("NanoCPUs %d, want none", got)
+	}
+}
+
+func TestCPUCap(t *testing.T) {
+	for _, c := range []struct {
+		need, cpus, slots int
+		want              float64
+	}{
+		{0, 8, 4, 2}, // the slot's share
+		{0, 10, 3, 10.0 / 3},
+		{3, 8, 4, 3},  // the budget's grant
+		{12, 8, 4, 8}, // a grant above the VM: Docker refuses more than it has
+		{0, 0, 4, 0},  // nothing known: no cap
+		{0, 8, 0, 0},
+	} {
+		if got := CPUCap(c.need, c.cpus, c.slots); got != c.want {
+			t.Errorf("CPUCap(%d, %d, %d) = %v, want %v", c.need, c.cpus, c.slots, got, c.want)
+		}
 	}
 }
 

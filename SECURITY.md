@@ -18,11 +18,20 @@ container is code from those repositories. It is not a sandbox for untrusted cod
   `contents: write` should stay on hosted runners, so that no token that can move a default branch
   reaches the Mac.
 - A job container mounts only the runner image mount, read-only: no host volumes and no Docker socket.
-  It runs as a non-root user with `--init` and a memory limit, and is removed after its job. The
-  consequence is that nothing inside a job can use Docker (`services:`, a job `container:`, Docker
-  container actions, `docker build`); see [What does not work](README.md#what-does-not-work).
-- A job container can reach your LAN through the Docker VM, and it can reach services on the Mac
-  itself (see the residual below).
+  It runs with `--init`, a 4 GiB memory limit, a limit of 4096 processes and threads, and a CPU cap
+  (its core-budget grant, or else its slot's share of the Docker VM's CPUs), and is removed after its
+  job. The consequence is that nothing inside a job can use Docker (`services:`, a job `container:`,
+  Docker container actions, `docker build`); see [What does not work](README.md#what-does-not-work).
+- A job runs as a non-root user. The image's `USER` is kept unless it is root, and root is refused
+  in every spelling: `root`, any number Docker reads as 0 (`0`, `00`, `+0`, `0000:0`), and a passwd
+  name with uid 0, which the preflight catches by reading the effective uid from the kernel. Such an
+  image runs as uid 1001 instead. A setuid program in the image, such as a passwordless `sudo`, still
+  lets a job step become root inside its container; keep it out of the images you serve.
+- Job containers join the pool's own bridge network, `local-ci-pool-main`, where traffic between
+  containers is off (`com.docker.network.bridge.enable_icc=false`). A job cannot reach a port that
+  another job opened, of its own repository or another, and cannot reach containers on Docker's
+  default bridge either. It can still reach the internet, your LAN through the Docker VM, and
+  services on the Mac itself (see the residual below).
 - Release binaries are built by this repository's CI and carry build provenance. Verify one with
   `gh attestation verify` before you run it.
 
@@ -52,8 +61,16 @@ its owner, so a private repository owned by an organization is served.
 container's own loopback, so those names do not lead to the Mac. It does not close the Docker Desktop
 host gateway address itself (`192.168.65.254` on current releases): a job that connects to that
 address reaches every port bound to `127.0.0.1` on the Mac. That includes the pool's own `/healthz`,
-which answers a forged loopback `Host` header and lists the repositories the pool serves, and any
-other development service you run on loopback.
+which answers a forged loopback `Host` header, and any other development service you run on
+loopback.
+
+What a job reads from `/healthz` is the redacted body: the pool's state, the repositories it serves,
+whether each is healthy, and a fixed class for why one is not (`setup`, `image`, `preflight`, …). The
+reasons themselves can quote another project's build or preflight output, so they, the image
+references and the names of stuck jobs go only to a request that carries the pool's health token.
+The pool writes a new random token at each start to
+`~/Library/Application Support/local-ci-pool/health-<port>.token` (mode 0600), which `pool status`
+reads and no job can.
 
 With the core budget, `/healthz` also shows a top-level `budget` object (`state`, an `error` class,
 `oldest_wait_s`) and, per project, `waiting` and `admitted` counts. These carry only the pool's own
@@ -64,6 +81,15 @@ Mitigation is owner discipline: run on the Mac only loopback services you would 
 repositories' jobs use, and give the ones that matter their own authentication. Real egress
 filtering would need root inside the job container (or a firewall in the Docker VM) and is out of
 scope for this pool.
+
+## Residual risk: no disk cap
+
+A job can fill the Docker VM's disk by writing to its container's filesystem. Concurrent jobs of
+every project, the pool's image builds and Docker itself then fail until the job ends and its
+container is removed. There is no per-container cap on Docker Desktop: with its containerd image
+store, `--storage-opt size=` is accepted and ignored (measured on Docker Desktop with Engine 29.9: a
+300 MB write passed a 100 MB cap). Size the VM disk under Docker Desktop > Settings > Resources with
+room for the largest job, and `docker system df` shows what takes it.
 
 ## Residual risk: the JIT configuration on the same UID
 
