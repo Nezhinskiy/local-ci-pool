@@ -18,11 +18,33 @@ container is code from those repositories. It is not a sandbox for untrusted cod
   `contents: write` should stay on hosted runners, so that no token that can move a default branch
   reaches the Mac.
 - A job container mounts only the runner image mount, read-only: no host volumes and no Docker socket.
-  It runs as a non-root user with `--init` and a memory limit, and is removed after its job.
+  It runs as a non-root user with `--init` and a memory limit, and is removed after its job. The
+  consequence is that nothing inside a job can use Docker (`services:`, a job `container:`, Docker
+  container actions, `docker build`); see [What does not work](README.md#what-does-not-work).
 - A job container can reach your LAN through the Docker VM, and it can reach services on the Mac
   itself (see the residual below).
 - Release binaries are built by this repository's CI and carry build provenance. Verify one with
   `gh attestation verify` before you run it.
+
+## The routing and the heartbeat variables
+
+The `route` action decides from repository variables, `CI_POOL_HB_<MACHINE>`, and anyone with write
+access to the repository can set a variable. That person can already edit the workflows, so running
+code gives them nothing they lack. What the variable gives them is routing:
+
+- Availability. A fresh heartbeat sends jobs to the local label. If no runner serves that label, for
+  example because the heartbeat was forged, the jobs sit queued (GitHub keeps a queued job up to 24
+  hours) instead of falling back to the hosted label.
+- With the `local-label` input, a different target. A heartbeat routes jobs to whatever self-hosted
+  runner serves that label, which may be another machine than the one you meant.
+
+`route/heartbeat.sh` writes a heartbeat for runners that are not this pool. Run it with a
+fine-grained personal access token limited to that one repository, with *Variables: read and
+write*, passed as `GH_TOKEN`, and not with the ambient `gh` login, which is usually a broad
+`repo`-scoped token on a machine where the script runs unattended. Keep the file that holds the token
+private (`chmod 600`). `heartbeat.sh` refuses a public repository (exit 2), as the pool does, because a
+pull request from a fork would run on your machine. The check is the repository's visibility, not
+its owner, so a private repository owned by an organization is served.
 
 ## Residual risk: Mac loopback services are reachable from jobs
 

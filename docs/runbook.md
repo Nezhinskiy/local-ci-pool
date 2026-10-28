@@ -28,8 +28,22 @@ holds your `gh` login and runs the code of your private repositories.
 
 ## Install
 
-Requirements: macOS, Docker Desktop, `gh` logged in with the scopes the repositories need (`repo`,
-`workflow`, `read:org`).
+Requirements: macOS, Docker Engine 28 or newer (verified on Docker Desktop), `gh` logged in with the
+scopes the repositories need (`repo`, `workflow`, `read:org`). The runner is mounted into job
+containers as an image, which needs Engine API 1.48 (Docker 28): the installer refuses an older
+engine and says why.
+
+Under launchd `DOCKER_HOST` is unset, so the pool finds Docker as the `docker` CLI does: `DOCKER_HOST`
+first, then the current docker context, then the first of the known socket paths that exists. It
+chooses once, when it starts. After you switch Docker runtimes while the old one keeps running, make
+the pool choose again:
+
+```sh
+launchctl kickstart -k gui/$(id -u)/com.local-ci-pool.pool
+```
+
+`-k` kills the running pool at once, like any stop that comes from launchd (see [launchd's 60-second
+limit](#launchds-60-second-limit)); stop it with `SIGTERM` as shown there if a job is running.
 
 ```sh
 gh auth status
@@ -250,6 +264,13 @@ for a token:
 | `budget` | the core budget: `state`, an `error` class when there is one, and `oldest_wait_s` (see [CI is waiting](#ci-is-waiting)) |
 | `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, a `reason` when not healthy, the budget's `waiting` and `admitted` counts, and `stuck` when a job is queued that GitHub does not offer the pool (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)) |
 
+`pool status` reads the same endpoint and prints it as text (see [CI went hosted](#ci-went-hosted)).
+
+The log leaves out the listener's per-poll line, `Getting next message`, which `actions/scaleset`
+writes before every poll of every scale set and which would be nearly all of it. Its other lines stay,
+among them `Handling initial session statistics`, `Acquiring jobs` and `Jobs acquired`: the last two
+are the only record that GitHub handed a scale set a job before a runner started.
+
 The endpoint binds `127.0.0.1:8737` and answers only requests whose `Host` is a loopback name. A job
 can still reach it through Docker Desktop's host gateway address with a forged `Host`, and so learn
 which repositories the pool serves; see [SECURITY.md](../SECURITY.md). Binding it is also the
@@ -263,6 +284,66 @@ lost runner and needs a re-run. A pool killed while Docker keeps running (`kill 
 [launchd's 60-second limit](#launchds-60-second-limit)) is different: a job that had started keeps
 running in its container, and the next pool leaves it running, counts it in `in_use` until it exits,
 and removes only this pool's containers that had already stopped.
+
+## CI went hosted
+
+A run used a hosted runner when you expected a Mac. The routing falls back whenever no Mac has a
+fresh heartbeat, so the question is why this one did not.
+
+1. **Ask the pool.** The installed binary is not on your `PATH`:
+
+   ```sh
+   "$HOME/Library/Application Support/local-ci-pool/bin/pool" status
+   ```
+
+   ```
+   pool v0.3.2 (5dbddde) on examplemacbo: docker ok, login ok, 7 slots, 0 in use, budget on
+     alice/alpha  healthy
+     alice/beta   unhealthy: draining
+       queued 12m0s: test https://github.com/alice/beta/actions/runs/1
+   ```
+
+   The exit status is 0 for a healthy pool, 1 when `/healthz` answers 503, and 3 when nothing
+   answers; `--json` prints the body as it is. Read the first line, then the projects:
+
+   - `pool: not running`: nothing answers on the health address. Look at
+     `launchctl print gui/$(id -u)/com.local-ci-pool.pool` and the end of `pool.log`; a line starting
+     `terminal:` names a cause the pool will not retry (see [Install](#install)).
+   - `docker down`: Docker does not answer. No heartbeat is written until it does.
+   - `login lost`: `gh` cannot give the pool a token. The pool keeps retrying and writes no
+     heartbeat meanwhile. Run `gh auth status`; if `gh` is logged out, run `gh auth login`.
+   - `unhealthy: <reason>` under a project: that project writes no heartbeat; the reason says why (see
+     [Opting a project in or out](#opting-a-project-in-or-out)).
+   - `N waiting for cores`: the budget holds the jobs (see [CI is waiting](#ci-is-waiting)).
+   - `queued <time>: <job> <run URL>`: GitHub has not offered the pool a job that has waited that
+     long for a runner (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)).
+
+2. **Read the run's annotation.** An `auto` route that falls back says so on the `route` job. The
+   three lines, here for `hosted-label: ubuntu-24.04-arm`:
+
+   ```
+   ::notice title=local-ci-pool::no Mac heartbeat found; running on ubuntu-24.04-arm
+   ::warning title=local-ci-pool::no fresh Mac heartbeat (the newest, CI_POOL_HB_EXAMPLEMACBO, is 1d 18h old); running on ubuntu-24.04-arm
+   ::warning title=local-ci-pool::no fresh Mac heartbeat (the newest, CI_POOL_HB_EXAMPLEMACBO, is in the future); running on ubuntu-24.04-arm
+   ```
+
+   - The notice: the repository has no heartbeat variable. Check
+     `gh variable list --repo OWNER/NAME`; a healthy pool writes `CI_POOL_HB_<MACHINE>` within two
+     minutes.
+   - The first warning: the newest heartbeat is too old (fresh is at most 300 seconds). It names the
+     machine and its age; the pool has been quiet for that long, so go to that Mac and run
+     `pool status`.
+   - The second warning: the newest heartbeat is more than 30 seconds ahead of the runner's clock.
+     Fix the Mac's clock.
+
+   A run forced to `mode: hosted` prints none of them.
+
+3. **An example of a pool that was down.** On 2026-10-21 a pool stayed down for 42 hours. `gh auth
+   token` had failed to finish (its keychain lookup timed out on a stalled Mac), the pool took that
+   for a logout and exited 0, and launchd does not restart a pool that exits 0. Every run in those
+   42 hours went hosted, and a run's annotation said `is 1d 18h old` at the end. Since v0.3.2 the
+   pool does not exit on a token it cannot read: it retries, and `pool status` shows `login lost`
+   while `gh` cannot give a token (see [Install](#install)).
 
 ## The budget settings
 
