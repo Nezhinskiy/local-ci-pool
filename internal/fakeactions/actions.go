@@ -57,6 +57,7 @@ type Actions struct {
 	tokens       []string
 	log          []string
 	capacity     map[int]string // scale set -> the capacity header of its last message request
+	anyCapacity  map[int]bool   // scale sets whose messages are delivered whatever capacity is sent
 	// barrier holds the registration requests until barrierN have arrived.
 	barrier  chan struct{}
 	barrierN int
@@ -77,17 +78,18 @@ type message struct {
 // New starts a fake Actions service; it is closed when the test ends.
 func New(t testing.TB) *Actions {
 	a := &Actions{
-		t:         t,
-		changed:   make(chan struct{}),
-		poll:      DefaultPoll,
-		scaleSets: map[int]*scaleset.RunnerScaleSet{},
-		nextSet:   1,
-		sessions:  map[int]uuid.UUID{},
-		assigned:  map[int]int{},
-		queues:    map[int][]*message{},
-		runners:   map[string]*registered{},
-		rejected:  map[string]bool{},
-		capacity:  map[int]string{},
+		t:           t,
+		changed:     make(chan struct{}),
+		poll:        DefaultPoll,
+		scaleSets:   map[int]*scaleset.RunnerScaleSet{},
+		nextSet:     1,
+		sessions:    map[int]uuid.UUID{},
+		assigned:    map[int]int{},
+		queues:      map[int][]*message{},
+		runners:     map[string]*registered{},
+		rejected:    map[string]bool{},
+		capacity:    map[int]string{},
+		anyCapacity: map[int]bool{},
 	}
 	a.actionsServer = newServer(t, http.HandlerFunc(a.serve), WithRunnerRegistrationTokenHandler(a.registrationToken))
 	return a
@@ -240,6 +242,16 @@ func (a *Actions) Capacity(name string) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.capacity[a.idLocked(name)]
+}
+
+// IgnoreCapacity delivers the scale set's messages whatever capacity its
+// listener sends, 0 included: github.com delivers a job it assigned while a
+// long poll (about 50 s) sent with an earlier capacity was open, though the
+// listener advertises 0 by then.
+func (a *Actions) IgnoreCapacity(name string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.anyCapacity[a.mustIDLocked(name)] = true
 }
 
 // Tokens lists the personal access tokens the registration endpoint saw.
@@ -642,7 +654,7 @@ func (a *Actions) getMessage(w http.ResponseWriter, r *http.Request, id int) {
 		_, open := a.sessions[id]
 		capacity := r.Header.Get(scaleset.HeaderScaleSetMaxCapacity)
 		a.capacity[id] = capacity
-		if open && capacity != "0" && len(a.queues[id]) > 0 {
+		if open && (capacity != "0" || a.anyCapacity[id]) && len(a.queues[id]) > 0 {
 			m := a.queues[id][0]
 			a.queues[id] = a.queues[id][1:]
 			a.mu.Unlock()
