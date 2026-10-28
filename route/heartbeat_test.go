@@ -200,6 +200,23 @@ func TestHeartbeatScriptSkipsWhenCheckFails(t *testing.T) {
 	}
 }
 
+// The check is the user's own command and runs unattended: it must not see
+// the fine-grained token that can write the repository's variables. gh still
+// gets it for the write.
+func TestHeartbeatScriptCheckRunsWithoutTheToken(t *testing.T) {
+	tokens := map[string]string{
+		"GH_TOKEN":                "alpha",
+		"GITHUB_TOKEN":            "alpha",
+		"GH_ENTERPRISE_TOKEN":     "alpha",
+		"GITHUB_ENTERPRISE_TOKEN": "alpha",
+	}
+	const check = `test -z "${GH_TOKEN-}${GITHUB_TOKEN-}${GH_ENTERPRISE_TOKEN-}${GITHUB_ENTERPRISE_TOKEN-}"`
+	r := runHeartbeat(t, tokens, "--repo", "o/r", "--machine", "m1", "--slots", "3", "--check", check)
+	if r.exit != 0 || len(r.wrote()) != 1 {
+		t.Fatalf("a token reached the check: exit %d, writes %q\nstderr: %s", r.exit, r.wrote(), r.stderr)
+	}
+}
+
 func TestHeartbeatScriptRejectsBadInput(t *testing.T) {
 	good := map[string]string{"repo": "o/r", "machine": "m1", "slots": "3"}
 	with := func(k, v string) []string {

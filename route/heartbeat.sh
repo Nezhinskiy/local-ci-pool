@@ -19,7 +19,10 @@
 #   --slots N       how many jobs the machine takes at once, 1-8
 #   --check CMD     run with `bash -c` first; if it fails nothing is written
 #                   (and the exit status is 0), so a machine whose Docker is
-#                   down or whose runner app has quit stops advertising itself
+#                   down or whose runner app has quit stops advertising itself.
+#                   The check runs without the token (GH_TOKEN, GITHUB_TOKEN
+#                   and the two ENTERPRISE variants are unset for it), so a
+#                   command of yours cannot read or leak it
 #
 # Authenticate with GH_TOKEN set to a fine-grained personal access token limited
 # to that one repository, with "Variables: read and write" (Metadata: read is
@@ -121,7 +124,7 @@ elif [[ "$private" != "true" ]]; then
 fi
 
 if [[ "$have_check" == true ]]; then
-  if ! bash -c "$check"; then
+  if ! env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN bash -c "$check"; then
     echo "heartbeat: check failed; not writing" >&2
     exit 0
   fi
