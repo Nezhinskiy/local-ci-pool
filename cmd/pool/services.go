@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/moby/moby/client"
 
@@ -23,6 +27,7 @@ func realServices() services {
 	return services{
 		newPool:      newRealPool,
 		newForgetter: newRealForgetter,
+		fetchHealth:  fetchHealth,
 	}
 }
 
@@ -86,4 +91,25 @@ func newDockerClient() (*client.Client, error) {
 		}
 	}
 	return client.New(opts...)
+}
+
+// fetchHealth is GET http://<addr>/healthz. A 503 is an answer, with the body
+// that says why; only a pool that does not answer is an error.
+func fetchHealth(ctx context.Context, addr string) (int, []byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/healthz", nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return 0, nil, err
+	}
+	return resp.StatusCode, body, nil
 }
