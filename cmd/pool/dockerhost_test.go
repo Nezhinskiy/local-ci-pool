@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -144,5 +145,19 @@ func TestDockerHostBrokenContextFallsThrough(t *testing.T) {
 	touch(t, sock)
 	if got := dockerHost(envOf(nil), home, []string{sock}); got != "unix://"+sock {
 		t.Fatalf("got %q, want the known socket", got)
+	}
+}
+
+// The sockets newDockerClient hands to dockerHost, in the order the brief
+// names them.
+func TestKnownSockets(t *testing.T) {
+	want := []string{
+		"/var/run/docker.sock",
+		"/Users/alice/.docker/run/docker.sock",
+		"/Users/alice/.orbstack/run/docker.sock",
+		"/Users/alice/.colima/default/docker.sock",
+	}
+	if got := knownSockets("/Users/alice"); !slices.Equal(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }

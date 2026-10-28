@@ -32,6 +32,18 @@ func dockerHost(getenv func(string) string, home string, sockets []string) strin
 	return ""
 }
 
+// knownSockets are the places a Docker Engine socket is usually found, in the
+// order dockerHost tries them: the system link, then Docker Desktop, OrbStack
+// and Colima under the home directory.
+func knownSockets(home string) []string {
+	return []string{
+		"/var/run/docker.sock",
+		filepath.Join(home, ".docker", "run", "docker.sock"),
+		filepath.Join(home, ".orbstack", "run", "docker.sock"),
+		filepath.Join(home, ".colima", "default", "docker.sock"),
+	}
+}
+
 // currentContext is the context name DOCKER_CONTEXT gives, else the one in
 // <cfg>/config.json; "" when neither names one.
 func currentContext(getenv func(string) string, cfg string) string {

@@ -80,13 +80,7 @@ func newRealForgetter(*slog.Logger) (forgetter, error) {
 func newDockerClient() (*client.Client, error) {
 	opts := []client.Opt{client.FromEnv}
 	if home, err := os.UserHomeDir(); err == nil {
-		sockets := []string{
-			"/var/run/docker.sock",
-			filepath.Join(home, ".docker", "run", "docker.sock"),
-			filepath.Join(home, ".orbstack", "run", "docker.sock"),
-			filepath.Join(home, ".colima", "default", "docker.sock"),
-		}
-		if h := dockerHost(os.Getenv, home, sockets); h != "" {
+		if h := dockerHost(os.Getenv, home, knownSockets(home)); h != "" {
 			opts = append(opts, client.WithHost(h))
 		}
 	}
@@ -102,7 +96,12 @@ func fetchHealth(ctx context.Context, addr string) (int, []byte, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	// A redirect is an answer, not something to follow: the address was
+	// checked to be loopback, and wherever it sends us was not.
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}

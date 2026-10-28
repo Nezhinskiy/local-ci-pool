@@ -45,14 +45,21 @@ func cmdStatus(ctx context.Context, args []string, stdout, stderr io.Writer, svc
 	if status == http.StatusServiceUnavailable {
 		code = exitError
 	}
-	if *asJSON {
-		_, _ = stdout.Write(body)
-		return code
-	}
+	// Whatever is listening on the port, only the pool's own snapshot is
+	// printed: JSON with a version. Anything else could carry escape
+	// sequences to the terminal.
 	var snap supervisor.Snapshot
 	if err := json.Unmarshal(body, &snap); err != nil {
 		_, _ = fmt.Fprintf(stderr, "pool: %s answered something that is not the pool's state: %v\n", *addr, err)
 		return exitError
+	}
+	if snap.Version == "" {
+		_, _ = fmt.Fprintf(stderr, "pool: %s answered JSON that is not the pool's state (no version)\n", *addr)
+		return exitError
+	}
+	if *asJSON {
+		_, _ = stdout.Write(body)
+		return code
 	}
 	_, _ = io.WriteString(stdout, formatStatus(snap))
 	return code

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -211,5 +212,80 @@ func TestStatusPrintsNoControlCharacters(t *testing.T) {
 	}
 	if want := `\u001b]0;x\u0007\u000a  fake  healthy`; !strings.Contains(stdout, want) {
 		t.Errorf("the escaped job name %q is missing:\n%q", want, stdout)
+	}
+}
+
+// The C1 branch of clean: a real U+009B reaches the snapshot as the JSON
+// escape \u009b (encoding/json writes it as the two bytes C2 9B, which a
+// raw 0x9b in a Go string would not be).
+func TestStatusEscapesC1InJobNames(t *testing.T) {
+	snap := statusFixture()
+	snap.Projects[1].Stuck[0].Job = "a\u009bb"
+	svc, _ := statusServices(http.StatusOK, snap, nil)
+	_, stdout, _ := do(t, svc, "status")
+	if strings.ContainsRune(stdout, '\u009b') {
+		t.Errorf("a C1 control reached the output: %q", stdout)
+	}
+	if want := `a\u009bb`; !strings.Contains(stdout, want) {
+		t.Errorf("stdout lacks the escaped job name %q:\n%q", want, stdout)
+	}
+}
+
+// --json prints the body as it is, but only a body that is JSON: anything
+// else on the port could carry escape sequences to the terminal.
+func TestStatusJSONRefusesAnythingButJSON(t *testing.T) {
+	for _, body := range []string{"\x1b[2Jhello", "<html>", ""} {
+		svc := services{fetchHealth: func(context.Context, string) (int, []byte, error) {
+			return http.StatusOK, []byte(body), nil
+		}}
+		code, stdout, stderr := do(t, svc, "status", "--json")
+		if code != exitError || stdout != "" || strings.Count(stderr, "\n") != 1 || !strings.HasPrefix(stderr, "pool: ") {
+			t.Errorf("body %q: exit %d, stdout %q, stderr %q, want one \"pool: …\" line", body, code, stdout, stderr)
+		}
+	}
+}
+
+// JSON that is not the pool's snapshot has no version: that is not the pool,
+// with or without --json.
+func TestStatusRefusesJSONThatIsNotTheSnapshot(t *testing.T) {
+	for _, args := range [][]string{{"status"}, {"status", "--json"}} {
+		svc := services{fetchHealth: func(context.Context, string) (int, []byte, error) {
+			return http.StatusOK, []byte(`{"ok":true}`), nil
+		}}
+		code, stdout, stderr := do(t, svc, args...)
+		if code != exitError || stdout != "" || strings.Count(stderr, "\n") != 1 || !strings.HasPrefix(stderr, "pool: ") {
+			t.Errorf("%v: exit %d, stdout %q, stderr %q, want one \"pool: …\" line", args, code, stdout, stderr)
+		}
+	}
+}
+
+// fetchHealth does not follow a redirect: the loopback check covers the
+// address it was given, not wherever a listener there sends it.
+func TestFetchHealthDoesNotFollowRedirects(t *testing.T) {
+	var elsewhere bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		elsewhere = true
+		_, _ = w.Write([]byte(`{"version":"v9.9.9"}`))
+	}))
+	defer target.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer redirector.Close()
+	addr := strings.TrimPrefix(redirector.URL, "http://")
+
+	status, _, err := fetchHealth(context.Background(), addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusFound {
+		t.Errorf("status %d, want the redirect's own %d", status, http.StatusFound)
+	}
+	if elsewhere {
+		t.Error("fetchHealth followed the redirect")
+	}
+	svc := services{fetchHealth: fetchHealth}
+	if code, _, stderr := do(t, svc, "status", "--health-addr", addr); code != exitError || !strings.Contains(stderr, "not the pool's health endpoint") {
+		t.Errorf("status: exit %d, stderr %q, want the not-the-pool line", code, stderr)
 	}
 }
