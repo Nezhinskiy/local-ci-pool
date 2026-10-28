@@ -9,7 +9,9 @@
 # Set up Go + Download modules, of Build and of Test, and the Test min-max,
 # all in seconds. The median of an even count is the lower middle. A job whose
 # conclusion is not success is left out of every figure and counted in a
-# trailing "failed: <label> <n>" line.
+# trailing "failed: <label> <n>" line. A label with no successful job keeps an
+# empty row, and the script says so on stderr and exits 3 after the table. A run
+# with a job that has not completed is refused (exit 2).
 #
 # Needs gh (authenticated for the repository) and jq.
 #
@@ -58,6 +60,12 @@ for id in "$@"; do
   fi
 done
 
+for f in "${files[@]}"; do
+  if jq -s -e 'any(.[].jobs[]; .status != "completed")' "$f" > /dev/null; then
+    die "run $(basename "$f" .json) has unfinished jobs; report it once the run has completed"
+  fi
+done
+
 jq -s -r '
   def secs: fromdateiso8601;
   def span: (.completed_at | secs) - (.started_at | secs);
@@ -87,3 +95,12 @@ jq -s -r '
     (if any($rows[]; .failed > 0) then "" else empty end),
     ($rows[] | select(.failed > 0) | "failed: \(.label) \(.failed)")
 ' "${files[@]}"
+
+# An empty row looks like a valid table; make it loud.
+empty="$(jq -s -r '[.[].jobs[]] | group_by(.labels[0])[] | select(all(.conclusion != "success")) | .[0].labels[0]' "${files[@]}")"
+if [ -n "$empty" ]; then
+  while IFS= read -r label; do
+    echo "bench-report: $label has no successful job; its row is empty" >&2
+  done <<< "$empty"
+  exit 3
+fi
