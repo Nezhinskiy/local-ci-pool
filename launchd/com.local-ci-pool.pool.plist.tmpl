@@ -12,7 +12,9 @@
 	<key>RunAtLoad</key>
 	<true/>
 	<!-- Restart after a crash or a Docker change (non-zero exit). A cause that
-	     restarting cannot fix, such as a logged-out gh, makes the pool exit 0. -->
+	     restarting cannot fix, such as a token GitHub refuses or a second pool,
+	     makes the pool exit 0. A token gh cannot give is waited for in the
+	     process, not exited on. -->
 	<key>KeepAlive</key>
 	<dict>
 		<key>SuccessfulExit</key>

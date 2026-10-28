@@ -80,3 +80,43 @@ func TestErrorsNeverCarryRunOutput(t *testing.T) {
 		t.Fatalf("error leaks the output: %v", err)
 	}
 }
+
+// ReadErr reports the last read's failure until a read succeeds, and does not
+// wait for a read that hangs.
+func TestReadErrFollowsTheLastRead(t *testing.T) {
+	var calls atomic.Int32
+	hang, release := make(chan struct{}), make(chan struct{})
+	s := NewSource(func(context.Context) ([]byte, error) {
+		switch calls.Add(1) {
+		case 1:
+			return nil, errors.New("gh auth token exited with status 1")
+		case 2:
+			close(hang)
+			<-release
+		}
+		return []byte("tok\n"), nil
+	})
+	if s.ReadErr() != nil {
+		t.Fatal("ReadErr before any read is not nil")
+	}
+	if _, err := s.Token(context.Background()); err == nil {
+		t.Fatal("want the first read to fail")
+	}
+	if err := s.ReadErr(); !errors.Is(err, ErrNoToken) {
+		t.Fatalf("ReadErr = %v, want ErrNoToken", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = s.Token(context.Background())
+	}()
+	<-hang
+	if !errors.Is(s.ReadErr(), ErrNoToken) {
+		t.Fatal("ReadErr changed while a read is still running")
+	}
+	close(release)
+	<-done
+	if err := s.ReadErr(); err != nil {
+		t.Fatalf("ReadErr = %v after a read succeeded", err)
+	}
+}

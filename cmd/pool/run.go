@@ -21,7 +21,9 @@ import (
 
 // Exit codes. launchd restarts the pool on a non-zero status only
 // (KeepAlive { SuccessfulExit = false }), so a cause that restarting cannot fix
-// exits 0.
+// exits 0: a token GitHub refuses after it was read again, a second pool, too
+// few resources for one slot, a bad host name. A token gh cannot give is none
+// of those: the supervisor waits for it and never returns for it.
 const (
 	exitOK    = 0
 	exitError = 1

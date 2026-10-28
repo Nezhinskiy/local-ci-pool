@@ -14,7 +14,8 @@ import (
 // ErrTerminal marks an error whose cause will not fix itself, such as a
 // rejected login or a scale set held elsewhere. cmd exits 0 on it, so launchd
 // does not restart the pool into the same failure; every other error exits
-// non-zero and launchd retries.
+// non-zero and launchd retries. A token gh cannot give just now is not one: the
+// pool waits for it (see isTokenRead).
 var ErrTerminal = errors.New("terminal")
 
 type terminalError struct{ msg string }
@@ -31,20 +32,23 @@ func terminal(format string, args ...any) error {
 // loginRejected returns the terminal error for a GitHub REST failure that
 // means the login is gone, or nil. The GitHub client has already dropped the
 // cached token and read it again once before it returns ErrUnauthorized, so
-// that error is the second refusal; and a token that cannot be read means gh
-// is logged out. Neither fixes itself, so launchd must not respawn into it.
+// that error is GitHub refusing a token gh has just given: it does not fix
+// itself, and a pool that kept sending it would have GitHub reject even valid
+// credentials for a while after many failed attempts.
+//
+// A token that cannot be read is not a lost login (isTokenRead): it is
+// retried, and the pool reports it in the snapshot meanwhile.
 func loginRejected(err error) error {
-	switch {
-	case errors.Is(err, ghauth.ErrNoToken):
-		return terminal("gh logged out: %v; run gh auth login", err)
-	case errors.Is(err, github.ErrUnauthorized):
+	if errors.Is(err, github.ErrUnauthorized) {
 		return terminal("gh login rejected: GitHub refused the token after reading it again; run gh auth login")
 	}
 	return nil
 }
 
 // isTokenRead reports whether err is a failure to read the token from gh, as
-// opposed to GitHub rejecting it.
+// opposed to GitHub rejecting it. gh exits 1 both when it has no login and when
+// its keychain lookup times out, so the failure may fix itself: every caller
+// retries it.
 func isTokenRead(err error) bool { return errors.Is(err, ghauth.ErrNoToken) }
 
 // isUnauthorized reports whether err is an authentication failure: the GitHub

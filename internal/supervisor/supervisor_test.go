@@ -593,21 +593,67 @@ func TestStartupRetriesAFailedTokenRead(t *testing.T) {
 	}
 }
 
-// A token read failing for longer than the two-minute window is terminal.
-func TestStartupWithoutTokenIsTerminal(t *testing.T) {
+// The night of 2026-10-21: the first `gh auth token` hung for 26 minutes and
+// exited 1, and gh went on failing past the start-up retry window; the login
+// itself was intact. A token that cannot be read is not a logout: the pool
+// waits for it, says so in the snapshot, and serves once gh answers again.
+func TestStartupOutlastsAnUnreadableToken(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.tok.firstErr = fmt.Errorf("%w: gh auth token exited with status 1", ghauth.ErrNoToken)
+	h.tok.failFirst = 9 // 2 s doubling: past four minutes of retries
+	h.tok.delay = 26 * time.Minute / 1000
+	serving := make(chan struct{})
+	h.serve = func(ctx context.Context, _ net.Listener) {
+		close(serving)
+		<-ctx.Done()
+	}
+	h.start()
+	began := h.clock.Now()
+	h.eventually("a second read, or Run returning", func() bool { return h.tok.readCount() > 1 || !h.running() })
+	if !h.running() {
+		t.Fatalf("Run returned %v after %d token read(s)", *h.result, h.tok.readCount())
+	}
+	h.eventually("the lost login reported", func() bool { return !h.sup.Snapshot().Login })
+	select {
+	case <-serving:
+	default:
+		t.Fatal("the health endpoint is not served while the pool waits for a token")
+	}
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	if waited := h.clock.Now().Sub(began); waited < 26*time.Minute+2*time.Minute {
+		t.Fatalf("served after %s, want the reads outlasting the old two-minute window", waited)
+	}
+	if !h.sup.Snapshot().Login {
+		t.Fatal("the login is still reported lost once a token was read")
+	}
+}
+
+// A token gh never gives is waited for, however long, before anything else
+// starts, and a stop ends the wait cleanly.
+func TestStartupWaitsForATokenUntilStopped(t *testing.T) {
 	h := newHarness(t, 2, 1000, "alpha")
 	h.tok.err = fmt.Errorf("%w: gh auth token exited with status 1", ghauth.ErrNoToken)
 	h.start()
 	began := h.clock.Now()
-	err := h.wait(defaultWait)
-	if !errors.Is(err, ErrTerminal) || !strings.Contains(err.Error(), "gh logged out") {
-		t.Fatalf("Run = %v, want terminal gh logged out", err)
+	h.eventually("reads past ten minutes", func() bool { return h.clock.Now().Sub(began) > 10*time.Minute })
+	if !h.running() {
+		t.Fatalf("Run returned %v while waiting for a token", *h.result)
 	}
-	if waited := h.clock.Now().Sub(began); waited < 2*time.Minute || h.tok.readCount() < 3 {
-		t.Fatalf("terminal after %s and %d reads, want retries for two minutes", waited, h.tok.readCount())
+	if n := h.tok.readCount(); n < 5 {
+		t.Fatalf("%d token reads in ten minutes, want retries", n)
 	}
-	if h.detects != 0 {
-		t.Fatal("Docker was probed before the login was checked")
+	if h.sup.Snapshot().Login {
+		t.Fatal("the snapshot reports a login while gh gives no token")
+	}
+	h.mu.Lock()
+	detects := h.detects
+	h.mu.Unlock()
+	if detects != 0 {
+		t.Fatal("Docker was probed before a token was read")
+	}
+	h.cancel()
+	if err := h.wait(defaultWait); err != nil {
+		t.Fatalf("Run = %v after a stop, want nil", err)
 	}
 }
 
@@ -624,16 +670,25 @@ func TestDiscoveryUnauthorizedIsTerminal(t *testing.T) {
 	}
 }
 
-// A refusal drops the cached token; a token that then cannot be read means gh
-// was logged out.
-func TestTokenLostAfterRefusalIsTerminal(t *testing.T) {
+// A refusal drops the cached token; a token that then cannot be read leaves
+// the project down, not the pool, and the project comes back once gh gives a
+// token GitHub accepts.
+func TestTokenUnreadableAfterRefusalIsRetried(t *testing.T) {
 	h := newHarness(t, 2, 1000, "alpha")
-	h.actions.RejectTokens()
+	h.actions.RejectTokens("tok-1")
 	h.tok.err, h.tok.errAfter = fmt.Errorf("%w: gh auth token exited with status 1", ghauth.ErrNoToken), true
 	h.start()
-	err := h.wait(defaultWait)
-	if !errors.Is(err, ErrTerminal) || !strings.Contains(err.Error(), "gh logged out") {
-		t.Fatalf("Run = %v, want terminal gh logged out", err)
+	h.eventually("a failed read after the refusal", func() bool { return h.tok.invalidated() > 0 && h.tok.readCount() > 2 })
+	if !h.running() {
+		t.Fatalf("Run returned %v for a token gh could not give", *h.result)
+	}
+	if h.healthy(alphaRepo) || h.sup.Snapshot().Login {
+		t.Fatal("alpha is healthy, or the login reported, while gh gives no token")
+	}
+	h.tok.setErr(nil)
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	if !h.sup.Snapshot().Login {
+		t.Fatal("the login is still reported lost")
 	}
 }
 
@@ -827,17 +882,18 @@ func TestFailOnLoginLossEndsRunTerminal(t *testing.T) {
 	}
 }
 
-func TestFailOnLoginLossForUnreadableToken(t *testing.T) {
+// A heartbeat write whose token gh could not give is not a lost login: the
+// next beat reads it again.
+func TestFailOnLoginLossIgnoresAnUnreadableToken(t *testing.T) {
 	h := newHarness(t, 2, 1000, "alpha")
 	h.start()
 	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
 
-	if !h.sup.FailOnLoginLoss(fmt.Errorf("%w: gh auth token exited with status 1", ghauth.ErrNoToken)) {
-		t.Fatal("an unreadable token was not taken for a lost login")
+	if h.sup.FailOnLoginLoss(fmt.Errorf("github: PATCH /x: %w: gh auth token exited with status 1", ghauth.ErrNoToken)) {
+		t.Fatal("an unreadable token was taken for a lost login")
 	}
-	err := h.wait(defaultWait)
-	if !errors.Is(err, ErrTerminal) || !strings.Contains(err.Error(), "gh logged out") {
-		t.Fatalf("Run = %v, want terminal gh logged out", err)
+	if !h.running() {
+		t.Fatalf("Run returned %v for an unreadable token", *h.result)
 	}
 }
 
