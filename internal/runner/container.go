@@ -12,6 +12,7 @@ import (
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/runnermount"
@@ -43,6 +44,8 @@ const (
 
 	// iccOption turns off traffic between the containers of a bridge.
 	iccOption = "com.docker.network.bridge.enable_icc"
+	// mtuOption is a bridge's MTU.
+	mtuOption = "com.docker.network.driver.mtu"
 
 	// cleanupTimeout bounds removing a container that could not be started.
 	cleanupTimeout = 30 * time.Second
@@ -89,18 +92,15 @@ type ContainerSpec struct {
 	JIT                         string
 }
 
-// CPUCap is the CPUs one runner may use: its budget grant when the gate
-// admitted it for one, otherwise its slot's share of the VM, cpus / slots. A
-// grant is cut to the VM's CPUs, more than which Docker refuses. With no CPUs
-// or no slots known it is 0, no cap.
-func CPUCap(need, cpus, slots int) float64 {
-	switch {
-	case cpus <= 0 || slots <= 0:
+// CPUCap is the CPUs one runner may use: its budget grant, cut to the VM's
+// CPUs, more than which Docker refuses. A runner the gate did not admit (the
+// budget off) gets 0, no cap: a lone job on an idle pool keeps the whole VM,
+// and busy jobs share the CPUs by the kernel's equal default weights.
+func CPUCap(need, cpus int) float64 {
+	if need <= 0 || cpus <= 0 {
 		return 0
-	case need > 0:
-		return float64(min(need, cpus))
 	}
-	return float64(cpus) / float64(slots)
+	return float64(min(need, cpus))
 }
 
 // NetworkName is the bridge network the runners of an instance join.
@@ -112,7 +112,9 @@ var networkMu sync.Mutex
 // EnsureNetwork makes sure the instance's network exists: a bridge with
 // outbound traffic, where containers cannot reach each other, so a job cannot
 // reach a service that a concurrent job, of its own project or another, has
-// open. A network of that name with other settings is refused, not used.
+// open. A network of that name with other settings is refused, not used. The
+// network takes the default bridge's MTU, which is where Docker applies a
+// daemon-wide mtu; a new network would otherwise get 1500.
 //
 // The network outlives the pool: the runners a previous run left running are
 // on it, and it is reused on the next start.
@@ -123,20 +125,39 @@ func EnsureNetwork(ctx context.Context, d Docker, instance string) error {
 	got, err := d.NetworkInspect(ctx, name, client.NetworkInspectOptions{})
 	switch {
 	case err == nil:
-		n := got.Network
-		if n.Driver != "bridge" || n.Internal || n.Options[iccOption] != "false" {
-			return fmt.Errorf("network %s exists with other settings (driver %s, internal %v, %s=%q); remove it with docker network rm %s", name, n.Driver, n.Internal, iccOption, n.Options[iccOption], name)
-		}
-		return nil
+		return checkNetwork(name, got.Network.Network)
 	case !cerrdefs.IsNotFound(err):
 		return fmt.Errorf("inspecting network %s: %w", name, err)
 	}
-	if _, err := d.NetworkCreate(ctx, name, client.NetworkCreateOptions{
+	options := map[string]string{iccOption: "false"}
+	if bridge, err := d.NetworkInspect(ctx, "bridge", client.NetworkInspectOptions{}); err == nil {
+		if mtu := bridge.Network.Options[mtuOption]; mtu != "" {
+			options[mtuOption] = mtu
+		}
+	}
+	_, err = d.NetworkCreate(ctx, name, client.NetworkCreateOptions{
 		Driver:  "bridge",
-		Options: map[string]string{iccOption: "false"},
+		Options: options,
 		Labels:  map[string]string{LabelInstance: instance},
-	}); err != nil {
+	})
+	if cerrdefs.IsConflict(err) {
+		// Another process created it since the inspect.
+		got, ierr := d.NetworkInspect(ctx, name, client.NetworkInspectOptions{})
+		if ierr != nil {
+			return fmt.Errorf("creating network %s: %w; inspecting it then: %w", name, err, ierr)
+		}
+		return checkNetwork(name, got.Network.Network)
+	}
+	if err != nil {
 		return fmt.Errorf("creating network %s: %w", name, err)
+	}
+	return nil
+}
+
+// checkNetwork accepts the instance's network only as EnsureNetwork creates it.
+func checkNetwork(name string, n network.Network) error {
+	if n.Driver != "bridge" || n.Internal || n.Options[iccOption] != "false" {
+		return fmt.Errorf("network %s exists with other settings (driver %s, internal %v, %s=%q); remove it with docker network rm %s", name, n.Driver, n.Internal, iccOption, n.Options[iccOption], name)
 	}
 	return nil
 }

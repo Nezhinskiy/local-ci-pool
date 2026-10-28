@@ -111,8 +111,10 @@ Run `./install.sh --dry-run` first if you want to see what it would do. The inst
 The pool writes no configuration. `config.toml` is yours; the installer creates it only when asked.
 The pool keeps derived state only: its git mirrors under
 `~/Library/Caches/local-ci-pool`, the Docker images `local-ci-pool/runner:<version>` (the runner
-trees) and `local-ci/<identity>:<digest>` (the job images), the Docker network
-`local-ci-pool-main` that every job container joins, and the health token
+trees) and `local-ci/<identity>:<digest>` (the job images), one Docker network per pool
+instance, `local-ci-pool-main` (a probe's is `local-ci-pool-probe-<owner>`), which every job
+container of every project joins, with traffic between containers off and the default bridge's
+MTU, and the health token
 `~/Library/Application Support/local-ci-pool/health-<port>.token`. Deleting any of it costs a
 fetch, a build or a restart. Releases before the runner trees moved kept them under
 `local-ci/runner:<version>`, where a repository named `runner` had its job images too; the first
@@ -458,9 +460,11 @@ at most the whole budget). The grant is fixed for the job's life, and `pool.log`
 `pytest -n "${CORESLOT_CPU:-2}"` or `make -j "${CORESLOT_CPU:-2}"`; the default covers a job that
 runs without the budget, where the variable is unset. The container is capped at its grant (Docker's
 `--cpus`), so a job that ignores `CORESLOT_CPU` runs slower rather than oversubscribing the Mac.
-Before this release a job always got all of `cpu`, so a workflow that assumed that must read
-`CORESLOT_CPU` now. Without the budget, each container is capped at its slot's share of the Docker
-VM's CPUs (CPUs divided by slots), and has a limit of 4096 processes and threads either way.
+Go before 1.25 sizes `GOMAXPROCS` to the VM's CPUs whatever the cap, and is throttled hard under
+it; set `GOMAXPROCS="${CORESLOT_CPU:-}"` for such a toolchain. Before this release a job always got
+all of `cpu`, so a workflow that assumed that must read `CORESLOT_CPU` now. Without the budget a
+container has no CPU cap: a lone job uses the whole VM, and busy jobs share it by the kernel's
+equal default weights. Either way it has a limit of 4096 processes and threads.
 
 **Creating it.** `./install.sh --budget-cpu 2` creates `~/.config/local-ci-pool/config.toml` (mode
 0600) when the installed pool would read no file, and never changes one that exists: it prints

@@ -49,6 +49,19 @@ func TestRealNetworkKeepsJobsApart(t *testing.T) {
 			t.Errorf("removing the test network: %v", err)
 		}
 	}()
+	// It takes the default bridge's MTU (65535 on Docker Desktop), not 1500.
+	bridge, err := cli.NetworkInspect(ctx, "bridge", client.NetworkInspectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	made, err := cli.NetworkInspect(ctx, net, client.NetworkInspectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const mtu = "com.docker.network.driver.mtu"
+	if want := bridge.Network.Options[mtu]; want != "" && made.Network.Options[mtu] != want {
+		t.Errorf("network mtu %q, want the default bridge's %q", made.Network.Options[mtu], want)
+	}
 	// Ensuring it again finds it and keeps it.
 	if err := runner.EnsureNetwork(ctx, cli, instance); err != nil {
 		t.Fatalf("a second EnsureNetwork: %v", err)

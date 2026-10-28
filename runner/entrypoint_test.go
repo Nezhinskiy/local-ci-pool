@@ -81,8 +81,8 @@ func newRig(t *testing.T) *rig {
 	r.write(filepath.Join(r.mount, "bin", "Runner.Listener"), stubListener, 0o755)
 	r.ldconfig(false)
 	// The kernel's view of the process, as in /proc/self/status: real,
-	// effective, saved and filesystem uids.
-	r.write(filepath.Join(r.dir, "status"), "Name:\tbash\nUid:\t1001\t1234\t1001\t1001\nGid:\t0\t0\t0\t0\n", 0o644)
+	// effective, saved and filesystem uids and gids.
+	r.write(filepath.Join(r.dir, "status"), "Name:\tbash\nUid:\t1001\t1234\t1001\t1001\nGid:\t1001\t2345\t1001\t1001\nGroups:\t0\n", 0o644)
 	// A broken entrypoint must not leave the stub listener running.
 	t.Cleanup(func() {
 		if b, err := os.ReadFile(filepath.Join(r.out, "listener.pid")); err == nil {
@@ -396,7 +396,7 @@ func TestEntrypointPreflightPrintsTheVersion(t *testing.T) {
 	}
 	// The effective uid comes first, from the kernel's status, not from
 	// bash's $EUID, which an image's ENV sets.
-	if strings.TrimSpace(string(out)) != "local-ci: uid 1234\n2.338.0" {
+	if strings.TrimSpace(string(out)) != "local-ci: uid 1234 gid 2345\n2.338.0" {
 		t.Fatalf("output = %q", out)
 	}
 	if r.read("argv") != "" {
@@ -454,7 +454,7 @@ func TestEntrypointPreflightSetsInvariantWithoutIcu(t *testing.T) {
 	r.write(filepath.Join(r.mount, "bin", "Runner.Listener"), "#!/bin/sh\necho \"2.338.0 ${DOTNET_SYSTEM_GLOBALIZATION_INVARIANT:-unset}\"\n", 0o755)
 	caFile := filepath.Join(r.dir, "ca.crt")
 	r.write(caFile, "x\n", 0o644)
-	for withICU, want := range map[bool]string{false: "local-ci: uid 1234\n2.338.0 1", true: "local-ci: uid 1234\n2.338.0 unset"} {
+	for withICU, want := range map[bool]string{false: "local-ci: uid 1234 gid 2345\n2.338.0 1", true: "local-ci: uid 1234 gid 2345\n2.338.0 unset"} {
 		r.ldconfig(withICU)
 		cmd := r.cmd("", "--preflight")
 		cmd.Env = append(cmd.Env, "LOCAL_CI_CA_PATHS="+caFile)

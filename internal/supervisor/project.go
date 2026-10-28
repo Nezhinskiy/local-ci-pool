@@ -428,7 +428,7 @@ func (pr *project) start(ctx context.Context, name, jit string, need int) error 
 		Instance: pr.s.instance,
 		Project:  pr.identity,
 		Need:     need,
-		CPUs:     runner.CPUCap(need, pr.s.machine.FP.CPUs, pr.s.machine.Slots),
+		CPUs:     runner.CPUCap(need, pr.s.machine.FP.CPUs),
 		Mount:    m.Spec,
 		JIT:      jit,
 	})

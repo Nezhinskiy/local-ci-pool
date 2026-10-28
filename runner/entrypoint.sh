@@ -17,7 +17,7 @@
 # LOCAL_CI_MOUNT, LOCAL_CI_ROOT, LOCAL_CI_CA_PATHS and LOCAL_CI_PROC_STATUS
 # exist for the tests and are honoured only when LOCAL_CI_TEST_HOOKS=1 is also
 # set. A job image can set any ENV it likes, so without that sentinel an image-controlled variable could
-# redirect the runner root, fake a CA bundle or fake the uid.
+# redirect the runner root, fake a CA bundle or fake the uid and gid.
 
 set -eu
 
@@ -84,14 +84,19 @@ if has_icu; then
 fi
 
 if [ "$mode" = preflight ]; then
-	# The effective uid, for the pool to refuse root in whatever spelling the
-	# image's USER gave it (00, +0, a passwd name with uid 0). It is read from
-	# the kernel: bash takes $EUID from the environment, which the image sets.
-	while read -r key _ euid _; do
-		if [ "$key" = Uid: ]; then
-			echo "local-ci: uid $euid"
-		fi
+	# The effective uid and gid, for the pool to refuse root and group root in
+	# whatever spelling the image's USER gave them (00, +0, a passwd name with
+	# uid 0 or primary group 0). They are read from the kernel: bash takes
+	# $EUID from the environment, which the image sets.
+	euid=''
+	egid=''
+	while read -r key _ effective _; do
+		case "$key" in
+		Uid:) euid=$effective ;;
+		Gid:) egid=$effective ;;
+		esac
 	done <"$proc_status"
+	echo "local-ci: uid $euid gid $egid"
 	# A runner in an image with no CA bundle retries its TLS handshake forever
 	# while `--version` still passes, so the bundle is part of the check.
 	ca_ok=

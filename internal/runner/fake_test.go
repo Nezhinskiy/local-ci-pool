@@ -45,6 +45,8 @@ type fakeDocker struct {
 	networks       map[string]network.Inspect
 	networkCreates []client.NetworkCreateOptions
 	networkErr     error // every NetworkInspect fails with it
+	// networkCreateHook, when set, answers NetworkCreate instead.
+	networkCreateHook func(name string) error
 }
 
 func newFakeDocker() *fakeDocker {
@@ -54,7 +56,7 @@ func newFakeDocker() *fakeDocker {
 func (f *fakeDocker) NetworkInspect(_ context.Context, name string, _ client.NetworkInspectOptions) (client.NetworkInspectResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, "network-inspect")
+	f.calls = append(f.calls, "network-inspect:"+name)
 	if f.networkErr != nil {
 		return client.NetworkInspectResult{}, f.networkErr
 	}
@@ -70,6 +72,9 @@ func (f *fakeDocker) NetworkCreate(_ context.Context, name string, o client.Netw
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "network-create")
 	f.networkCreates = append(f.networkCreates, o)
+	if hook := f.networkCreateHook; hook != nil {
+		return client.NetworkCreateResult{}, hook(name)
+	}
 	if f.networks == nil {
 		f.networks = map[string]network.Inspect{}
 	}
