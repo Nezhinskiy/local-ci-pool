@@ -1,0 +1,60 @@
+# Benchmark workload: the same Go tests on three runner labels, to compare a
+# Mac served by local-ci-pool with GitHub-hosted runners.
+#
+# This is a template, not a workflow of this repository: it lives outside
+# .github/workflows so it never runs here. To use it, copy it into the
+# .github/workflows/ of a private repository your pool serves:
+#
+#   cp bench/bench.yml <your-repo>/.github/workflows/bench.yml
+#
+# and change `local-ci-pool-probe-local` in the matrix below to the runs-on
+# label your pool serves for that repository. Then dispatch it from the
+# Actions tab or with `gh workflow run bench.yml`, and read the timings with
+# scripts/bench-report.sh (see bench/README.md).
+#
+# There is no max-parallel on purpose: how long a job waits for a runner is
+# part of what the report measures. fail-fast is off so one label failing does
+# not cancel the others' repetitions.
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit of Nezhinskiy/local-ci-pool whose tests are timed
+        type: string
+        default: b1a51f5ff796b32928614e558129ad2efbb94688
+
+permissions: {}
+
+jobs:
+  bench:
+    name: bench (${{ matrix.label }}, ${{ matrix.rep }})
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        label: [local-ci-pool-probe-local, ubuntu-24.04-arm, ubuntu-24.04]
+        rep: [1, 2, 3, 4, 5]
+    steps:
+      # The repository is public, so no token is needed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Nezhinskiy/local-ci-pool
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Download modules
+        run: go mod download
+      # Compiles the test binaries and runs no test.
+      - name: Build
+        run: go test -run '^$' ./internal/supervisor/... ./internal/runner/... ./internal/budget/...
+      - name: Test
+        run: go test ./internal/supervisor/... ./internal/runner/... ./internal/budget/...
