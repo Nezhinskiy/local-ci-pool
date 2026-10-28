@@ -53,8 +53,9 @@ func (r *denyRepo) commit(name, body, msg string, env []string) {
 }
 
 // scan runs the CI deny-list script over the range (from, HEAD] and returns
-// its exit code and output.
-func (r *denyRepo) scan(from string) (int, string) {
+// its exit code and output. extraEnv entries (KEY=value) are added to the
+// script's environment.
+func (r *denyRepo) scan(from string, extraEnv ...string) (int, string) {
 	r.t.Helper()
 	script, err := filepath.Abs(filepath.Join("scripts", "deny-list.sh"))
 	if err != nil {
@@ -63,6 +64,7 @@ func (r *denyRepo) scan(from string) (int, string) {
 	cmd := exec.Command("bash", script)
 	cmd.Dir = r.dir
 	cmd.Env = append(os.Environ(), "DENYLIST="+testDenyList, "RANGE_FROM="+from, "RANGE_TO="+r.git(nil, "rev-parse", "HEAD"))
+	cmd.Env = append(cmd.Env, extraEnv...)
 	out, err := cmd.CombinedOutput()
 	code := 0
 	if ee, ok := err.(*exec.ExitError); ok {
@@ -130,5 +132,55 @@ func TestDenyListScanFailsClosedWithoutAList(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	if err == nil || !strings.Contains(string(out), "DENYLIST secret is empty") {
 		t.Fatalf("want a failure, got %v:\n%s", err, out)
+	}
+}
+
+// IDENTITY_EXEMPT lists full commit SHAs whose author and committer identity is
+// not matched; nothing else about them is exempt.
+func TestDenyListExemptsListedIdentities(t *testing.T) {
+	r := newDenyRepo(t)
+	base := r.git(nil, "rev-parse", "HEAD")
+	web := []string{"GIT_COMMITTER_NAME=hidden-handle"}
+	r.commit("a.txt", "fine\n", "add a", web)
+	listed := r.git(nil, "rev-parse", "HEAD")
+	if code, out := r.scan(base, "IDENTITY_EXEMPT="+listed); code != 0 {
+		t.Fatalf("exit %d for a listed commit, want 0:\n%s", code, out)
+	}
+	r.commit("b.txt", "fine\n", "add b", web)
+	unlisted := r.git(nil, "rev-parse", "HEAD")
+	code, out := r.scan(base, "IDENTITY_EXEMPT="+listed)
+	if code != 1 || !strings.Contains(out, "author or committer") {
+		t.Fatalf("exit %d, want 1 naming the identity check:\n%s", code, out)
+	}
+	if !strings.Contains(out, unlisted) || strings.Contains(out, listed) {
+		t.Fatalf("the output must name only the unlisted commit %s:\n%s", unlisted, out)
+	}
+}
+
+// The exemption covers the identity check only: the message is still scanned.
+func TestDenyListExemptionKeepsMessageCheck(t *testing.T) {
+	r := newDenyRepo(t)
+	base := r.git(nil, "rev-parse", "HEAD")
+	r.commit("a.txt", "fine\n", "fix for private-alpha", []string{"GIT_COMMITTER_NAME=hidden-handle"})
+	listed := r.git(nil, "rev-parse", "HEAD")
+	code, out := r.scan(base, "IDENTITY_EXEMPT="+listed)
+	if code != 1 || !strings.Contains(out, "commit messages match") {
+		t.Fatalf("exit %d, want 1 naming the message check:\n%s", code, out)
+	}
+	if strings.Contains(out, "author or committer") {
+		t.Fatalf("a listed commit's identity must not be reported:\n%s", out)
+	}
+}
+
+// An entry that is not a full SHA fails closed before anything is scanned.
+func TestDenyListRejectsMalformedExemption(t *testing.T) {
+	r := newDenyRepo(t)
+	base := r.git(nil, "rev-parse", "HEAD")
+	r.commit("a.txt", "fine\n", "add a", nil)
+	short := r.git(nil, "rev-parse", "--short=7", "HEAD")
+	code, out := r.scan(base, "IDENTITY_EXEMPT="+short)
+	want := "::error::IDENTITY_EXEMPT holds an entry that is not a full commit SHA; the scan cannot run"
+	if code != 2 || !strings.Contains(out, want) {
+		t.Fatalf("exit %d, want 2 with %q:\n%s", code, want, out)
 	}
 }

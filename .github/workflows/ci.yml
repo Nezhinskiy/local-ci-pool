@@ -73,4 +73,7 @@ jobs:
           DENYLIST: ${{ secrets.DENYLIST }}
           RANGE_FROM: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           RANGE_TO: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Merged with GitHub's web button, which recorded the account's identity
+          # as committer; the history is kept, and merges are fast-forward pushes now.
+          IDENTITY_EXEMPT: c27aab0233d4bfc5486ce78e8b84554ee3023027 a333bc9d43c43b0cfc239fc26814188e9978db7a
         run: bash scripts/deny-list.sh

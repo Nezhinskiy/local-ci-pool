@@ -9,6 +9,10 @@
 #   DENYLIST    one fixed string per line, matched case-insensitively
 #   RANGE_FROM  the commit before the push (empty or zeros: none)
 #   RANGE_TO    the pushed commit
+#   IDENTITY_EXEMPT  whitespace-separated full commit SHAs whose author and
+#               committer identity is not matched (two commits were merged with
+#               GitHub's web button, which recorded the account as committer);
+#               every other check still scans them
 #
 # It exits 0 when nothing matches, 1 when something does, and 2 when the scan
 # cannot be trusted (an empty list, a failing tool). Matched text is never
@@ -41,6 +45,16 @@ matches() {
       ;;
   esac
 }
+
+# Fail closed before any scanning: an exemption is a full SHA or nothing.
+exempt=" "
+for e in ${IDENTITY_EXEMPT:-}; do
+  if [[ ! "$e" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "::error::IDENTITY_EXEMPT holds an entry that is not a full commit SHA; the scan cannot run"
+    exit 2
+  fi
+  exempt+="$e "
+done
 
 bad=0
 
@@ -84,6 +98,9 @@ while read -r c; do
   git log -1 --format=%B "$c" > "$scratch/msg"
   if matches "$scratch/msg"; then
     message_hits+=("$c")
+  fi
+  if [[ "$exempt" == *" $c "* ]]; then
+    continue
   fi
   git log -1 --format='%an%n%ae%n%cn%n%ce' "$c" > "$scratch/who"
   if matches "$scratch/who"; then
