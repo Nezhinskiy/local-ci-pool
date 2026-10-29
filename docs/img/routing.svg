@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 300" width="800" height="300" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14">
+  <title>How route picks a runner: Macs write heartbeats into repository variables; a hosted route job reads them and picks the Mac's label or a hosted one</title>
+  <style>
+    .bg { fill: #ffffff; }
+    .box { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.5; }
+    .mac { fill: #ddf4ff; stroke: #54aeff; }
+    .gh { fill: #fff8c5; stroke: #d4a72c; }
+    .t { fill: #1f2328; }
+    .s { fill: #59636e; font-size: 12px; }
+    .code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; fill: #1f2328; }
+    .ln { stroke: #59636e; stroke-width: 1.5; fill: none; }
+    .ah { fill: #59636e; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .box { fill: #161b22; stroke: #3d444d; }
+      .mac { fill: #0c2d6b; stroke: #388bfd; }
+      .gh { fill: #3b2e00; stroke: #9e6a03; }
+      .t, .code { fill: #e6edf3; }
+      .s { fill: #9198a1; }
+      .ln { stroke: #9198a1; }
+      .ah { fill: #9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="ah" d="M0 0 L10 5 L0 10 z"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="800" height="300"/>
+
+  <rect class="box mac" x="20" y="30" width="200" height="80" rx="8"/>
+  <text class="t" x="120" y="62" text-anchor="middle" font-weight="600">Each Mac's pool</text>
+  <text class="s" x="120" y="84" text-anchor="middle">writes a heartbeat</text>
+  <text class="s" x="120" y="100" text-anchor="middle">every 2 minutes</text>
+
+  <rect class="box" x="300" y="30" width="200" height="80" rx="8"/>
+  <text class="t" x="400" y="62" text-anchor="middle" font-weight="600">Repository variables</text>
+  <text class="code" x="400" y="86" text-anchor="middle">CI_POOL_HB_&lt;MACHINE&gt;</text>
+  <text class="s" x="400" y="102" text-anchor="middle">no token in the repo</text>
+
+  <rect class="box gh" x="580" y="30" width="200" height="80" rx="8"/>
+  <text class="t" x="680" y="62" text-anchor="middle" font-weight="600">route job (hosted)</text>
+  <text class="code" x="680" y="86" text-anchor="middle">toJSON(vars)</text>
+  <text class="s" x="680" y="102" text-anchor="middle">a heartbeat ≤ 300 s old?</text>
+
+  <path class="ln" d="M220 70 H296" marker-end="url(#a)"/>
+  <path class="ln" d="M500 70 H576" marker-end="url(#a)"/>
+
+  <path class="ln" d="M640 110 V150 H230 V196" marker-end="url(#a)"/>
+  <text class="s" x="440" y="144" text-anchor="middle">yes</text>
+  <path class="ln" d="M720 110 V196" marker-end="url(#a)"/>
+  <text class="s" x="734" y="160">no</text>
+
+  <rect class="box mac" x="60" y="200" width="340" height="80" rx="8"/>
+  <text class="code" x="230" y="230" text-anchor="middle">runs-on: &lt;identity&gt;-local</text>
+  <text class="s" x="230" y="252" text-anchor="middle">a fresh container on a Mac, removed after the job</text>
+
+  <rect class="box gh" x="540" y="200" width="240" height="80" rx="8"/>
+  <text class="code" x="660" y="230" text-anchor="middle">runs-on: ubuntu-24.04-arm</text>
+  <text class="s" x="660" y="252" text-anchor="middle">GitHub's runner; the run says why</text>
+</svg>

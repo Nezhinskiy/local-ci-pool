@@ -4,6 +4,29 @@ The Macs you already own run your private repositories' GitHub Actions jobs, in 
 containers, while they are awake. When no Mac is awake, GitHub-hosted runners take over. The
 fallback needs no token stored in the repository.
 
+![Each Mac writes a heartbeat into a repository variable; a hosted route job reads it and sends the jobs to the Mac's label, or to a hosted label when no heartbeat is fresh](docs/img/routing.svg)
+
+## Why
+
+- **Past the plan's included usage, hosted minutes cost money; a Mac you already own does not.**
+  A private repository's jobs draw on the account's included Actions usage and are then billed by
+  the minute. Here the jobs run on your Macs, and GitHub's runners take only the jobs that arrive
+  while no Mac is serving.
+- **CI still runs when the Macs sleep, with no secret.** Each Mac writes a heartbeat into a
+  repository variable, and a `route` job reads it to choose the Mac's label or a hosted one. The
+  usual selector, runner-fallback-action, needs a token that can read the repository's runners,
+  and it cannot see a pool that scales to zero: it chose the hosted runner in every case we tried,
+  also while a Mac was free ([Compared with](#compared-with)).
+- **A job gets a throwaway container, not your Mac.** A plain self-hosted runner runs jobs as your
+  user, with your files and your Docker. Here each job runs in a fresh container that is removed
+  when it ends, as a non-root user, with no Docker socket and no host folders.
+  [SECURITY.md](SECURITY.md) lists what a job can still reach.
+
+It is for a developer with private repositories on a personal account and a Mac or two that are
+on most of the day. It is not built to be faster than GitHub's runners: in our one small benchmark
+a whole job took about as long on a Mac as on a hosted arm64 runner, or longer. Check
+[What does not work](#what-does-not-work) before you install.
+
 Read [SECURITY.md](SECURITY.md) before you install anything, and the [runbook](docs/runbook.md) for
 operations.
 
@@ -13,7 +36,8 @@ operations.
   `docker build` do not work, because a job container gets no Docker socket.
 - Linux jobs only, in the Mac's architecture: arm64 on Apple silicon.
 - Private repositories of a personal account only. A public repository is refused.
-- macOS only, with Docker Engine 28 or newer. Verified on Docker Desktop.
+- macOS only, with Docker Engine 28 or newer. Verified on Docker Desktop on Apple silicon. OrbStack,
+  Colima and Intel Macs (a `darwin_amd64` build is released) are untested.
 - The job runs in your marker image, not in GitHub's runner image, so the tools GitHub preinstalls
   are not there unless your image has them. The image must provide `bash`, glibc and a CA bundle
   (a bare `ubuntu:24.04` lacks `ca-certificates`).
@@ -27,8 +51,10 @@ operations.
 ## Quickstart
 
 1. Log in to GitHub with the account that owns the repositories, and start Docker (Engine 28 or
-   newer, which is Engine API 1.48, with at least 6 GB of memory and 2 CPUs for one
-   [slot](#slots)). The installer needs a `gh` that has `gh attestation` (2.49 or newer):
+   newer, which is Engine API 1.48). Give Docker at least 6 GB of memory and 2 CPUs, in Docker
+   Desktop under Settings → Resources: a Mac runs one job per [slot](#slots), and 8 GB with 4 CPUs
+   gives 1 slot, 16 GB with 8 CPUs gives 3. The installer needs a `gh` that has `gh attestation`
+   (2.49 or newer):
 
    ```sh
    gh auth login --scopes repo,workflow,read:org
@@ -37,15 +63,40 @@ operations.
    ```
 
    The pool's own calls need only `repo`. `workflow` lets this login push the workflow of step 3
-   over HTTPS, and `read:org` is part of every `gh` login.
+   over HTTPS, and `read:org` is part of every `gh` login. Already logged in? Add the missing scope
+   with `gh auth refresh --scopes workflow`.
 
 2. Opt a repository in: commit [the marker](#the-marker), `.github/local-ci.json`, to the default
    branch of a private repository that your account owns. The pool finds it when it starts, and a
-   marker committed later on its next discovery pass, within 10 minutes.
+   marker committed later on its next discovery pass, within 10 minutes. To start, let the pool
+   build a minimal image from the repository itself (the job runs in this image, not in GitHub's
+   runner image; add your toolchain to it later):
+
+   ```json
+   { "dockerfile": "ci/Dockerfile", "inputs": ["ci"] }
+   ```
+
+   ```dockerfile
+   # ci/Dockerfile
+   FROM ubuntu:24.04
+   RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+   ```
+
+   That image is enough for `actions/checkout` and `actions/setup-go`, which download what they
+   need. Pin `FROM` by digest once it works.
 
 3. Route a workflow through the [`route` action](#routing): the example there has a `route` job and
-   a `test` job that takes its `runs-on` from it. Until the pool is up, `route` falls back to the
-   hosted label, so committing this first is safe.
+   a `test` job that takes its `runs-on` from it. Put it in `.github/workflows/ci.yml` under
+   `name: ci` and `on: push`, and replace `<40-hex sha>` with the commit of the latest release:
+
+   ```sh
+   gh api "repos/Nezhinskiy/local-ci-pool/commits/$(gh release view --repo Nezhinskiy/local-ci-pool --json tagName --jq .tagName)" --jq .sha
+   ```
+
+   Until the pool is up, `route` falls back to the hosted label, so committing this first is safe.
+   The `route` job itself always runs on a hosted runner, and GitHub bills each hosted job by the
+   started minute, so every run costs at least one hosted minute.
 
 4. Install the pool. The installer downloads the latest release, verifies its build provenance, and
    starts a launchd agent. `./install.sh --dry-run` shows what it would do first.
@@ -64,7 +115,7 @@ operations.
    ```
 
    ```
-   pool v0.5.0 (8eda50a) on examplemacbo: docker ok, login ok, 7 slots, 0 in use
+   pool v0.6.0 (a4d3acb) on examplemacbo: docker ok, login ok, 3 slots, 0 in use
      alice/alpha  healthy
      alice/beta   healthy
    ```
@@ -75,9 +126,9 @@ operations.
 
    `pool status` exits 0 when the pool is up (whatever its projects' health), 1 when it answers 503
    (Docker down or `gh` login lost), and 3 when nothing answers. With `--json` it prints the
-   `/healthz` body as it is. When `test` ran on `alpha-local` and went green, the Mac ran your job;
-   when it ran on the hosted label, the `route` job says why (see
-   [When it falls back](#when-it-falls-back)).
+   `/healthz` body as it is. Open the run's `test` job: the "Set up job" step names the runner, which
+   is `local-ci-…` when a Mac ran it. When it ran on the hosted label instead, the `route` job says
+   why (see [When it falls back](#when-it-falls-back)).
 
 ## How it works
 
@@ -160,11 +211,10 @@ available to a private repository of a personal account on 2026-10-28. Where you
 arm runners, or your Mac is an Intel one, pass `hosted-label: ubuntu-24.04` instead.
 
 Pin the action by its full commit SHA; Renovate's `github-actions` manager keeps it current. Take the
-SHA of the latest release (v0.4.0 or later has `local-label` and the annotations below), in your
-clone of this repository:
+SHA of the latest release (v0.4.0 or later has `local-label` and the annotations below):
 
 ```sh
-git rev-parse "$(gh release view --repo Nezhinskiy/local-ci-pool --json tagName --jq .tagName)^{commit}"
+gh api "repos/Nezhinskiy/local-ci-pool/commits/$(gh release view --repo Nezhinskiy/local-ci-pool --json tagName --jq .tagName)" --jq .sha
 ```
 
 | Input | Meaning |
@@ -250,9 +300,10 @@ is the example from the script's header, which also has the cron form:
 ```
 
 Keep that plist private (`chmod 600`): the token is in it. `heartbeat.sh` refuses a public repository
-(exit 2), as the pool does, because a pull request from a fork would run on your machine. The check
-is the repository's visibility, not its owner, so a private repository owned by an organization is
-served.
+(exit 2), as the pool does, because a pull request from a fork would run on your machine. Unlike the
+pool, the script checks only the repository's visibility, not its owner, so it also publishes
+heartbeats for a private repository owned by an organization. The pool itself serves only your
+personal account's repositories.
 
 ## Compared with
 
