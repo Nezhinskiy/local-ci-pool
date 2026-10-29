@@ -18,10 +18,10 @@ import (
 func TestDocsQuoteStatusOutput(t *testing.T) {
 	base := func() supervisor.Snapshot {
 		return supervisor.Snapshot{
-			Version: "v0.5.0",
-			Commit:  "8eda50a",
+			Version: "v0.6.0",
+			Commit:  "a4d3acb",
 			Machine: "examplemacbo",
-			Slots:   7,
+			Slots:   3,
 			Docker:  true,
 			Login:   true,
 			Budget:  budget.State{State: "off"},
