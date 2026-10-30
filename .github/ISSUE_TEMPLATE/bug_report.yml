@@ -1,0 +1,67 @@
+name: Bug report
+description: The pool does not install, does not serve a repository, or a job does not run where you expect.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue is public. `pool status` names your Mac (`on <machine>`) and the private
+        repositories your pool serves, and `pool status --json` also carries their build output
+        and image references. Before you paste anything, replace the machine name with `mac-1`
+        and each repository name with `owner/repo1`, `owner/repo2`, …, and do not paste the
+        `--json` output.
+
+        A security problem goes through private reporting instead (the Security tab, "Report a
+        vulnerability"), not a public issue. The [runbook](https://github.com/Nezhinskiy/local-ci-pool/blob/main/docs/runbook.md)
+        covers "CI went hosted" and "A repository is not served".
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      placeholder: Installed with ./install.sh; the test job still runs on ubuntu-24.04-arm.
+    validations:
+      required: true
+  - type: input
+    id: pool
+    attributes:
+      label: Pool version
+      description: '`"$HOME/Library/Application Support/local-ci-pool/bin/pool" version`'
+      placeholder: v0.6.0 a4d3acb
+    validations:
+      required: true
+  - type: input
+    id: mac
+    attributes:
+      label: macOS version and chip
+      description: '`sw_vers -productVersion; uname -m`'
+      placeholder: 15.4, arm64
+    validations:
+      required: true
+  - type: input
+    id: docker
+    attributes:
+      label: Docker runtime and version
+      description: '`docker version --format "{{.Server.Version}} (API {{.Server.APIVersion}})"`, and which runtime (Docker Desktop, OrbStack, Colima)'
+      placeholder: Docker Desktop, 29.0.1 (API 1.52)
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `pool status`, with the machine and repository names replaced
+      description: '`"$HOME/Library/Application Support/local-ci-pool/bin/pool" status; echo "exit $?"`'
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: route
+    attributes:
+      label: What the `route` job said
+      description: The annotation on the run's `route` job, if it fell back to a hosted label. Leave empty if the job never ran.
+      render: text
+  - type: textarea
+    id: log
+    attributes:
+      label: Pool log lines around the problem (optional)
+      description: From `~/Library/Logs/local-ci-pool/pool.log`. Replace repository names, the machine name and the heartbeat variable name (`CI_POOL_HB_<MACHINE>`) before you paste.
+      render: text
