@@ -1,8 +1,8 @@
 # local-ci-pool
 
-The Macs you already own run your private repositories' GitHub Actions jobs, in ephemeral Docker
-containers, while they are awake. When no Mac is awake, GitHub-hosted runners take over. The
-fallback needs no token stored in the repository.
+A pool of ephemeral GitHub Actions runners on the Macs you already own, for private repositories
+on a personal account. A Mac runs each job in a throwaway Docker container while it is awake; when no
+Mac is awake, GitHub-hosted runners take the job, with no token stored in the repository.
 
 ![Each Mac writes a heartbeat into a repository variable; a hosted route job reads it and sends the jobs to the Mac's label, or to a hosted label when no heartbeat is fresh](docs/img/routing.svg)
 
@@ -27,8 +27,17 @@ on most of the day. It is not built to be faster than GitHub's runners: in our o
 a whole job took about as long on a Mac as on a hosted arm64 runner, or longer. Check
 [What does not work](#what-does-not-work) before you install.
 
-Read [SECURITY.md](SECURITY.md) before you install anything, and the [runbook](docs/runbook.md) for
-operations.
+## Requirements
+
+| What | Needs | Check |
+|---|---|---|
+| Mac | macOS, awake and logged in (the pool is a per-user launchd agent). Tested on macOS 27 only (the runbook measured 27.0.1); no older release has been tried. Apple silicon is verified; an Intel build (`darwin_amd64`) is released but untested | `sw_vers -productVersion` |
+| Docker | Engine 28 or newer, which is Engine API 1.48 (the runner is mounted as an image). Docker Desktop is the verified one; OrbStack and Colima are untested. Give it at least 6 GB of memory and 2 CPUs for one [slot](#slots) | `docker version --format '{{.Server.Version}} (API {{.Server.APIVersion}})'` |
+| `gh` | 2.49 or newer (the installer verifies the release with `gh attestation`), logged in as the account that owns the repositories. The pool's own calls need the `repo` scope; `workflow` lets the same login push the workflow of the Quick Start over HTTPS; `read:org` is part of every `gh` login | `gh auth status` |
+| Repository | private, owned by your personal account, with a [marker](#the-marker) on its default branch. Public and organization-owned repositories are not served | `gh repo view OWNER/NAME --json visibility,owner` |
+| Job image | `bash`, glibc, a CA bundle, and a user that is not root (see [the image](#2-mark-a-repository)). A bare `ubuntu:24.04` has no CA bundle | the pool's preflight |
+| Disk and network | the first start downloads the actions/runner release (about 190 MB) and pulls or builds your image | |
+| Only for [another runner's heartbeat](#use-the-routing-with-another-runner) | a fine-grained personal access token limited to that one repository, with *Variables: read and write*. The pool itself needs no token of its own: it uses your `gh` login | |
 
 ## What does not work
 
@@ -36,11 +45,8 @@ operations.
   `docker build` do not work, because a job container gets no Docker socket.
 - Linux jobs only, in the Mac's architecture: arm64 on Apple silicon.
 - Private repositories of a personal account only. A public repository is refused.
-- macOS only, with Docker Engine 28 or newer. Verified on Docker Desktop on Apple silicon. OrbStack,
-  Colima and Intel Macs (a `darwin_amd64` build is released) are untested.
 - The job runs in your marker image, not in GitHub's runner image, so the tools GitHub preinstalls
-  are not there unless your image has them. The image must provide `bash`, glibc and a CA bundle
-  (a bare `ubuntu:24.04` lacks `ca-certificates`).
+  are not there unless your image has them.
 - A job runs as a non-root user outside group root (the image's own non-root `USER`, otherwise
   `1001:1001`) under a 4 GiB memory limit and a 4096-process limit, and with the core budget on, a
   CPU cap at its grant. Install what the job needs in the image, not with `sudo apt-get` in a step.
@@ -48,87 +54,199 @@ operations.
   with traffic between containers turned off.
 - A Mac must be awake and logged in.
 
-## Quickstart
+## Quick Start
 
-1. Log in to GitHub with the account that owns the repositories, and start Docker (Engine 28 or
-   newer, which is Engine API 1.48). Give Docker at least 6 GB of memory and 2 CPUs, in Docker
-   Desktop under Settings → Resources: a Mac runs one job per [slot](#slots), and 8 GB with 4 CPUs
-   gives 1 slot, 16 GB with 8 CPUs gives 3. The installer needs a `gh` that has `gh attestation`
-   (2.49 or newer):
+Five steps. Each says what you should see and where to look when you do not. The steps take a few
+minutes of your own time; the first start of the pool then downloads the runner and builds the image
+in the background, which takes longer. `gh` and Docker are not installed by this project:
+`brew install gh` installs `gh`, and Docker Desktop comes from docker.com.
 
-   ```sh
-   gh auth login --scopes repo,workflow,read:org
-   gh --version
-   docker version --format '{{.Server.Version}} (API {{.Server.APIVersion}})'
-   ```
+### 1. Check the tools
 
-   The pool's own calls need only `repo`. `workflow` lets this login push the workflow of step 3
-   over HTTPS, and `read:org` is part of every `gh` login. Already logged in? Add the missing scope
-   with `gh auth refresh --scopes workflow`.
+```sh
+gh auth login --scopes repo,workflow,read:org
+gh auth status
+docker version --format '{{.Server.Version}} (API {{.Server.APIVersion}})'
+```
 
-2. Opt a repository in: commit [the marker](#the-marker), `.github/local-ci.json`, to the default
-   branch of a private repository that your account owns. The pool finds it when it starts, and a
-   marker committed later on its next discovery pass, within 10 minutes. To start, let the pool
-   build a minimal image from the repository itself (the job runs in this image, not in GitHub's
-   runner image; add your toolchain to it later):
+Already logged in? Skip the first line, or add the missing scope with
+`gh auth refresh --scopes workflow`.
 
-   ```json
-   { "dockerfile": "ci/Dockerfile", "inputs": ["ci"] }
-   ```
+You should see, from `gh auth status`, a `Logged in to github.com account …` line whose token scopes
+include `repo`; and from `docker`, a version such as `29.9.2 (API 1.56)`, where the API is 1.48 or
+higher. Set Docker's memory and CPUs in Docker Desktop under Settings → Resources: a Mac runs one
+job per [slot](#slots), and 8 GB with 4 CPUs gives 1 slot, 16 GB with 8 CPUs gives 3.
 
-   ```dockerfile
-   # ci/Dockerfile
-   FROM ubuntu:24.04
-   RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-   ```
+If it fails: the installer in step 4 names the same checks and says what to change; see
+[Install](docs/runbook.md#install).
 
-   That image is enough for `actions/checkout` and `actions/setup-go`, which download what they
-   need. Pin `FROM` by digest once it works.
+### 2. Mark a repository
 
-3. Route a workflow through the [`route` action](#routing): the example there has a `route` job and
-   a `test` job that takes its `runs-on` from it. Put it in `.github/workflows/ci.yml` under
-   `name: ci` and `on: push`, and replace `<40-hex sha>` with the commit of the latest release:
+Opt a private repository that your account owns in by committing [the marker](#the-marker),
+`.github/local-ci.json`, to its default branch. (For a trial: `gh repo create alpha --private
+--clone`.) The job runs in the image the marker names, not in GitHub's runner image. To start, let
+the pool build a minimal one from the repository itself:
 
-   ```sh
-   gh api "repos/Nezhinskiy/local-ci-pool/commits/$(gh release view --repo Nezhinskiy/local-ci-pool --json tagName --jq .tagName)" --jq .sha
-   ```
+```json
+{ "dockerfile": "ci/Dockerfile", "inputs": ["ci"] }
+```
 
-   Until the pool is up, `route` falls back to the hosted label, so committing this first is safe.
-   The `route` job itself always runs on a hosted runner, and GitHub bills each hosted job by the
-   started minute, so every run costs at least one hosted minute.
+```dockerfile
+# ci/Dockerfile
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+```
 
-4. Install the pool. The installer downloads the latest release, verifies its build provenance, and
-   starts a launchd agent. `./install.sh --dry-run` shows what it would do first.
+The pool needs three things from any job image, and this one has them:
 
-   ```sh
-   gh repo clone Nezhinskiy/local-ci-pool && cd local-ci-pool
-   ./install.sh
-   ```
+- `bash`: the pool's entrypoint is a bash script.
+- glibc and a CA bundle, at `/etc/ssl/certs/ca-certificates.crt` or `/etc/pki/tls/certs/ca-bundle.crt`
+  and not empty: without one the runner retries its TLS handshake forever, so the preflight refuses
+  the image (`local-ci: image has no CA bundle`). A bare `ubuntu:24.04` fails that way.
+- A user that is not root. Without a non-root `USER` in the Dockerfile the job runs as `1001:1001`.
 
-5. Wait until the project is healthy, then push a commit to trigger the workflow and check the run.
-   The first start downloads the runner and pulls or builds your image, so the project reads
-   `unhealthy: starting` for a while. The installed binary is not on your `PATH`:
+The pool mounts the runner at `/opt/local-ci` and starts its own entrypoint there, so the image needs
+no runner and no `ENTRYPOINT`. The image has no toolchain and no `git`; add what your jobs need to
+the Dockerfile, and pin `FROM` by digest once it works. The marker can also name a prebuilt image
+pinned by digest ([below](#the-marker)).
 
-   ```sh
-   "$HOME/Library/Application Support/local-ci-pool/bin/pool" status
-   ```
+You should see the file on the default branch, and nothing from the pool yet:
 
-   ```
-   pool v0.6.0 (a4d3acb) on examplemacbo: docker ok, login ok, 3 slots, 0 in use
-     alice/alpha  healthy
-     alice/beta   healthy
-   ```
+```sh
+gh api repos/OWNER/NAME/contents/.github/local-ci.json --jq .path
+```
 
-   A healthy project gets its heartbeat within two minutes: `gh variable list --repo OWNER/NAME`
-   shows `CI_POOL_HB_<MACHINE>`. A repository missing from the list is not served; see
-   [A repository is not served](docs/runbook.md#a-repository-is-not-served).
+```
+.github/local-ci.json
+```
 
-   `pool status` exits 0 when the pool is up (whatever its projects' health), 1 when it answers 503
-   (Docker down or `gh` login lost), and 3 when nothing answers. With `--json` it prints the
-   `/healthz` body as it is. Open the run's `test` job: the "Set up job" step names the runner, which
-   is `local-ci-…` when a Mac ran it. When it ran on the hosted label instead, the `route` job says
-   why (see [When it falls back](#when-it-falls-back)).
+If it fails: the marker is read when the pool starts and then on every discovery pass, within 10
+minutes. A repository that never shows up in step 5 is explained in
+[A repository is not served](docs/runbook.md#a-repository-is-not-served), and the image's
+failures in [Opting a project in or out](docs/runbook.md#opting-a-project-in-or-out).
+
+### 3. Route a workflow
+
+Put this in `.github/workflows/ci.yml` of the same repository, with `identity` set to the repository
+name reduced to `[a-z0-9-]` ([how](#the-marker)), and `<40-hex sha>` replaced by the commit of the
+latest release:
+
+```sh
+gh api "repos/Nezhinskiy/local-ci-pool/commits/$(gh release view --repo Nezhinskiy/local-ci-pool --json tagName --jq .tagName)" --jq .sha
+```
+
+```yaml
+name: ci
+on: push
+jobs:
+  route:
+    runs-on: ubuntu-24.04
+    outputs:
+      label: ${{ steps.route.outputs.label }}
+    steps:
+      - id: route
+        uses: Nezhinskiy/local-ci-pool/route@<40-hex sha>
+        with:
+          vars-json: ${{ toJSON(vars) }}
+          identity: alpha
+          hosted-label: ubuntu-24.04-arm
+          hosted-shards: 1
+  test:
+    needs: route
+    runs-on: ${{ needs.route.outputs.label }}
+    steps:
+      - run: echo "runner $RUNNER_NAME on $(uname -m)"
+```
+
+Until the pool is up, `route` falls back to the hosted label, so committing this first is safe: the
+run goes green on a hosted runner. The `route` job itself always runs on a hosted runner, and
+GitHub bills each hosted job by the started minute, so every run costs at least one hosted minute.
+Where your account has no arm runners, or your Mac is an Intel one, use `hosted-label: ubuntu-24.04`
+(see [Routing](#routing)).
+
+You should see, after a push, a green run whose `route` job ends with the notice
+`no Mac heartbeat found; running on ubuntu-24.04-arm` and whose `test` job ran on a GitHub-hosted
+runner.
+
+If it fails: the push of a workflow file over HTTPS needs the `workflow` scope (step 1), and a typo
+in the SHA or the inputs fails the `route` job in the "Set up job" step.
+
+### 4. Install the pool
+
+The installer downloads the latest release, verifies its build provenance with `gh attestation`, and
+starts a launchd agent. `./install.sh --dry-run` shows what it would do first.
+
+```sh
+gh repo clone Nezhinskiy/local-ci-pool && cd local-ci-pool
+./install.sh
+```
+
+You should see, among its lines, your machine and slots, the verified release, and the pool
+answering (the version is the latest release; the machine name is your `LocalHostName`, lower-cased
+and cut to its letters and digits, at most 12):
+
+```
+machine: examplemacbo (3 slots; heartbeat variable CI_POOL_HB_EXAMPLEMACBO)
+downloading v0.6.0 for darwin_arm64
+verifying the build provenance of …
+release: v0.6.0 a4d3acb
+…
+the pool v0.6.0 answers on http://127.0.0.1:8737/healthz
+```
+
+If it fails, it says why, and the checks run before it replaces anything: `gh is not logged in`,
+`Docker Engine API … is older than 1.48`, too little Docker memory for one slot, or `the attestation
+… did not verify; nothing was installed`. See [Install](docs/runbook.md#install). A pool that has not
+answered within a minute is only reported: the first start downloads the runner. The installed
+binary is not on your `PATH`, and the pool does not run in your shell; it logs to
+`~/Library/Logs/local-ci-pool/pool.log`.
+
+### 5. Check the pool and run a job
+
+```sh
+"$HOME/Library/Application Support/local-ci-pool/bin/pool" status
+```
+
+While the runner and your image are being fetched or built, the project is not healthy yet:
+
+```
+pool v0.6.0 (a4d3acb) on examplemacbo: docker ok, login ok, 3 slots, 0 in use
+  alice/alpha  unhealthy: starting
+```
+
+Run it again until the project reads `healthy`:
+
+```
+pool v0.6.0 (a4d3acb) on examplemacbo: docker ok, login ok, 3 slots, 0 in use
+  alice/alpha  healthy
+  alice/beta   healthy
+```
+
+A healthy project gets its heartbeat within two minutes: `gh variable list --repo OWNER/NAME`
+shows `CI_POOL_HB_<MACHINE>` (here `CI_POOL_HB_EXAMPLEMACBO`). Then push a commit and open the
+run's `test` job. The "Set up job" step names the runner, and the step prints it too: it reads
+`runner local-ci-… on aarch64` when a Mac ran the job.
+
+`pool status` exits 0 when the pool is up (whatever its projects' health), 1 when it answers 503
+(Docker down or `gh` login lost), and 3 when nothing answers; with `--json` it prints the
+`/healthz` body as it is.
+
+If it fails:
+
+- `pool: not running (nothing answers …)`, exit 3: the agent is not loaded. Run
+  `launchctl print gui/$(id -u)/com.local-ci-pool.pool` and read `pool.log`; see
+  [Health and logs](docs/runbook.md#health-and-logs).
+- Your repository is missing from the list: [A repository is not served](docs/runbook.md#a-repository-is-not-served).
+- The project stays `unhealthy` with a reason (`image`, `preflight`, …): the reason is in the status
+  line; see [Opting a project in or out](docs/runbook.md#opting-a-project-in-or-out).
+- The `test` job ran on the hosted label: the `route` job's annotation says why, and
+  [When it falls back](#when-it-falls-back) and [CI went hosted](docs/runbook.md#ci-went-hosted)
+  walk through it.
+- The job sits queued: [A job stays queued on a free pool](docs/runbook.md#a-job-stays-queued-on-a-free-pool).
+
+To remove everything the installer placed, run `./install.sh --uninstall` (see
+[Uninstall](docs/runbook.md#uninstall)).
 
 ## How it works
 
@@ -168,6 +286,7 @@ slots = min(floor((round(MemTotal / 2^30) - 2) / 4), floor(NCPU / 2), 8)
 `MemTotal` and `NCPU` come from `docker info`. The memory term rounds to the nearest GiB because the
 Docker Desktop VM reports slightly less than its slider value. The pool refuses to start when
 `slots` is below 1.
+
 
 ## Routing
 
@@ -305,6 +424,30 @@ pool, the script checks only the repository's visibility, not its owner, so it a
 heartbeats for a private repository owned by an organization. The pool itself serves only your
 personal account's repositories.
 
+
+## Security model
+
+The pool serves private repositories that you own and trust. It is not a sandbox for untrusted
+code: everything a job runs is code from those repositories. In short:
+
+- The pool holds your `gh` login. It reads the token with `gh auth token` when it needs it and never
+  writes it to disk, logs it or passes it to a container. A job sees only the `GITHUB_TOKEN` its
+  workflow grants it.
+- A job container mounts only the read-only runner, with no host folders and no Docker socket. It
+  runs as a non-root user outside group root, with `--init`, a 4 GiB memory limit and a limit of 4096
+  processes, and is removed after its job.
+- A public repository is refused. Before each runner starts, the pool needs GitHub's answer, at most a
+  minute old, that the repository is private; a failed check is a refusal.
+- Release binaries are built by this repository's CI and carry build provenance, which the installer
+  verifies before it places anything.
+- What a job can still reach: services bound to `127.0.0.1` on the Mac (through Docker Desktop's host
+  gateway), your LAN and the internet; it can fill the Docker VM's disk, because there is no disk cap.
+  Anyone with write access to a repository can set its heartbeat variables and so steer the routing
+  (for example, queue jobs for a Mac that is not there); they can already edit its workflows.
+
+[SECURITY.md](SECURITY.md) has the threat model, each residual risk and how to report a
+vulnerability.
+
 ## Compared with
 
 What the neighbouring projects document, read on 2026-10-28. `unverified` means the project's
@@ -332,6 +475,7 @@ hosted runner in all three cases:
 
 Each time a Mac could take the job, and `route` sent it there. The runners API lists a scale-set
 runner with no labels, so a label check cannot match it.
+
 
 ## Core budget (optional)
 
@@ -366,9 +510,22 @@ budget off, set `enabled = false` or delete the file. The runbook covers
 [the settings](docs/runbook.md#the-budget-settings) in full and [what to do when CI
 waits](docs/runbook.md#ci-is-waiting).
 
-## Development
+
+## Status
+
+The latest release is the one `install.sh` installs, and `pool version` prints it; v0.6.0 at the time
+of writing. A release has `darwin_arm64` and `darwin_amd64` archives, their checksums and build
+provenance. Of those, only Apple silicon with Docker Desktop on macOS 27 has run the pool; the other
+combinations are untested ([Requirements](#requirements)).
 
 Supported upstream: `actions/scaleset v0.5.0`, pinned exactly.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The code that adapts `actions/scaleset` is credited in
-[third_party/NOTICE](third_party/NOTICE). This project is released under the [MIT License](LICENSE).
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the tests, the checks CI runs and the rules that keep this
+public repository free of private names. Report a vulnerability as [SECURITY.md](SECURITY.md#reporting)
+describes. The code that adapts `actions/scaleset` is credited in [third_party/NOTICE](third_party/NOTICE).
+
+## License
+
+[MIT](LICENSE).
