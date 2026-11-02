@@ -33,6 +33,10 @@ func TestDocsQuoteStatusOutput(t *testing.T) {
 	}
 	quickstart := base()
 
+	starting := base()
+	starting.Projects = starting.Projects[:1]
+	starting.Projects[0] = supervisor.ProjectHealth{Repo: "alice/alpha", Reason: "starting", Class: "starting"}
+
 	hosted := base()
 	hosted.Budget = budget.State{State: "on"}
 	hosted.Projects[1] = supervisor.ProjectHealth{
@@ -50,16 +54,17 @@ func TestDocsQuoteStatusOutput(t *testing.T) {
 		snap supervisor.Snapshot
 	}{
 		{"README.md", quickstart},
+		{"README.md", starting},
 		{filepath.Join("docs", "runbook.md"), hosted},
 	} {
 		doc, err := os.ReadFile(filepath.Join("..", "..", c.file))
 		if err != nil {
 			t.Fatal(err)
 		}
-		// The docs indent the block inside a list item; compare line by
-		// line with that indent removed.
+		// A block inside a list item is indented with the item; compare
+		// with that indent removed too.
 		want := formatStatus(c.snap)
-		if !strings.Contains(dedent(string(doc)), want) {
+		if !strings.Contains(string(doc), want) && !strings.Contains(dedent(string(doc)), want) {
 			t.Errorf("%s does not quote what pool status prints:\n%s", c.file, want)
 		}
 	}
