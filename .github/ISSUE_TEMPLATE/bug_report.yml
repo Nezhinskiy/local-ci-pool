@@ -6,10 +6,11 @@ body:
     attributes:
       value: |
         This issue is public. `pool status` names your Mac (`on <machine>`) and the private
-        repositories your pool serves, and `pool status --json` also carries their build output
-        and image references. Before you paste anything, replace the machine name with `mac-1`
-        and each repository name with `owner/repo1`, `owner/repo2`, …, and do not paste the
-        `--json` output.
+        repositories your pool serves, and the reason under an unhealthy one can quote image names
+        and build or preflight output. `pool status --json` adds every project's image reference.
+        Before you paste anything, replace the machine name with `mac-1` and each repository name
+        with `owner/repo1`, `owner/repo2`, …, remove image names and anything else private from
+        the reasons, and do not paste the `--json` output.
 
         A security problem goes through private reporting instead (the Security tab, "Report a
         vulnerability"), not a public issue. The [runbook](https://github.com/Nezhinskiy/local-ci-pool/blob/main/docs/runbook.md)
@@ -25,7 +26,7 @@ body:
     id: pool
     attributes:
       label: Pool version
-      description: '`"$HOME/Library/Application Support/local-ci-pool/bin/pool" version`'
+      description: '`"$HOME/Library/Application Support/local-ci-pool/bin/pool" version`, or "not installed" when the installer failed'
       placeholder: v0.6.0 a4d3acb
     validations:
       required: true
@@ -49,7 +50,7 @@ body:
     id: status
     attributes:
       label: Output of `pool status`, with the machine and repository names replaced
-      description: '`"$HOME/Library/Application Support/local-ci-pool/bin/pool" status; echo "exit $?"`'
+      description: '`"$HOME/Library/Application Support/local-ci-pool/bin/pool" status; echo "exit $?"`, or "not installed" when the installer failed'
       render: text
     validations:
       required: true
