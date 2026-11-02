@@ -450,8 +450,9 @@ vulnerability.
 
 ## Compared with
 
-What the neighbouring projects document, read on 2026-10-28. `unverified` means the project's
-documentation did not settle it.
+What the neighbouring projects document, read on 2026-10-28 (ARC and RunsOn on 2026-11-02).
+`unverified` means the project's documentation did not settle it; `none documented` means the
+pages we read describe no built-in fallback to GitHub-hosted runners.
 
 | Project | Host | Ephemeral | Hosted fallback | Secret needed for fallback | Personal accounts |
 |---|---|---|---|---|---|
@@ -462,7 +463,8 @@ documentation did not settle it.
 | [omniaura/mac-runner](https://github.com/omniaura/mac-runner) | macOS 13+ | no (persistent native runners) | via runner-fallback-action | fine-grained PAT, *Administration: Read-only* | repository or organization |
 | [Tartelet](https://github.com/framna-dk/tartelet) | macOS (Tart VMs) | unverified | unverified | unverified | unverified |
 | [runner-fallback-action](https://github.com/mikehardy/runner-fallback-action) | a selector, not a runner: lists the registered self-hosted runners through the REST API | n/a | yes, but with a scale-set pool it chose the hosted runner every time we tried, also while a Mac was free (tested, see below) | PAT, *Administration: Read* (repository) or organization admin | yes |
-| [ARC](https://github.com/actions/actions-runner-controller) | Kubernetes | unverified | unverified | unverified | unverified |
+| [ARC](https://github.com/actions/actions-runner-controller) (runner scale sets) | Kubernetes; runner pods scale to 0 | yes, as documented ("can be ephemeral") | none documented | n/a | unverified: the docs name repository, organization and enterprise levels |
+| [RunsOn](https://runs-on.com/docs/) | your own AWS account; a fresh EC2 runner per job | yes | none documented | n/a | unverified: the Flex setup mentions a personal account but its steps are about an organization; Fleet is organization or enterprise |
 | [rhobuild/runpool](https://github.com/rhobuild/runpool) | Linux, rootful Docker Engine 28 | yes (a capsule per job with an inner dockerd) | unverified | unverified | unverified |
 
 The runner-fallback-action row was tested on 2026-10-28 against this pool. The action was at commit
