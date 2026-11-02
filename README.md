@@ -121,7 +121,7 @@ git push
 gh api repos/OWNER/NAME/contents/.github/local-ci.json --jq .path
 ```
 
-You should see the file on the default branch, and nothing from the pool yet:
+You should see the file on the default branch:
 
 ```
 .github/local-ci.json
