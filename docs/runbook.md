@@ -28,7 +28,8 @@ holds your `gh` login and runs the code of your private repositories.
 
 ## Install
 
-Requirements: macOS; Docker Engine 28 or newer (verified on Docker Desktop) with at least 6 GB of
+Requirements (the README's [table](../README.md#requirements) has the checks): macOS, tested on 27 only;
+Docker Engine 28 or newer (verified on Docker Desktop) with at least 6 GB of
 memory and 2 CPUs; `gh` 2.49 or newer (the installer verifies the release with `gh attestation`),
 logged in as the account that owns the repositories. The runner is mounted into job containers as
 an image, which needs Engine API 1.48 (Docker 28): the installer refuses an older engine and says
