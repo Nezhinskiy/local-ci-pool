@@ -6,6 +6,10 @@ Mac is awake, GitHub-hosted runners take the job, with no token stored in the re
 
 ![Each Mac writes a heartbeat into a repository variable; a hosted route job reads it and sends the jobs to the Mac's label, or to a hosted label when no heartbeat is fresh](docs/img/routing.svg)
 
+![pool status, then route: a Mac with a fresh heartbeat gets the job, a sleeping one falls back to hosted](docs/demo/demo.gif)
+
+*Recorded against fixtures with the real `pool` and `route.sh`; see [docs/demo](docs/demo).*
+
 ## Why
 
 - **Past the plan's included usage, hosted minutes cost money; a Mac you already own does not.**
