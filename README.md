@@ -11,20 +11,20 @@ Mac is awake, GitHub-hosted runners take the job, with no token stored in the re
 - **Past the plan's included usage, hosted minutes cost money; a Mac you already own does not.**
   A private repository's jobs draw on the account's included Actions usage and are then billed by
   the minute. Here the jobs run on your Macs, and GitHub's runners take only the jobs that arrive
-  while no Mac is serving.
+  while no Mac is serving, plus the short `route` job of every run.
 - **CI still runs when the Macs sleep, with no secret.** Each Mac writes a heartbeat into a
   repository variable, and a `route` job reads it to choose the Mac's label or a hosted one. The
   usual selector, runner-fallback-action, needs a token that can read the repository's runners,
-  and it cannot see a pool that scales to zero: it chose the hosted runner in every case we tried,
-  also while a Mac was free ([Compared with](#compared-with)).
+  and it cannot see a pool that scales to zero: it chose the hosted runner in all three cases we
+  tried, also while a Mac was free ([Compared with](#compared-with)).
 - **A job gets a throwaway container, not your Mac.** A plain self-hosted runner runs jobs as your
   user, with your files and your Docker. Here each job runs in a fresh container that is removed
   when it ends, as a non-root user, with no Docker socket and no host folders.
   [SECURITY.md](SECURITY.md) lists what a job can still reach.
 
 It is for a developer with private repositories on a personal account and a Mac or two that are
-on most of the day. It is not built to be faster than GitHub's runners: in our one small benchmark
-a whole job took about as long on a Mac as on a hosted arm64 runner, or longer. Check
+on most of the day. It is not built to be faster than GitHub's runners, and nothing here claims it
+is; [bench/](bench/README.md) is a harness to measure your own jobs. Check
 [What does not work](#what-does-not-work) before you install.
 
 ## Requirements
@@ -33,7 +33,7 @@ a whole job took about as long on a Mac as on a hosted arm64 runner, or longer. 
 |---|---|---|
 | Mac | macOS, awake and logged in (the pool is a per-user launchd agent). Tested on macOS 27 only (the runbook measured 27.0.1); no older release has been tried. Apple silicon is verified; an Intel build (`darwin_amd64`) is released but untested | `sw_vers -productVersion` |
 | Docker | Engine 28 or newer, which is Engine API 1.48 (the runner is mounted as an image). Docker Desktop is the verified one; OrbStack and Colima are untested. Give it at least 6 GB of memory and 2 CPUs for one [slot](#slots) | `docker version --format '{{.Server.Version}} (API {{.Server.APIVersion}})'` |
-| `gh` | 2.49 or newer (the installer verifies the release with `gh attestation`), logged in as the account that owns the repositories. The pool's own calls need the `repo` scope; `workflow` lets the same login push the workflow of the Quick Start over HTTPS; `read:org` is part of every `gh` login | `gh auth status` |
+| `gh` | 2.68 or newer (the installer verifies the release with `gh attestation verify --source-ref`, which 2.68 introduced), logged in as the account that owns the repositories. The pool's own calls need the `repo` scope; `workflow` lets the same login push the workflow of the Quick Start over HTTPS; `read:org` is part of every `gh` login | `gh auth status` |
 | Repository | private, owned by your personal account, with a [marker](#the-marker) on its default branch. Public and organization-owned repositories are not served | `gh repo view OWNER/NAME --json visibility,owner` |
 | Job image | `bash`, glibc, a CA bundle, and a user that is not root (see [the image](#2-mark-a-repository)). A bare `ubuntu:24.04` has no CA bundle | the pool's preflight |
 | Disk and network | the first start downloads the actions/runner release (about 190 MB) and pulls or builds your image | |
@@ -73,8 +73,8 @@ Already logged in? Skip the first line, or add the missing scope with
 `gh auth refresh --scopes workflow`.
 
 You should see, from `gh auth status`, a `Logged in to github.com account …` line whose token scopes
-include `repo`; and from `docker`, a version such as `29.9.2 (API 1.56)`, where the API is 1.48 or
-higher. Set Docker's memory and CPUs in Docker Desktop under Settings → Resources: a Mac runs one
+include `repo`; and from `docker`, a line such as `29.9.2 (API 1.56)` (yours differs), where the API
+is 1.48 or higher. Set Docker's memory and CPUs in Docker Desktop under Settings → Resources: a Mac runs one
 job per [slot](#slots), and 8 GB with 4 CPUs gives 1 slot, 16 GB with 8 CPUs gives 3.
 
 If it fails: the installer in step 4 names the same checks and says what to change; see
@@ -83,8 +83,8 @@ If it fails: the installer in step 4 names the same checks and says what to chan
 ### 2. Mark a repository
 
 Opt a private repository that your account owns in by committing [the marker](#the-marker),
-`.github/local-ci.json`, to its default branch. (For a trial: `gh repo create alpha --private
---clone`.) The job runs in the image the marker names, not in GitHub's runner image. To start, let
+`.github/local-ci.json`, to its default branch. (For a trial, create one with `gh repo create alpha
+--private --clone --add-readme`, and `cd` into it.) The job runs in the image the marker names, not in GitHub's runner image. To start, let
 the pool build a minimal one from the repository itself:
 
 ```json
@@ -111,11 +111,17 @@ no runner and no `ENTRYPOINT`. The image has no toolchain and no `git`; add what
 the Dockerfile, and pin `FROM` by digest once it works. The marker can also name a prebuilt image
 pinned by digest ([below](#the-marker)).
 
-You should see the file on the default branch, and nothing from the pool yet:
+Write the two files, then commit and push them to the default branch. `OWNER/NAME` below and in the
+later steps is your repository as `gh repo view --json nameWithOwner --jq .nameWithOwner` prints it:
 
 ```sh
+git add .github/local-ci.json ci/Dockerfile
+git commit -m "Opt in to local-ci-pool"
+git push
 gh api repos/OWNER/NAME/contents/.github/local-ci.json --jq .path
 ```
+
+You should see the file on the default branch, and nothing from the pool yet:
 
 ```
 .github/local-ci.json
@@ -163,14 +169,16 @@ Until the pool is up, `route` falls back to the hosted label, so committing this
 run goes green on a hosted runner. The `route` job itself always runs on a hosted runner, and
 GitHub bills each hosted job by the started minute, so every run costs at least one hosted minute.
 Where your account has no arm runners, or your Mac is an Intel one, use `hosted-label: ubuntu-24.04`
-(see [Routing](#routing)).
+instead; with a label no runner serves, the `test` job waits in the queue without an error (see
+[Routing](#routing)).
 
 You should see, after a push, a green run whose `route` job ends with the notice
 `no Mac heartbeat found; running on ubuntu-24.04-arm` and whose `test` job ran on a GitHub-hosted
 runner.
 
-If it fails: the push of a workflow file over HTTPS needs the `workflow` scope (step 1), and a typo
-in the SHA or the inputs fails the `route` job in the "Set up job" step.
+If it fails: the push of a workflow file over HTTPS needs the `workflow` scope (step 1); a typo in
+the SHA or the inputs fails the `route` job in the "Set up job" step; and a `test` job that stays
+queued means the hosted label is one your account does not have (see above).
 
 ### 4. Install the pool
 
@@ -179,6 +187,7 @@ starts a launchd agent. `./install.sh --dry-run` shows what it would do first.
 
 ```sh
 gh repo clone Nezhinskiy/local-ci-pool && cd local-ci-pool
+git checkout "$(gh release view --json tagName --jq .tagName)"
 ./install.sh
 ```
 
@@ -223,7 +232,8 @@ pool v0.6.0 (a4d3acb) on examplemacbo: docker ok, login ok, 3 slots, 0 in use
   alice/beta   healthy
 ```
 
-A healthy project gets its heartbeat within two minutes: `gh variable list --repo OWNER/NAME`
+`alice/beta` stands for any other repository you opted in. A healthy project gets its heartbeat
+within two minutes: `gh variable list --repo OWNER/NAME`
 shows `CI_POOL_HB_<MACHINE>` (here `CI_POOL_HB_EXAMPLEMACBO`). Then push a commit and open the
 run's `test` job. The "Set up job" step names the runner, and the step prints it too: it reads
 `runner local-ci-… on aarch64` when a Mac ran the job.
@@ -238,8 +248,8 @@ If it fails:
   `launchctl print gui/$(id -u)/com.local-ci-pool.pool` and read `pool.log`; see
   [Health and logs](docs/runbook.md#health-and-logs).
 - Your repository is missing from the list: [A repository is not served](docs/runbook.md#a-repository-is-not-served).
-- The project stays `unhealthy` with a reason (`image`, `preflight`, …): the reason is in the status
-  line; see [Opting a project in or out](docs/runbook.md#opting-a-project-in-or-out).
+- The project stays `unhealthy`: the reason after the colon names the failure (an image that did
+  not pull or build, a failed preflight, …); see [Opting a project in or out](docs/runbook.md#opting-a-project-in-or-out).
 - The `test` job ran on the hosted label: the `route` job's annotation says why, and
   [When it falls back](#when-it-falls-back) and [CI went hosted](docs/runbook.md#ci-went-hosted)
   walk through it.
