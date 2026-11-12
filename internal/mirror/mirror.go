@@ -1,7 +1,7 @@
 // Package mirror keeps a partial bare clone of a project and turns a commit's
-// build inputs into a Docker build context. No credential is ever written:
-// every git call that may reach GitHub borrows the owner's `gh` login through a
-// credential helper given on the command line.
+// build inputs into a Docker build context. No credential is ever written or
+// put in an argument: every git call gets the pool's token in its environment,
+// and a credential helper given on the command line hands it to git.
 package mirror
 
 import (
@@ -24,10 +24,16 @@ import (
 
 const defaultBaseURL = "https://github.com"
 
-// credentialArgs clear any configured helper and name the pool's one helper.
-// They go in front of every git call, so a lazy blob fetch during `git archive`
-// authenticates the same way `git fetch` does.
-var credentialArgs = []string{"-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"}
+// tokenEnv carries the token to the credential helper. It is set on the git
+// process alone: not in a file, an argument or the pool's own environment.
+const tokenEnv = "LOCAL_CI_POOL_GIT_TOKEN"
+
+// credentialHelper answers git's "get" with the token in tokenEnv and ignores
+// "store" and "erase", so git saves the token nowhere. It used to be
+// `gh auth git-credential`, which reads the keychain on every git call: under
+// launchd's background QoS on a loaded Mac that read times out, gh exits 1,
+// and git, with prompts off, fails with "could not read Username".
+const credentialHelper = `!f() { if test "$1" = get; then echo username=x-access-token; echo "password=$` + tokenEnv + `"; fi; }; f`
 
 // Mirror is a directory of bare repositories, one per project.
 type Mirror struct {
@@ -35,6 +41,9 @@ type Mirror struct {
 	// BaseURL is the git host; the remote of a repository is
 	// BaseURL/<owner>/<name>.git. Empty means https://github.com.
 	BaseURL string
+	// Token returns the token git authenticates to BaseURL with: in the pool,
+	// the cached `gh auth token` of ghauth. Nil sends no credential.
+	Token func(ctx context.Context) (string, error)
 }
 
 var (
@@ -81,12 +90,15 @@ func (m Mirror) Dir(repo string) string {
 	return filepath.Join(m.Root, discovery.Identity(name)+".git")
 }
 
-func (m Mirror) remoteURL(repo string) string {
-	base := m.BaseURL
-	if base == "" {
-		base = defaultBaseURL
+func (m Mirror) base() string {
+	if m.BaseURL == "" {
+		return defaultBaseURL
 	}
-	return strings.TrimRight(base, "/") + "/" + repo + ".git"
+	return strings.TrimRight(m.BaseURL, "/")
+}
+
+func (m Mirror) remoteURL(repo string) string {
+	return m.base() + "/" + repo + ".git"
 }
 
 func lock(dir string) func() {
@@ -96,18 +108,35 @@ func lock(dir string) func() {
 	return mu.Unlock
 }
 
-func gitCmd(ctx context.Context, dir string, args ...string) *exec.Cmd {
+// gitCmd builds a git call. Every call clears the configured credential
+// helpers; with a Token it names the pool's helper for BaseURL alone and puts
+// the token in the call's environment, so a lazy blob fetch during
+// `git archive` authenticates the same way `git fetch` does.
+func (m Mirror) gitCmd(ctx context.Context, dir string, args ...string) (*exec.Cmd, error) {
+	global := []string{"-c", "credential.helper="}
+	env := append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=", "LC_ALL=C")
+	if m.Token != nil {
+		tok, err := m.Token(ctx)
+		if err != nil {
+			return nil, err
+		}
+		global = append(global, "-c", "credential."+m.base()+".helper="+credentialHelper)
+		env = append(env, tokenEnv+"="+tok)
+	}
 	// --literal-pathspecs: an input is a path, never a glob or pathspec magic,
 	// for ls-tree and archive alike.
-	global := append(append([]string{}, credentialArgs...), "--literal-pathspecs")
+	global = append(global, "--literal-pathspecs")
 	cmd := exec.CommandContext(ctx, "git", append(global, args...)...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=", "LC_ALL=C")
-	return cmd
+	cmd.Env = env
+	return cmd, nil
 }
 
-func run(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := gitCmd(ctx, dir, args...)
+func (m Mirror) run(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd, err := m.gitCmd(ctx, dir, args...)
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w", firstWord(args), err)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
@@ -148,19 +177,19 @@ func (m Mirror) Fetch(ctx context.Context, repo, ref string) (string, error) {
 		if err := os.MkdirAll(m.Root, 0o700); err != nil {
 			return "", err
 		}
-		if _, err := run(ctx, m.Root, "init", "--bare", "-q", dir); err != nil {
+		if _, err := m.run(ctx, m.Root, "init", "--bare", "-q", dir); err != nil {
 			return "", err
 		}
 	} else if err != nil {
 		return "", err
 	}
-	if _, err := run(ctx, dir, "config", "remote.origin.url", m.remoteURL(repo)); err != nil {
+	if _, err := m.run(ctx, dir, "config", "remote.origin.url", m.remoteURL(repo)); err != nil {
 		return "", err
 	}
-	if _, err := run(ctx, dir, "fetch", "--filter=blob:none", "--no-tags", "origin", "+"+ref+":"+ref); err != nil {
+	if _, err := m.run(ctx, dir, "fetch", "--filter=blob:none", "--no-tags", "origin", "+"+ref+":"+ref); err != nil {
 		return "", err
 	}
-	out, err := run(ctx, dir, "rev-parse", "--verify", "FETCH_HEAD^{commit}")
+	out, err := m.run(ctx, dir, "rev-parse", "--verify", "FETCH_HEAD^{commit}")
 	if err != nil {
 		return "", err
 	}
@@ -182,7 +211,7 @@ func (m Mirror) InputsDigest(ctx context.Context, dir, commit string, inputs []s
 	if err := checkInputs(inputs); err != nil {
 		return "", err
 	}
-	out, err := run(ctx, dir, append([]string{"ls-tree", "-r", "--full-tree", commit, "--"}, inputs...)...)
+	out, err := m.run(ctx, dir, append([]string{"ls-tree", "-r", "--full-tree", commit, "--"}, inputs...)...)
 	if err != nil {
 		return "", err
 	}
@@ -213,7 +242,10 @@ func (m Mirror) Archive(ctx context.Context, dir, commit string, inputs []string
 	}
 	// tar.umask is pinned so the modes (0755 and 0644) do not depend on a git
 	// config of the machine: the default umask 002 would make them 0775 and 0664.
-	cmd := gitCmd(ctx, dir, append([]string{"-c", "tar.umask=022", "archive", "--format=tar", commit, "--"}, inputs...)...)
+	cmd, err := m.gitCmd(ctx, dir, append([]string{"-c", "tar.umask=022", "archive", "--format=tar", commit, "--"}, inputs...)...)
+	if err != nil {
+		return nil, fmt.Errorf("git archive: %w", err)
+	}
 	a := &archive{cmd: cmd, stderr: &bytes.Buffer{}}
 	cmd.Stderr = a.stderr
 	out, err := cmd.StdoutPipe()

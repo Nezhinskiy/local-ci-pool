@@ -49,7 +49,10 @@ func newRealPool(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, erro
 		Token:   tok,
 		Clients: supervisor.NewClientFactory(""),
 		// The mirrors are derived state: deleting them costs a fetch.
-		Mirror: mirror.Mirror{Root: filepath.Join(cache, "local-ci-pool", "mirror")},
+		// git authenticates with the token the pool already holds: a `gh`
+		// per git call reads the keychain each time, which a loaded Mac can
+		// make time out.
+		Mirror: mirror.Mirror{Root: filepath.Join(cache, "local-ci-pool", "mirror"), Token: tok.Token},
 		Log:    log,
 		Serve:  health.Serve(func() supervisor.Snapshot { return sup.Snapshot() }, supportDir(), log),
 		// The settings file's path by the default rule. New reads nothing

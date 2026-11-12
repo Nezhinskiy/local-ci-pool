@@ -22,7 +22,8 @@ container is code from those repositories. It is not a sandbox for untrusted cod
 
 - The pool process uses your `gh` login at run time. A compromised pool process holds that
   login's rights over every repository the account owns. The token is read from `gh auth token`,
-  never written to disk, never logged and never passed to a container.
+  never written to disk, never logged and never passed to a container. The `git` calls that fetch a
+  project's image inputs get it in their environment, never in an argument or a git config file.
 - Jobs never see that token. A job sees the `GITHUB_TOKEN` its workflow grants it. Jobs that need
   `contents: write` should stay on hosted runners, so that no token that can move a default branch
   reaches the Mac.

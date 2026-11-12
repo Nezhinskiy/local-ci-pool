@@ -191,12 +191,13 @@ func gitSpy(t *testing.T) (logPath string) {
 	return logPath
 }
 
-func TestFetchAndArchiveUseTheGhCredentialHelperAndWriteNoCredential(t *testing.T) {
+func TestFetchAndArchiveUseThePoolCredentialHelperAndWriteNoCredential(t *testing.T) {
 	s := newSource(t)
 	s.write("ci/Dockerfile", "FROM scratch\n", 0o644)
 	commit := s.commit("one")
 	spy := gitSpy(t)
 	m := s.mirror(t)
+	m.Token = func(context.Context) (string, error) { return "tok", nil }
 	ctx := context.Background()
 
 	if _, err := m.Fetch(ctx, "o/alpha", "main"); err != nil {
@@ -233,7 +234,7 @@ func TestFetchAndArchiveUseTheGhCredentialHelperAndWriteNoCredential(t *testing.
 		if !strings.Contains(joined, " --literal-pathspecs ") {
 			t.Errorf("git call without --literal-pathspecs: %s", joined)
 		}
-		const helper = "-c credential.helper= -c credential.helper=!gh auth git-credential"
+		helper := "-c credential.helper= -c credential." + s.srv + ".helper=" + credentialHelper + " "
 		if !strings.HasPrefix(strings.TrimSpace(joined), helper) {
 			t.Errorf("git call without the credential helper arguments: %s", joined)
 		}
