@@ -27,8 +27,16 @@
 	     SIGTERM itself and waits for it before it unloads the agent. -->
 	<key>ExitTimeOut</key>
 	<integer>2700</integer>
+	<!-- Standard, not Background. Background puts the pool and everything it
+	     starts (gh, git) in darwinbg: the lowest CPU priority (4), throttled
+	     disk and network I/O. On a Mac loaded far past its cores that starves
+	     the pool, and its GitHub calls hit their 30 s timeout, heartbeats
+	     included. Adaptive is the same as Background here: it lifts a job only
+	     while an XPC transaction is open, and the pool has none. Standard runs at
+	     priority 20, below apps and the Docker VM (31), so the jobs still come
+	     first, and the coordinator itself is light. -->
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Standard</string>
 	<key>StandardOutPath</key>
 	<string>@LOG_DIR@/pool.log</string>
 	<key>StandardErrorPath</key>
