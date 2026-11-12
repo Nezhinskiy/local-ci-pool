@@ -895,8 +895,11 @@ func TestPlistKeys(t *testing.T) {
 	if top["ThrottleInterval"] != 30 {
 		t.Errorf("ThrottleInterval = %v, want 30", top["ThrottleInterval"])
 	}
-	if top["ProcessType"] != "Background" {
-		t.Errorf("ProcessType = %v, want Background", top["ProcessType"])
+	// Background (and Adaptive, which is Background for a process without XPC
+	// transactions) runs the pool and its gh and git children in darwinbg, at
+	// priority 4: on an overloaded Mac they starve and the heartbeat times out.
+	if top["ProcessType"] != "Standard" {
+		t.Errorf("ProcessType = %v, want Standard (Background and Adaptive starve the pool on a loaded Mac)", top["ProcessType"])
 	}
 	if top["RunAtLoad"] != true {
 		t.Errorf("RunAtLoad = %v, want true", top["RunAtLoad"])

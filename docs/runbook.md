@@ -129,6 +129,29 @@ little Docker memory for one slot, a `LocalHostName` without letters or digits, 
 another Mac, or a token GitHub refuses after the pool read it again (`gh login rejected`). Fix the
 cause and run the installer again (or `launchctl kickstart gui/$UID/com.local-ci-pool.pool`).
 
+The agent runs with `ProcessType` `Standard`: priority 20, below apps and the Docker VM (31), so jobs
+and your own work come first. Agents installed by earlier releases ran as `Background`, which puts
+the pool and every `gh` and `git` it starts in darwinbg: priority 4, with disk and network I/O
+throttled. On a Mac loaded far past its cores that starves the pool: its GitHub calls hit their
+30-second timeout, heartbeats included, and the Mac drops out of routing although it is up.
+`Adaptive` is no better, since it lifts a job only while an XPC transaction is open and the pool has
+none. Measured on macOS 27.2.1 with one probe agent per type running side by side, on a 14-core Mac
+at a load of 113 to 166 for 9 minutes, each cycle a fixed 30 ms CPU task, a child process and a fresh
+HTTPS request to `api.github.com`:
+
+| `ProcessType` | cycles | CPU task, median / max | child, median / max | HTTPS, median / max |
+|---|---|---|---|---|
+| `Background` | 27 | 1.1 s / 55 s | 0.7 s / 15 s | 0.4 s / 10.6 s |
+| `Adaptive` | 42 | 3.5 s / 21 s | 0.9 s / 9.7 s | 0.6 s / 4.9 s |
+| `Standard` | 91 | 0.35 s / 1.0 s | 0.07 s / 0.9 s | 0.3 s / 0.9 s |
+| `Interactive` | 101 | 0.04 s / 0.05 s | 0.01 s / 0.03 s | 0.16 s / 0.4 s |
+
+`Interactive` is faster still, but it competes with apps at their own priority, and launchd's
+documentation keeps it for jobs a user interface waits on. The pool itself is light: about 90
+seconds of CPU in 31 hours. `launchctl print gui/$UID/com.local-ci-pool.pool` reports
+`spawn type = daemon (3)` for `Standard` and `background (5)` for an agent from an earlier release;
+run the installer again to replace the latter.
+
 A token `gh auth token` cannot give is not one of those causes: the pool keeps running and retries.
 `gh` exits 1 both when it is logged out and when its keychain lookup times out (60 seconds), which a
 stalled Mac can make it do, so the failure does not prove a logout. On 2026-10-21, a pool that took
@@ -384,6 +407,9 @@ fresh heartbeat, so the question is why this one did not.
      `launchctl print gui/$(id -u)/com.local-ci-pool.pool` and the end of `pool.log`; a line starting
      `terminal:` names a cause the pool will not retry (see [Install](#install)).
    - `docker down`: Docker does not answer. No heartbeat is written until it does.
+   - Healthy, but `pool.log` has `heartbeat write failed` with `Client.Timeout exceeded` or
+     `i/o timeout`: the pool could not reach GitHub within 30 seconds. On a Mac loaded far past its
+     cores, check that the agent is not `Background` (see [Install](#install)).
    - `login lost`: `gh` cannot give the pool a token. The pool keeps retrying and writes no
      heartbeat meanwhile. Run `gh auth status`; if `gh` is logged out, run `gh auth login`.
    - `unhealthy: <reason>` under a project: that project writes no heartbeat; the reason says why (see
