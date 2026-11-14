@@ -117,6 +117,17 @@ func TestJobsCapIsReadAgainWithoutARestart(t *testing.T) {
 	})
 }
 
+// A changed cap is advertised at once, also on an idle pool: GitHub learns the
+// new number without waiting for a slot to change.
+func TestARaisedCapIsAdvertisedAtOnce(t *testing.T) {
+	h := newHarness(t, 3, 1000, "alpha")
+	h.settings = &fakeSettings{max: 1}
+	h.start()
+	h.eventually("capacity 1", func() bool { return h.actions.Capacity(alphaSet) == "1" })
+	h.settings.set(3, false)
+	h.eventually("capacity 3 once the cap is 3", func() bool { return h.actions.Capacity(alphaSet) == "3" })
+}
+
 // A cap removed without a restart gives back every slot of both kinds: the
 // docker VM runs beside a full set of container jobs again.
 func TestRemovingTheCapRunsTheDockerVMBesideEverySlot(t *testing.T) {
@@ -169,7 +180,8 @@ func TestEveryContainerGetsItsShareOfTheCPUs(t *testing.T) {
 	}{
 		{"a cap of 2 on 8 CPUs", &fakeSettings{max: 2}, 4e9},
 		{"no cap: 4 slots on 8 CPUs", nil, 2e9},
-		{"a cap above the CPUs", &fakeSettings{max: 16}, 1e9},
+		{"a cap above the slots: the slots share them", &fakeSettings{max: 16}, 2e9},
+		{"a cap of 3 on 4 slots", &fakeSettings{max: 3}, 2e9},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, 4, 1000, "alpha")

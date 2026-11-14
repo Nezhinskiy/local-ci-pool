@@ -652,19 +652,17 @@ func (s *Supervisor) readSettings() {
 }
 
 // cpusPerJob is the CPUs one container job may use: the Docker VM's CPUs shared
-// by the cap on jobs, or by the slots without a cap, and at least 1. A job then
-// sizes its workers (os.availableParallelism, nproc under a quota) to its share,
-// and all jobs together never ask for more CPUs than there are. The docker VM
-// keeps its own CPUs and counts as one job.
+// by the jobs that can run at once (the cap on jobs, never more than the slots),
+// and at least 1. A job that sizes its workers by os.availableParallelism, which
+// follows the quota, then starts as many as its share holds; all jobs together
+// never ask for more CPUs than there are. The docker VM keeps its own CPUs and
+// counts as one job. The pool never starts with fewer than 1 slot.
 func (s *Supervisor) cpusPerJob() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	div := s.jobsMax
-	if div < 1 {
-		div = s.machine.Slots
-	}
-	if div < 1 {
-		return 1
+	div := s.machine.Slots
+	if s.jobsMax > 0 {
+		div = min(s.jobsMax, div)
 	}
 	return max(s.machine.FP.CPUs/div, 1)
 }

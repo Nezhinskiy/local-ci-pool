@@ -78,8 +78,9 @@ type ContainerSpec struct {
 	Project                     string
 	Mount                       mount.Mount
 	JIT                         string
-	// CPUs caps the CPUs the container may use, so a job that sizes its workers by the CPUs it sees
-	// (os.availableParallelism, nproc under a quota) takes its share and not the whole VM; 0 sets no cap.
+	// CPUs caps the CPUs the container may use (a CFS quota, not a cpuset), so a job that sizes its
+	// workers by os.availableParallelism, which follows the quota, takes its share and not the whole VM;
+	// nproc and os.cpus() still see every CPU of the VM. 0 sets no cap.
 	CPUs int
 }
 

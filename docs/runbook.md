@@ -486,11 +486,16 @@ The pool runs as many container jobs at once as it has slots (see [Changing slot
 and one docker VM beside them. To run fewer, for example to leave the Mac room for local builds, set
 a cap in the settings file. Without the file the pool runs as it always has.
 
-Every container job is held to its share of the Docker VM's CPUs: the VM's CPUs divided by the cap, or
-by the slots without a cap, at least 1 (with a cap of 4 on 14 CPUs, 3 each). A job that sizes its
-workers by the CPUs it sees (`os.availableParallelism()`, `nproc` under the quota) then starts as many as
-its share holds, not one per CPU of the whole VM inside its 4 GiB. A docker VM keeps its own 4 CPUs
-and counts as one job.
+Every container job the pool starts is held to its share of the Docker VM's CPUs: the VM's CPUs divided
+by the jobs that can run at once (the cap, never more than the slots; the slots without a cap), at least
+1 (with a cap of 4 on 14 CPUs, 3 each). The share is a CPU quota, not a set of CPUs: Node's
+`os.availableParallelism()` follows it, while `nproc` and `os.cpus()` do not. Measured on a 14-CPU
+Docker VM under `--cpus=3` with Node 22: `os.availableParallelism()` gave 3, `nproc` and
+`os.cpus().length` gave 14. A job that sizes its workers by the former starts as many as
+its share holds; one that sizes them by the latter starts one per CPU of the whole VM and is only
+throttled. A job left running by a previous pool (a survivor, after a kill or launchd's 60-second limit)
+keeps the CPU limit it started with, which from a release before this one is none. A docker VM keeps
+its own 4 CPUs and counts as one job.
 
 **Where.** The pool resolves the path on every read:
 
