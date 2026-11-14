@@ -24,9 +24,10 @@ import (
 // probe mode, by a project of its own. Its scale set is
 // <identity>-docker-<machine>, labelled <identity>-docker; its "image" is the
 // repository's base VM, built from the default branch only; each of its
-// runners runs in a throwaway clone of that base (Deps.VM). It shares the
-// repository's visibility checks and drain with the container class, and
-// nothing else: one machine-wide docker slot (one VM at a time) instead of the
+// runners runs in a throwaway clone of that base (Deps.VM). Like the container
+// class's project it runs its own visibility checks and its own drain, so it
+// leaves no later than the container class would. It shares nothing with it
+// but the identity: one machine-wide docker slot (one VM at a time) instead of the
 // container slots, no budget gate (a VM has its own CPUs), no survivors, no
 // heartbeat (the routing action does not route docker jobs), and no
 // container, so the Docker die events and the reconcile never see its runners:
@@ -78,7 +79,7 @@ func (pr *project) baseKey(ctx context.Context, p discovery.Project, m runnermou
 		return "", "", fmt.Errorf("docker base: digesting the docker inputs of %s: %w", p.Repo, err)
 	}
 	sum := sha256.Sum256([]byte(strings.Join([]string{
-		digest, d.Provision, vm.Template, strings.TrimSpace(string(ver)), tree.ID,
+		digest, d.Provision, vm.Template, vm.Recipe, strings.TrimSpace(string(ver)), tree.ID,
 		fmt.Sprintf("%d/%d/%d", b.CPUs, b.MemoryGiB, b.DiskGiB),
 	}, "\x00")))
 	return hex.EncodeToString(sum[:]), commit, nil
@@ -100,11 +101,22 @@ func (pr *project) ensureBase(ctx context.Context, p discovery.Project, m runner
 	img := Image{Ref: name + "@" + key[:12]}
 	path := pr.s.baseKeyPath(pr.identity)
 	if old, err := os.ReadFile(path); err == nil && strings.SplitN(string(old), "\n", 2)[0] == key {
-		return img, nil
+		// The key is trusted only while its base is there: a base deleted by hand, or a wiped ~/.lima,
+		// is built again rather than served.
+		if ok, err := pr.s.deps.VM.HasBase(ctx, pr.identity); err == nil && ok {
+			return img, nil
+		}
 	}
 	// A build is a VM too: it takes the machine's one docker-VM slot, so it
-	// waits for a running job and no job starts while it builds.
-	for !pr.s.vmSlots.TryAcquire() {
+	// waits for a running job and no job starts while it builds. A VM that may
+	// still run (leakVM) stops builds too.
+	for {
+		if err := pr.s.vmLeakErr(); err != nil {
+			return Image{}, fmt.Errorf("docker base: %w", err)
+		}
+		if pr.s.vmSlots.TryAcquire() {
+			break
+		}
 		select {
 		case <-ctx.Done():
 			return Image{}, ctx.Err()
@@ -177,10 +189,22 @@ func (pr *project) startVM(ctx context.Context, name, jit string, _ int) error {
 		if err != nil {
 			pr.log.Info("a docker VM's runner ended", "runner", name, "error", err.Error())
 		}
+		if errors.Is(err, vm.ErrDeleteFailed) {
+			// The clone may still run: its runner keeps the slot, and no docker runner starts
+			// anywhere until a restart's sweep deletes it.
+			pr.s.leakVM(err)
+			pr.mu.Lock()
+			pr.launchErr = "docker vm: " + pr.s.vmLeakErr().Error()
+			pr.mu.Unlock()
+			return
+		}
 		if sc := pr.getScaler(); sc != nil {
 			sc.Exited(name)
 		}
 	})
+	if errors.Is(err, vm.ErrDeleteFailed) {
+		pr.s.leakVM(err)
+	}
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
 	pr.launchErr = ""
@@ -198,7 +222,9 @@ func (r vmRemover) ContainerRemove(ctx context.Context, name string, _ client.Co
 	return client.ContainerRemoveResult{}, r.b.Remove(ctx, name)
 }
 
-// sweepVMs deletes the job clones a killed pool left, once at start. A probe
+// sweepVMs deletes the job clones a killed pool left, once at start. One it
+// could not list or delete may still run, so the class then starts no VM
+// until the pool restarts, as after a failed delete (leakVM). A probe
 // never does: the main pool's clones may be running.
 func (s *Supervisor) sweepVMs(ctx context.Context) {
 	if s.cfg.Probe || s.deps.VM == nil {
@@ -209,7 +235,7 @@ func (s *Supervisor) sweepVMs(ctx context.Context) {
 	case errors.Is(err, exec.ErrNotFound):
 		s.log.Debug("no docker VMs to sweep: limactl not found")
 	case err != nil:
-		s.log.Warn("sweeping docker VMs left by a previous run", "error", err.Error())
+		s.leakVM(fmt.Errorf("sweeping the docker VMs a previous run left: %w", err))
 	}
 	for _, name := range deleted {
 		s.log.Info("deleted a docker VM left by a previous run", "vm", name)
@@ -232,19 +258,37 @@ func (pr *project) vetFor() func(context.Context) error {
 		if err := pr.vet(ctx); err != nil {
 			return err
 		}
-		b := pr.s.deps.VM
-		free, err := b.FreeGiB()
-		if err == nil && free >= float64(b.MinFreeGiB) {
-			return nil
-		}
-		if err != nil {
-			err = fmt.Errorf("reading free disk: %w", err)
-		} else {
-			err = fmt.Errorf("%w: %.1f GiB free, needs %d", vm.ErrDiskShort, free, b.MinFreeGiB)
+		err := pr.s.vmLeakErr()
+		if err == nil {
+			err = pr.s.deps.VM.DiskOK()
 		}
 		pr.mu.Lock()
-		pr.launchErr = "docker vm: " + err.Error()
-		pr.mu.Unlock()
-		return err
+		defer pr.mu.Unlock()
+		if err != nil {
+			pr.launchErr = "docker vm: " + err.Error()
+			return err
+		}
+		pr.launchErr = "" // the disk recovered: the reason goes with it
+		return nil
 	}
+}
+
+// leakVM records a job clone whose delete failed: it may still run, so no
+// docker runner starts on this machine until a restart's sweep deletes it.
+func (s *Supervisor) leakVM(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.vmLeak == "" {
+		s.log.Error("a docker VM may still run; no docker VM starts until the pool restarts", "error", err.Error())
+		s.vmLeak = err.Error()
+	}
+}
+
+func (s *Supervisor) vmLeakErr() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.vmLeak == "" {
+		return nil
+	}
+	return errors.New(s.vmLeak + "; restart the pool once it is gone (limactl list)")
 }

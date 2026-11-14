@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +17,7 @@ import (
 // network (the template's image). go test -tags lima ./internal/vm/
 func TestRealBaseAndJob(t *testing.T) {
 	home, _ := os.UserHomeDir()
-	b := &Backend{Lima: Exec{}, Instance: "smoke", CPUs: 2, MemoryGiB: 2, DiskGiB: 20, MinFreeGiB: 10, FreeGiB: FreeGiBAt(filepath.Join(home, ".lima"))}
+	b := &Backend{Lima: Exec{}, Instance: "smoke", CPUs: 2, MemoryGiB: 2, DiskGiB: 20, MinFreeGiB: 10, FreeGiB: FreeGiBAt(Home(home))}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 	identity := "smoke-" + time.Now().Format("150405")

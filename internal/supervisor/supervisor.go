@@ -346,7 +346,10 @@ type Supervisor struct {
 	instance string
 	slots    *runner.Slots
 	// vmSlots is the docker class's one slot: one docker VM at a time.
-	vmSlots  *runner.Slots
+	vmSlots *runner.Slots
+	// vmLeak is set when a docker VM may still run (a delete, or the start-up
+	// sweep, failed): no docker VM starts until a restart.
+	vmLeak   string
 	mount    runnermount.Mount
 	dockerOK bool
 	projects map[string]*project // by project key: owner/name, plus dockerKey for the docker class
@@ -480,6 +483,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		// Every docker VM's name carries the instance, so a probe and the main pool never touch each
 		// other's VMs.
 		s.deps.VM.Instance = instance
+		s.deps.VM.Log = s.log
 	}
 	var mount runnermount.Mount
 	err = s.retryTokenRead(ctx, func() error {

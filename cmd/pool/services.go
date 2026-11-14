@@ -67,7 +67,7 @@ func newRealPool(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, erro
 		// MinFreeGiB of free disk where Lima keeps them none.
 		VM: &vm.Backend{
 			Lima: vm.Exec{}, CPUs: 4, MemoryGiB: 6, DiskGiB: 30, MinFreeGiB: 15,
-			FreeGiB: vm.FreeGiBAt(filepath.Join(home, ".lima")),
+			FreeGiB: vm.FreeGiBAt(vm.Home(home)),
 		},
 		StateDir: supportDir(),
 	})

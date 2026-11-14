@@ -26,7 +26,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
@@ -55,7 +57,14 @@ const (
 	DefaultJobTimeout = 6*time.Hour + 10*time.Minute
 	// DefaultDeleteTimeout bounds one delete when Backend.DeleteTimeout is zero.
 	DefaultDeleteTimeout = 2 * time.Minute
+	// Recipe names BuildBase's own steps (the runner user, the tree and source directories, the
+	// provision script): a change of them changes Recipe, and the caller's base key with it.
+	Recipe = "1"
 )
+
+// ErrDeleteFailed marks a job clone that could not be deleted: it may still run, so the caller must
+// not start another VM until it is gone.
+var ErrDeleteFailed = errors.New("deleting the job's docker VM failed")
 
 // Lima runs one limactl command, with stdin when it is not nil, and returns its standard output.
 type Lima interface {
@@ -76,12 +85,46 @@ func (e Exec) Run(ctx context.Context, stdin io.Reader, args ...string) ([]byte,
 	cmd.Stdin = stdin
 	// limactl shell's ssh child can hold the output pipes after limactl itself is killed.
 	cmd.WaitDelay = 10 * time.Second
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	// A job is root in its VM and can write to the runner's streams without end: only the head of stdout
+	// (the small answers of list, --version, docker version) and the tail of stderr are kept.
+	stdout, stderr := &capped{max: maxStdout}, &tail{max: maxStderr}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	if err := cmd.Run(); err != nil {
-		return stdout.Bytes(), fmt.Errorf("limactl %s: %w: %s", args[0], err, strings.TrimSpace(lastLine(stderr.String())))
+		return stdout.b, fmt.Errorf("limactl %s: %w: %s", args[0], err, strings.TrimSpace(lastLine(string(stderr.b))))
 	}
-	return stdout.Bytes(), nil
+	return stdout.b, nil
+}
+
+const (
+	maxStdout = 1 << 20
+	maxStderr = 4 << 10
+)
+
+// capped keeps the first max bytes written to it and drops the rest.
+type capped struct {
+	b   []byte
+	max int
+}
+
+func (c *capped) Write(p []byte) (int, error) {
+	if room := c.max - len(c.b); room > 0 {
+		c.b = append(c.b, p[:min(len(p), room)]...)
+	}
+	return len(p), nil
+}
+
+// tail keeps the last max bytes written to it.
+type tail struct {
+	b   []byte
+	max int
+}
+
+func (t *tail) Write(p []byte) (int, error) {
+	t.b = append(t.b, p...)
+	if over := len(t.b) - t.max; over > 0 {
+		t.b = append(t.b[:0:0], t.b[over:]...)
+	}
+	return len(p), nil
 }
 
 func lastLine(s string) string {
@@ -245,6 +288,20 @@ func (b *Backend) protect(ctx context.Context, base string) {
 	}
 }
 
+// HasBase reports whether identity's base exists, for a caller that trusts a stored key only while its
+// base is there.
+func (b *Backend) HasBase(ctx context.Context, identity string) (bool, error) {
+	base, err := b.BaseName(identity)
+	if err != nil {
+		return false, err
+	}
+	names, err := b.list(ctx)
+	return names[base], err
+}
+
+// DiskOK reports ErrDiskShort, with the numbers, below MinFreeGiB of free disk.
+func (b *Backend) DiskOK() error { return b.diskOK() }
+
 func (b *Backend) diskOK() error {
 	free, err := b.FreeGiB()
 	if err != nil {
@@ -277,7 +334,9 @@ func (b *Backend) Launch(ctx context.Context, identity, runner, jit string, done
 	}
 	for _, args := range [][]string{{"clone", "--tty=false", base, job}, {"start", "--tty=false", job}} {
 		if _, err := b.Lima.Run(ctx, nil, args...); err != nil {
-			_ = b.remove(context.WithoutCancel(ctx), job)
+			if derr := b.remove(context.WithoutCancel(ctx), job); derr != nil {
+				err = errors.Join(err, fmt.Errorf("%w: %s: %w", ErrDeleteFailed, job, derr))
+			}
 			return fmt.Errorf("starting docker VM %s: %w", job, err)
 		}
 	}
@@ -290,7 +349,16 @@ func (b *Backend) Launch(ctx context.Context, identity, runner, jit string, done
 		if runCtx.Err() != nil { // a killed process reports "signal: killed", not the deadline
 			err = errors.Join(err, runCtx.Err())
 		}
-		done(errors.Join(err, b.remove(context.WithoutCancel(ctx), job)))
+		var delErr error
+		for try := 0; try < 3; try++ {
+			if delErr = b.remove(context.WithoutCancel(ctx), job); delErr == nil {
+				break
+			}
+		}
+		if delErr != nil {
+			delErr = fmt.Errorf("%w: %s: %w", ErrDeleteFailed, job, delErr)
+		}
+		done(errors.Join(err, delErr))
 	}()
 	return nil
 }
@@ -316,7 +384,8 @@ func (b *Backend) remove(ctx context.Context, name string) error {
 
 // Sweep cleans what a killed pool of this instance left behind: it deletes every job clone and unfinished
 // build, and resolves an interrupted swap (an old base set aside is put back when no base is in place, and
-// deleted otherwise).
+// deleted otherwise). A job clone or build it cannot delete is an error that wraps ErrDeleteFailed: it may
+// still run.
 func (b *Backend) Sweep(ctx context.Context) ([]string, error) {
 	names, err := b.list(ctx)
 	if err != nil {
@@ -324,10 +393,13 @@ func (b *Backend) Sweep(ctx context.Context) ([]string, error) {
 	}
 	scope := func(kind string) string { return prefix + kind + "-" + b.Instance + "-" }
 	var deleted []string
+	var errs []error
 	for n := range names {
 		switch {
 		case strings.HasPrefix(n, scope("job")), strings.HasPrefix(n, scope("new")):
-			if b.remove(ctx, n) == nil {
+			if err := b.remove(ctx, n); err != nil {
+				errs = append(errs, fmt.Errorf("%w: %s: %w", ErrDeleteFailed, n, err))
+			} else {
 				deleted = append(deleted, n)
 			}
 		case strings.HasPrefix(n, scope("old")):
@@ -345,7 +417,7 @@ func (b *Backend) Sweep(ctx context.Context) ([]string, error) {
 			b.protect(ctx, n) // a crash between rename and protect left it unprotected
 		}
 	}
-	return deleted, nil
+	return deleted, errors.Join(errs...)
 }
 
 func (b *Backend) list(ctx context.Context) (map[string]bool, error) {
@@ -382,13 +454,30 @@ func or(d, def time.Duration) time.Duration {
 	return def
 }
 
-// FreeGiBAt reports the free disk of the file system holding dir, for Backend.FreeGiB.
+// FreeGiBAt reports the free disk of the file system holding dir, for Backend.FreeGiB. A dir that does
+// not exist yet (limactl makes it at its first VM) is measured at its nearest existing parent.
 func FreeGiBAt(dir string) func() (float64, error) {
 	return func() (float64, error) {
 		var st syscall.Statfs_t
-		if err := syscall.Statfs(dir, &st); err != nil {
-			return 0, err
+		d := dir
+		for {
+			err := syscall.Statfs(d, &st)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, syscall.ENOENT) || filepath.Dir(d) == d {
+				return 0, err
+			}
+			d = filepath.Dir(d)
 		}
 		return float64(st.Bavail) * float64(st.Bsize) / (1 << 30), nil
 	}
+}
+
+// Home is where limactl keeps its VMs: $LIMA_HOME, else ~/.lima.
+func Home(userHome string) string {
+	if h := os.Getenv("LIMA_HOME"); h != "" {
+		return h
+	}
+	return filepath.Join(userHome, ".lima")
 }

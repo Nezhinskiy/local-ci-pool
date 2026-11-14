@@ -31,8 +31,8 @@ before a repository commits the block.**
 
 - The pool registers a second scale set for the repository, `<identity>-docker-<machine>`, labelled
   `<identity>-docker`, outside probe mode only, and only for a marker read at the default branch. It
-  is a project of its own in `/healthz` (`"docker_class": true`), sharing the repository's visibility
-  checks and drain. It writes no heartbeat: the routing action routes `<identity>-local` jobs alone, so
+  is a project of its own in `/healthz` (`"docker_class": true`), with its own visibility checks and
+  drain: it leaves no later than the repository's container class would. It writes no heartbeat: the routing action routes `<identity>-local` jobs alone, so
   a workflow names `<identity>-docker` in `runs-on` directly, and such a job waits for the Mac; it never
   falls back to a hosted runner.
 - The pool keeps one base VM per repository (Lima, `vz`). It builds the base **only from the default branch**:
@@ -53,11 +53,12 @@ before a repository commits the block.**
   A repository identity may have at most 24 characters, the room the VM names leave (Lima's socket paths
   are limited); a longer one fails the base build with that reason. The key and the Engine version are stored in
   `~/Library/Application Support/local-ci-pool/docker-base-<identity>.key` once a build succeeds, and
-  checked at start and on every discovery pass. A failed build keeps the old base and marks the class
+  checked at start and on every discovery pass; a key whose base is gone (deleted by hand, a wiped Lima home)
+  is built again. A failed build keeps the old base and marks the class
   unhealthy (`docker base: …`), as a failed image build does, and is tried again on the next pass. One base
   builds at a time on the machine. A failing build is retried on every discovery pass (10 minutes), with no backoff;
-  `/healthz` shows it failing, with the reason, until one passes. A launch that comes while a rebuild swaps the
-  base in fails, and its job is retried. A pull request's own `provision` never reaches the base, and probe mode
+  `/healthz` shows it failing, with the reason, until one passes. A pull request's own `provision` never reaches
+  the base, and probe mode
   does not build one.
 - A job gets a copy-on-write clone of the stopped base:
   - booted with no host mounts, with guest-to-host port forwarding off, and with no Rosetta or containerd
@@ -70,7 +71,7 @@ before a repository commits the block.**
 - One docker VM runs at a time on a machine, whatever the repository (one machine-wide slot), with its own
   CPU and memory (4 CPUs, 6 GiB, a 30 GiB disk), outside Docker Desktop's slots and the core budget. A base
   build is a VM too and takes the same slot: it waits for a running job, and no job starts while it builds.
-  Below 15 GiB free where Lima keeps its VMs (`~/.lima`) the pool registers no runner and starts no VM, and
+  Below 15 GiB free where Lima keeps its VMs (`$LIMA_HOME`, else `~/.lima`) the pool registers no runner and starts no VM, and
   `/healthz` reports the class unhealthy (`docker vm: not enough free disk …`). The job stays queued; the pool never moves it elsewhere.
 - A docker runner has no container: the Docker die events, the reconcile and the start-up sweep of
   containers never release or remove it. Its clone's end is its exit; an idle one beyond the assigned

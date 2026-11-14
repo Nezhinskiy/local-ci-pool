@@ -303,8 +303,10 @@ func (c *Client) Repo(ctx context.Context, full string) (Repo, error) {
 	return Repo(r.repoJSON), nil
 }
 
-// ReadFile returns the raw content of path at ref ("" for the default
-// branch). A missing file is ErrNotFound.
+// ReadFile returns the raw content of path on branch ref ("" for the default
+// branch). A missing file is ErrNotFound. The branch is named in full
+// (refs/heads/<ref>): a bare name would let a tag of the same name decide
+// what is read.
 func (c *Client) ReadFile(ctx context.Context, full, ref, path string) ([]byte, error) {
 	if err := checkFull(full); err != nil {
 		return nil, err
@@ -318,7 +320,7 @@ func (c *Client) ReadFile(ctx context.Context, full, ref, path string) ([]byte, 
 	}
 	u := c.base + "/repos/" + full + "/contents/" + strings.Join(segs, "/")
 	if ref != "" {
-		u += "?ref=" + url.QueryEscape(ref)
+		u += "?ref=" + url.QueryEscape("refs/heads/"+strings.TrimPrefix(ref, "refs/heads/"))
 	}
 	res, err := c.get(ctx, u, "application/vnd.github.raw")
 	if err != nil {

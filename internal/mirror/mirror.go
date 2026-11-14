@@ -160,9 +160,11 @@ func tail(s string) string {
 	return s
 }
 
-// Fetch brings ref of repo ("owner/name") into the project's bare repository,
-// without file contents (blobs arrive when something needs them), and returns
-// the commit the ref points at.
+// Fetch brings branch ref of repo ("owner/name") into the project's bare
+// repository, without file contents (blobs arrive when something needs them),
+// and returns the commit the branch points at. ref is a branch name, fetched
+// as refs/heads/<ref>: git would resolve a bare name to a tag of the same
+// name first, and anyone who can push a tag would then decide what is built.
 func (m Mirror) Fetch(ctx context.Context, repo, ref string) (string, error) {
 	if err := checkRepo(repo); err != nil {
 		return "", err
@@ -186,7 +188,8 @@ func (m Mirror) Fetch(ctx context.Context, repo, ref string) (string, error) {
 	if _, err := m.run(ctx, dir, "config", "remote.origin.url", m.remoteURL(repo)); err != nil {
 		return "", err
 	}
-	if _, err := m.run(ctx, dir, "fetch", "--filter=blob:none", "--no-tags", "origin", "+"+ref+":"+ref); err != nil {
+	branch := "refs/heads/" + strings.TrimPrefix(ref, "refs/heads/")
+	if _, err := m.run(ctx, dir, "fetch", "--filter=blob:none", "--no-tags", "origin", "+"+branch+":"+branch); err != nil {
 		return "", err
 	}
 	out, err := m.run(ctx, dir, "rev-parse", "--verify", "FETCH_HEAD^{commit}")

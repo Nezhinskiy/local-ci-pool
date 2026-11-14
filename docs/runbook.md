@@ -313,16 +313,21 @@ What you see and do:
   9.4 GiB of disk. `pool status` shows the class as `<owner>/<repo> (docker)`, `starting` until the base
   is built. A workflow names `runs-on: <identity>-docker`; the routing action and the heartbeat do not
   cover it, so such a job waits for a Mac that serves it and never falls back to a hosted runner.
-- **Disk:** the pool starts no VM while `~/.lima`'s volume has less than 15 GiB free; the job stays
+- **Disk:** the pool starts no VM while the volume of `$LIMA_HOME` (else `~/.lima`) has less than 15 GiB free; the job stays
   queued, and the class shows `docker vm: not enough free disk for a docker VM: … GiB free, needs 15`.
   Free the space; the next poll starts it. Clones a killed pool left are deleted at its next start.
 - **Reasons in `/healthz`** for the entry with `"docker_class": true`: `docker class: limactl not found`
   (class `setup`); `docker base: …` (class `setup` while there is no base yet, `image` when a rebuild
   failed and the old base still serves); `docker vm: …` (class `vm`, the last VM launch failed; cleared by
-  the next one that succeeds).
+  the next one that succeeds). One reason does not clear: a docker VM the pool could not delete (after a job,
+  a failed boot, or in the start-up sweep) may still run, so the pool starts no docker VM and builds no base
+  until it restarts. Check `limactl list`, delete the VM by hand, then restart the pool.
 - **Rebuilding the base by hand:** delete
   `~/Library/Application Support/local-ci-pool/docker-base-<identity>.key`; the next discovery pass (or a
-  restart) builds it again. The base itself, `local-ci-docker-base-<identity>`, is protected in Lima.
+  restart) builds it again. The base itself, `local-ci-docker-base-main-<identity>`, is protected in Lima.
+- **After the block is removed** the pool stops the class but keeps its base (about 10 GiB) and its key
+  file. To reclaim them: `limactl unprotect local-ci-docker-base-main-<identity>`, `limactl delete
+  local-ci-docker-base-main-<identity>`, and delete `docker-base-<identity>.key`.
 
 ## A repository is not served
 

@@ -40,17 +40,20 @@ func dockerMarker() string {
 // "shell ... entrypoint.sh") runs until finish or a delete of the clone ends
 // it.
 type fakeLima struct {
-	mu      sync.Mutex
-	calls   []string
-	stdin   map[string]string // the stdin of each call, by its arguments
-	missing bool              // limactl is not installed
-	fail    string            // a call whose arguments start with it fails
-	list    string
-	jobs    map[string]chan error // running job clones, by clone name
+	mu       sync.Mutex
+	calls    []string
+	stdin    map[string]string     // the stdin of each call, by its arguments
+	missing  bool                  // limactl is not installed
+	fail     string                // a call whose arguments start with it fails
+	failAlso string                // a second such prefix
+	list     string                // instances listed besides those it made
+	jobs     map[string]chan error // running job clones, by clone name
+	made     map[string]bool       // instances made by create, clone and rename, not yet deleted
+	version  string                // what --version prints; "" for 2.3.0
 }
 
 func newFakeLima() *fakeLima {
-	return &fakeLima{stdin: map[string]string{}, jobs: map[string]chan error{}}
+	return &fakeLima{stdin: map[string]string{}, jobs: map[string]chan error{}, made: map[string]bool{}}
 }
 
 func (f *fakeLima) Run(ctx context.Context, stdin io.Reader, args ...string) ([]byte, error) {
@@ -67,21 +70,39 @@ func (f *fakeLima) Run(ctx context.Context, stdin io.Reader, args ...string) ([]
 		f.mu.Unlock()
 		return nil, &exec.Error{Name: "limactl", Err: exec.ErrNotFound}
 	}
-	if f.fail != "" && strings.HasPrefix(joined, f.fail) {
+	if (f.fail != "" && strings.HasPrefix(joined, f.fail)) || (f.failAlso != "" && strings.HasPrefix(joined, f.failAlso)) {
 		f.mu.Unlock()
 		return nil, errors.New("limactl failed")
 	}
 	switch {
 	case args[0] == "--version":
+		v := f.version
 		f.mu.Unlock()
-		return []byte("limactl version 2.3.0\n"), nil
+		if v == "" {
+			v = "2.3.0"
+		}
+		return []byte("limactl version " + v + "\n"), nil
 	case args[0] == "list":
 		defer f.mu.Unlock()
-		return []byte(f.list), nil
+		out := f.list
+		for n := range f.made {
+			out += `{"name":"` + n + `"}` + "\n"
+		}
+		return []byte(out), nil
 	case strings.Contains(joined, "docker version"):
 		f.mu.Unlock()
 		return []byte("29.9.3\n"), nil
+	case args[0] == "create" || args[0] == "clone" || args[0] == "rename":
+		name := args[len(args)-1]
+		if args[0] == "create" {
+			name = strings.TrimPrefix(args[3], "--name=")
+		}
+		if args[0] == "rename" {
+			delete(f.made, args[len(args)-2])
+		}
+		f.made[name] = true
 	case args[0] == "delete":
+		delete(f.made, args[len(args)-1])
 		if ch := f.jobs[args[len(args)-1]]; ch != nil {
 			delete(f.jobs, args[len(args)-1])
 			ch <- errors.New("the VM is gone")
@@ -538,6 +559,112 @@ func TestDockerBaseIsBuiltFromTheDefaultBranch(t *testing.T) {
 	if _, err := pr.ensureBase(context.Background(), p, m); err != nil || lima.count(create) != 3 {
 		t.Fatalf("a changed key: %v, %d builds, want 3", err, lima.count(create))
 	}
+	// A matching key with its base gone (deleted by hand, ~/.lima wiped) builds again.
+	lima.mu.Lock()
+	delete(lima.made, testBaseName("alpha"))
+	lima.mu.Unlock()
+	if _, err := pr.ensureBase(context.Background(), p, m); err != nil || lima.count(create) != 4 {
+		t.Fatalf("a missing base under a matching key: %v, %d builds, want 4", err, lima.count(create))
+	}
+}
+
+// Every part of the base's key changes it: the inputs digest, the provision
+// path, limactl's version, the runner tree's image and the VM's size.
+func TestEveryPartOfTheBaseKeyCounts(t *testing.T) {
+	newPr := func(lima *fakeLima, cpus int) (*project, *fakeMirror) {
+		mirror := &fakeMirror{digest: "d1"}
+		s := New(Config{}, Deps{Docker: newFakeDocker(), Mirror: mirror, StateDir: t.TempDir(),
+			VM: &vm.Backend{Lima: lima, Instance: "main", CPUs: cpus, MemoryGiB: 6, DiskGiB: 30}})
+		return &project{s: s, identity: "alpha", log: s.log}, mirror
+	}
+	proj := func(provision string) discovery.Project {
+		return discovery.Project{Identity: "alpha", Repo: alphaRepo, Ref: "main", DefaultBranch: "main",
+			Marker: discovery.Marker{Docker: &discovery.DockerVM{Provision: provision, Inputs: []string{"ci/vm"}}}}
+	}
+	mnt := func(v string) runnermount.Mount {
+		return runnermount.Mount{Version: v, Spec: mount.Mount{Type: mount.TypeImage, Source: runnermount.Ref(v)}}
+	}
+	key := func(pr *project, p discovery.Project, m runnermount.Mount) string {
+		t.Helper()
+		k, _, err := pr.baseKey(context.Background(), p, m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	pr, mirror := newPr(newFakeLima(), 4)
+	want := key(pr, proj("ci/vm/provision.sh"), mnt("2.338.0"))
+	mirror.setDigest("d2")
+	changed := map[string]string{"inputs": key(pr, proj("ci/vm/provision.sh"), mnt("2.338.0"))}
+	mirror.setDigest("d1")
+	changed["provision"] = key(pr, proj("ci/vm/other.sh"), mnt("2.338.0"))
+	changed["runner tree"] = key(pr, proj("ci/vm/provision.sh"), mnt("2.339.0"))
+	lima := newFakeLima()
+	lima.version = "2.4.0"
+	pr2, _ := newPr(lima, 4)
+	changed["limactl"] = key(pr2, proj("ci/vm/provision.sh"), mnt("2.338.0"))
+	pr3, _ := newPr(newFakeLima(), 2)
+	changed["VM size"] = key(pr3, proj("ci/vm/provision.sh"), mnt("2.338.0"))
+	for part, k := range changed {
+		if k == want {
+			t.Errorf("a change of the %s left the key as it was", part)
+		}
+	}
+	if again := key(pr, proj("ci/vm/provision.sh"), mnt("2.338.0")); again != want {
+		t.Fatal("the same inputs gave another key")
+	}
+}
+
+// A job clone that cannot be deleted keeps its slot and stops every docker
+// runner: no second VM boots beside one that may still run.
+func TestAnUndeletableCloneStopsTheDockerClass(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.withDocker("alpha")
+	h.start()
+	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	h.lima.set(func(f *fakeLima) { f.fail = "delete --force " + testJobPrefix })
+	h.actions.Assign(alphaDockerSet, 1)
+	h.eventually("a VM runs", func() bool { return len(h.lima.running()) == 1 })
+	job := h.lima.running()[0]
+	h.actions.Started(alphaDockerSet, job)
+	h.actions.Completed(alphaDockerSet, job)
+	h.delivered(alphaDockerSet)
+	h.lima.finish(job)
+	h.eventually("unhealthy for the leaked VM", func() bool {
+		p, _ := h.dockerHealth(alphaRepo)
+		return p.Class == "vm" && strings.Contains(p.Reason, vm.ErrDeleteFailed.Error())
+	})
+	if snap := h.sup.Snapshot(); snap.VMInUse != 1 {
+		t.Fatalf("vm_in_use %d after a failed delete, want the slot kept", snap.VMInUse)
+	}
+	h.actions.Assign(alphaDockerSet, 1)
+	time.Sleep(300 * time.Millisecond)
+	if n := h.lima.count("clone"); n != 1 {
+		t.Fatalf("%d clones: a second VM booted beside one that may run", n)
+	}
+}
+
+// A runner's own error (text the job wrote) never becomes the class's reason.
+func TestARunnersErrorIsNotTheReason(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.withDocker("alpha")
+	h.start()
+	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	h.actions.Assign(alphaDockerSet, 1)
+	h.eventually("a VM runs", func() bool { return len(h.lima.running()) == 1 })
+	job := h.lima.running()[0]
+	h.actions.Started(alphaDockerSet, job)
+	h.actions.Completed(alphaDockerSet, job)
+	h.delivered(alphaDockerSet)
+	h.lima.mu.Lock()
+	ch := h.lima.jobs[testJobName(job)]
+	delete(h.lima.jobs, testJobName(job))
+	h.lima.mu.Unlock()
+	ch <- errors.New("JOB-WROTE-THIS")
+	time.Sleep(200 * time.Millisecond)
+	if p, _ := h.dockerHealth(alphaRepo); strings.Contains(p.Reason, "JOB-WROTE-THIS") {
+		t.Fatalf("the runner's error reached the reason: %q", p.Reason)
+	}
 }
 
 // The names a main-instance pool gives its docker VMs (vm.Backend.JobName and BaseName).
@@ -545,3 +672,65 @@ const testJobPrefix = "local-ci-docker-job-main-"
 
 func testJobName(runner string) string    { return testJobPrefix + runner }
 func testBaseName(identity string) string { return "local-ci-docker-base-main-" + identity }
+
+// A job clone the start-up sweep cannot delete may still run: the class
+// reports it, builds no base and so registers no runner.
+func TestAFailedSweepStopsTheDockerClass(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.withDocker("alpha")
+	left := testJobName("local-ci-left")
+	h.lima.set(func(f *fakeLima) {
+		f.list = `{"name":"` + left + `"}` + "\n"
+		f.fail = "delete --force " + left
+	})
+	h.start()
+	h.eventually("unhealthy for the leftover VM", func() bool {
+		p, ok := h.dockerHealth(alphaRepo)
+		return ok && strings.Contains(p.Reason, vm.ErrDeleteFailed.Error())
+	})
+	time.Sleep(300 * time.Millisecond)
+	if h.actions.ScaleSet(alphaDockerSet) != nil {
+		t.Fatal("a docker scale set registered beside a VM that may run")
+	}
+	if n := h.lima.count("clone") + h.lima.count("create"); n != 0 {
+		t.Fatalf("%d VMs made beside one that may run", n)
+	}
+}
+
+// A short-disk reason goes once the disk recovers, with no job queued.
+func TestAShortDiskReasonClearsWithoutAJob(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.withDocker("alpha")
+	h.start()
+	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	h.mu.Lock()
+	h.freeGiB = 5
+	h.mu.Unlock()
+	h.actions.Assign(alphaDockerSet, 1)
+	h.eventually("unhealthy for the disk", func() bool { p, _ := h.dockerHealth(alphaRepo); return p.Class == "vm" })
+	h.actions.Revoke(alphaDockerSet, 1)
+	h.mu.Lock()
+	h.freeGiB = 50
+	h.mu.Unlock()
+	h.eventually("healthy with no job queued", func() bool { return h.dockerHealthy(alphaRepo) })
+}
+
+// A failed boot whose clone cannot be deleted stops the docker class too: the
+// scaler frees the slot, so only the vet keeps a second VM from booting.
+func TestAFailedBootWithAnUndeletableCloneStopsTheDockerClass(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.withDocker("alpha")
+	h.start()
+	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	h.lima.set(func(f *fakeLima) { f.fail = "start --tty=false " + testJobPrefix })
+	h.lima.set(func(f *fakeLima) { f.failAlso = "delete --force " + testJobPrefix })
+	h.actions.Assign(alphaDockerSet, 1)
+	h.eventually("unhealthy for the leaked VM", func() bool {
+		p, _ := h.dockerHealth(alphaRepo)
+		return p.Class == "vm" && strings.Contains(p.Reason, vm.ErrDeleteFailed.Error())
+	})
+	time.Sleep(300 * time.Millisecond)
+	if n := h.lima.count("clone"); n != 1 {
+		t.Fatalf("%d clones beside a clone that may still run", n)
+	}
+}

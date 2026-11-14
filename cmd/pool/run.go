@@ -35,7 +35,7 @@ const (
 const usage = `usage: pool <command>
 
 commands:
-  run [--probe --only-repo OWNER/NAME [--marker-ref REF] [--health-addr ADDR]]
+  run [--probe --only-repo OWNER/NAME [--marker-ref BRANCH] [--health-addr ADDR]]
                  serve the private repositories that opted in
   status [--json] [--health-addr ADDR]  show the running pool's state
   forget         delete this Mac's heartbeat variable from every repository
@@ -167,7 +167,7 @@ func cmdRun(ctx context.Context, args []string, stderr io.Writer, svc services) 
 	fs.SetOutput(io.Discard)
 	probe := fs.Bool("probe", false, "serve one repository under probe names")
 	onlyRepo := fs.String("only-repo", "", "with --probe: the repository (OWNER/NAME) to serve")
-	markerRef := fs.String("marker-ref", "", "with --probe: read the marker at this ref instead of the default branch")
+	markerRef := fs.String("marker-ref", "", "with --probe: read the marker at this branch instead of the default branch")
 	healthAddr := fs.String("health-addr", supervisor.DefaultHealthAddr, "with --probe: health endpoint address; binding it is the single-instance lock")
 	if err := fs.Parse(args); err != nil {
 		return usageError(stderr, err.Error())

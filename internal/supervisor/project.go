@@ -18,6 +18,7 @@ import (
 	"github.com/Nezhinskiy/local-ci-pool/internal/machine"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runner"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runnermount"
+	"github.com/Nezhinskiy/local-ci-pool/internal/vm"
 )
 
 // project serves one repository's class: its image, its scale set, one
@@ -943,7 +944,20 @@ func (pr *project) isFailed() bool {
 }
 
 func (pr *project) health() ProjectHealth {
+	var leak error
+	if pr.docker {
+		leak = pr.s.vmLeakErr() // takes s.mu: never under pr.mu
+	}
 	pr.mu.Lock()
+	// A short-disk reason goes as soon as the disk recovers, also with no job
+	// queued to run the vet again. A VM that may still run is the reason until
+	// the pool restarts, also before any job has asked for a VM.
+	if pr.docker && strings.HasPrefix(pr.launchErr, "docker vm: "+vm.ErrDiskShort.Error()) && pr.s.deps.VM.DiskOK() == nil {
+		pr.launchErr = ""
+	}
+	if leak != nil {
+		pr.launchErr = "docker vm: " + leak.Error()
+	}
 	h := ProjectHealth{Repo: pr.repo, Identity: pr.identity, Image: pr.img.Ref, DockerClass: pr.docker}
 	switch {
 	case pr.public:

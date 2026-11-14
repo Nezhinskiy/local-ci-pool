@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -427,6 +428,37 @@ func TestSweepKeepsToItsInstanceAndResolvesAnInterruptedSwap(t *testing.T) {
 	}
 }
 
+func TestFreeGiBAtMeasuresAMissingDirAtItsParent(t *testing.T) {
+	gib, err := FreeGiBAt(filepath.Join(t.TempDir(), "not", "yet"))()
+	if err != nil || gib <= 0 {
+		t.Fatalf("free %v GiB, err %v", gib, err)
+	}
+}
+
+func TestHomeFollowsLimaHome(t *testing.T) {
+	t.Setenv("LIMA_HOME", "/elsewhere/lima")
+	if h := Home("/Users/x"); h != "/elsewhere/lima" {
+		t.Fatalf("home %q", h)
+	}
+	t.Setenv("LIMA_HOME", "")
+	if h := Home("/Users/x"); h != "/Users/x/.lima" {
+		t.Fatalf("home %q", h)
+	}
+}
+
+func TestSweepReportsACloneItCannotDelete(t *testing.T) {
+	f := &fakeLima{list: `{"name":"local-ci-docker-job-main-local-ci-aa"}
+{"name":"local-ci-docker-job-main-local-ci-bb"}
+`, fail: map[string]error{"delete --force local-ci-docker-job-main-local-ci-aa": errors.New("boom")}}
+	deleted, err := backend(f, 50).Sweep(context.Background())
+	if !errors.Is(err, ErrDeleteFailed) || !strings.Contains(err.Error(), "local-ci-aa") {
+		t.Fatalf("err %v, want ErrDeleteFailed naming the clone", err)
+	}
+	if len(deleted) != 1 || deleted[0] != "local-ci-docker-job-main-local-ci-bb" {
+		t.Fatalf("deleted %v, want the other clone still deleted", deleted)
+	}
+}
+
 func TestSweepAndSwapFailOnAnUnreadableList(t *testing.T) {
 	if _, err := backend(&fakeLima{list: "not json\n"}, 50).Sweep(context.Background()); err == nil {
 		t.Fatal("a garbled list must fail the sweep")
@@ -541,6 +573,43 @@ func TestTheInstanceIsValidated(t *testing.T) {
 		b.Instance = inst
 		if _, err := b.BaseName("alpha"); err == nil {
 			t.Fatalf("instance %q accepted", inst)
+		}
+	}
+}
+
+func TestTheJobsOutputIsBounded(t *testing.T) {
+	c, tl := &capped{max: 8}, &tail{max: 8}
+	for range 1000 {
+		_, _ = c.Write([]byte("0123456789"))
+		_, _ = tl.Write([]byte("0123456789"))
+	}
+	if string(c.b) != "01234567" || string(tl.b) != "23456789" {
+		t.Fatalf("head %q, tail %q", c.b, tl.b)
+	}
+}
+
+func TestAnUndeletableCloneIsErrDeleteFailed(t *testing.T) {
+	f := &fakeLima{fail: map[string]error{"delete": errors.New("delete hung")}}
+	done := make(chan error, 1)
+	if err := backend(f, 50).Launch(context.Background(), "alpha", "local-ci-0123456789ab", "JIT", func(err error) { done <- err }); err != nil {
+		t.Fatal(err)
+	}
+	if err := wait(t, done); !errors.Is(err, ErrDeleteFailed) {
+		t.Fatalf("done got %v, want ErrDeleteFailed", err)
+	}
+	if n := strings.Count(strings.Join(f.argsList(), "\n"), "delete --force "+job); n != 3 {
+		t.Fatalf("%d delete attempts, want 3", n)
+	}
+	f2 := &fakeLima{fail: map[string]error{"start": errors.New("boom"), "delete": errors.New("delete hung")}}
+	if err := backend(f2, 50).Launch(context.Background(), "alpha", "r", "JIT", func(error) {}); !errors.Is(err, ErrDeleteFailed) {
+		t.Fatalf("a failed boot whose clone stays: %v, want ErrDeleteFailed", err)
+	}
+}
+
+func TestHasBase(t *testing.T) {
+	for list, want := range map[string]bool{`{"name":"` + base + `"}`: true, `{"name":"local-ci-docker-base-main-beta"}`: false, "": false} {
+		if got, err := backend(&fakeLima{list: list}, 50).HasBase(context.Background(), "alpha"); err != nil || got != want {
+			t.Fatalf("list %q: %v, %v; want %v", list, got, err, want)
 		}
 	}
 }
