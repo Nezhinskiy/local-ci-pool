@@ -450,7 +450,9 @@ func TestARebuildWaitsForTheRunningJobsVM(t *testing.T) {
 	h.withDocker("alpha")
 	h.start()
 	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
-	creates := func() int { return h.lima.count("create --tty=false --plain --name=local-ci-docker-building-main-alpha") }
+	creates := func() int {
+		return h.lima.count("create --tty=false --plain --name=local-ci-docker-building-main-alpha")
+	}
 	before := creates()
 	h.actions.Assign(alphaDockerSet, 1)
 	h.eventually("alpha's VM runs", func() bool { return len(h.lima.running()) == 1 })
