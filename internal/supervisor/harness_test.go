@@ -63,7 +63,9 @@ type fakeContainer struct {
 	labels map[string]string
 	image  string
 	mount  string // the runner mount's source
-	state  container.ContainerState
+	// nanoCPUs is the container's CPU quota.
+	nanoCPUs int64
+	state    container.ContainerState
 }
 
 // fakeDocker keeps containers by name (the ID is the name) and broadcasts die
@@ -97,7 +99,7 @@ func newFakeDocker() *fakeDocker {
 }
 
 func (f *fakeDocker) ContainerCreate(ctx context.Context, o client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
-	c := &fakeContainer{labels: o.Config.Labels, image: o.Config.Image, state: container.StateCreated}
+	c := &fakeContainer{labels: o.Config.Labels, image: o.Config.Image, state: container.StateCreated, nanoCPUs: o.HostConfig.NanoCPUs}
 	if len(o.HostConfig.Mounts) == 1 {
 		c.mount = o.HostConfig.Mounts[0].Source
 	}

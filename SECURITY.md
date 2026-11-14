@@ -32,8 +32,8 @@ container is code from those repositories. It is not a sandbox for untrusted cod
   repository that makes it.
 - A job container mounts only the runner image mount, read-only: no host volumes and no Docker socket.
   It runs with `--init`, a 4 GiB memory limit and a limit of 4096 processes and threads, and is
-  removed after its job. It has no CPU cap: busy jobs share the VM's CPUs by the kernel's equal
-  default weights. The consequence is that nothing inside a job can use Docker (`services:`, a job `container:`,
+  removed after its job. It is capped at its share of the VM's CPUs (the CPUs divided by the cap
+  on jobs, or by the slots; the runbook's "Limiting concurrent jobs"). The consequence is that nothing inside a job can use Docker (`services:`, a job `container:`,
   Docker container actions, `docker build`); see [What does not work](README.md#what-does-not-work).
 - A job runs as a non-root user, outside group root. The image's `USER` is kept unless it is root,
   and root is refused in every spelling: `root`, any number Docker reads as 0 (`0`, `00`, `+0`,

@@ -139,3 +139,37 @@ func TestInvalidJobsCapIsReported(t *testing.T) {
 	h.settings.set(2, false)
 	h.eventually("the class cleared", func() bool { return h.sup.Snapshot().Jobs == (JobsHealth{Max: 2}) })
 }
+
+// Every container job is held to its share of the Docker VM's CPUs: the CPUs
+// shared by the cap, or by the slots without one, so a job that sizes its
+// workers by the CPUs it sees does not start one per CPU of the whole VM.
+func TestEveryContainerGetsItsShareOfTheCPUs(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		settings *fakeSettings
+		want     int64
+	}{
+		{"a cap of 2 on 8 CPUs", &fakeSettings{max: 2}, 4e9},
+		{"no cap: 4 slots on 8 CPUs", nil, 2e9},
+		{"a cap above the CPUs", &fakeSettings{max: 16}, 1e9},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, 4, 1000, "alpha")
+			if tc.settings != nil {
+				h.settings = tc.settings
+			}
+			h.start()
+			h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+			h.actions.Assign(alphaSet, 1)
+			img := h.imageOf("alpha")
+			h.eventually("a runner", func() bool { return len(h.docker.runners(img)) == 1 })
+			h.docker.mu.Lock()
+			defer h.docker.mu.Unlock()
+			for name, c := range h.docker.containers {
+				if c.image == img && c.nanoCPUs != tc.want {
+					t.Fatalf("%s: NanoCPUs %d, want %d", name, c.nanoCPUs, tc.want)
+				}
+			}
+		})
+	}
+}

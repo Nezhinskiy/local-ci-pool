@@ -563,6 +563,7 @@ func (pr *project) start(ctx context.Context, name, jit string) error {
 		Project:  pr.identity,
 		Mount:    m.Spec,
 		JIT:      jit,
+		CPUs:     pr.s.cpusPerJob(),
 	})
 	return err
 }

@@ -486,6 +486,12 @@ The pool runs as many container jobs at once as it has slots (see [Changing slot
 and one docker VM beside them. To run fewer, for example to leave the Mac room for local builds, set
 a cap in the settings file. Without the file the pool runs as it always has.
 
+Every container job is held to its share of the Docker VM's CPUs: the VM's CPUs divided by the cap, or
+by the slots without a cap, at least 1 (with a cap of 4 on 14 CPUs, 3 each). A job that sizes its
+workers by the CPUs it sees (`os.availableParallelism()`, `nproc` under the quota) then starts as many as
+its share holds, not one per CPU of the whole VM inside its 4 GiB. A docker VM keeps its own 4 CPUs
+and counts as one job.
+
 **Where.** The pool resolves the path on every read:
 
 1. `$XDG_CONFIG_HOME/local-ci-pool/config.toml` when `XDG_CONFIG_HOME` is set and absolute,
@@ -537,8 +543,8 @@ exits over the file.
 **A `[budget]` table** left from a release with the core budget is not read: `pool.log` warns
 `config: [budget] is no longer read; the core budget was removed, set [jobs] max instead` once, and
 the pool runs on. Delete the table. The core budget gave each job a share of the Mac's cores through
-coreslot and capped its container at that share; a job container now has no CPU cap (busy jobs share
-the VM's CPUs by the kernel's equal default weights), `CORESLOT_CPU` is no longer set in a job's
+coreslot and capped its container at that share; a job container is now capped at a static share
+instead (above), `CORESLOT_CPU` is no longer set in a job's
 environment, so a workflow that read `"${CORESLOT_CPU:-2}"` gets its default, and
 `install.sh --budget-cpu` is gone.
 

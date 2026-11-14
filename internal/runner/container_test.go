@@ -25,6 +25,7 @@ func testSpec() ContainerSpec {
 		Project:  "alpha",
 		Mount:    mount.Mount{Type: mount.TypeImage, Source: "local-ci-pool/runner:2.338.0", Target: "/opt/local-ci", ReadOnly: true},
 		JIT:      testJIT,
+		CPUs:     3,
 	}
 }
 
@@ -97,9 +98,9 @@ func TestStartRunnerContract(t *testing.T) {
 	if hc.PidsLimit == nil || *hc.PidsLimit != 4096 {
 		t.Fatalf("PidsLimit %v, want 4096", hc.PidsLimit)
 	}
-	// No CPU cap: busy jobs share the VM's CPUs by the kernel's equal weights.
-	if hc.NanoCPUs != 0 || hc.CPUQuota != 0 || hc.CpusetCpus != "" {
-		t.Fatalf("NanoCPUs %d, CPUQuota %d, CpusetCpus %q, want no CPU cap", hc.NanoCPUs, hc.CPUQuota, hc.CpusetCpus)
+	// The spec's CPUs, as a quota: a job sizes its workers to its share, not to the whole VM.
+	if hc.NanoCPUs != 3_000_000_000 || hc.CPUQuota != 0 || hc.CpusetCpus != "" {
+		t.Fatalf("NanoCPUs %d, CPUQuota %d, CpusetCpus %q, want the spec's 3 CPUs", hc.NanoCPUs, hc.CPUQuota, hc.CpusetCpus)
 	}
 	if want := []string{"host.docker.internal:127.0.0.1", "gateway.docker.internal:127.0.0.1"}; !slices.Equal(hc.ExtraHosts, want) {
 		t.Fatalf("ExtraHosts %q, want %q", hc.ExtraHosts, want)

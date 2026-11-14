@@ -651,6 +651,24 @@ func (s *Supervisor) readSettings() {
 	s.requestCapacity()
 }
 
+// cpusPerJob is the CPUs one container job may use: the Docker VM's CPUs shared
+// by the cap on jobs, or by the slots without a cap, and at least 1. A job then
+// sizes its workers (os.availableParallelism, nproc under a quota) to its share,
+// and all jobs together never ask for more CPUs than there are. The docker VM
+// keeps its own CPUs and counts as one job.
+func (s *Supervisor) cpusPerJob() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	div := s.jobsMax
+	if div < 1 {
+		div = s.machine.Slots
+	}
+	if div < 1 {
+		return 1
+	}
+	return max(s.machine.FP.CPUs/div, 1)
+}
+
 // FailOnLoginLoss ends Run with a terminal error if err means the GitHub login
 // is gone (a token GitHub refuses after it was read again), the same
 // classification every other GitHub call of the pool gets. It reports whether

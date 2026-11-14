@@ -54,7 +54,8 @@ is; [bench/](bench/README.md) is a harness to measure your own jobs. Check
 - The job runs in your marker image, not in GitHub's runner image, so the tools GitHub preinstalls
   are not there unless your image has them.
 - A job runs as a non-root user outside group root (the image's own non-root `USER`, otherwise
-  `1001:1001`) under a 4 GiB memory limit and a 4096-process limit. Install what the job needs in
+  `1001:1001`) under a 4 GiB memory limit, a 4096-process limit and a CPU cap at its share of the
+  Docker VM's CPUs. Install what the job needs in
   the image, not with `sudo apt-get` in a step.
 - Jobs cannot reach each other's ports: every job container of the pool joins one bridge network
   with traffic between containers turned off.

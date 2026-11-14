@@ -78,6 +78,9 @@ type ContainerSpec struct {
 	Project                     string
 	Mount                       mount.Mount
 	JIT                         string
+	// CPUs caps the CPUs the container may use, so a job that sizes its workers by the CPUs it sees
+	// (os.availableParallelism, nproc under a quota) takes its share and not the whole VM; 0 sets no cap.
+	CPUs int
 }
 
 // NetworkName is the bridge network the runners of an instance join.
@@ -198,6 +201,7 @@ func StartRunner(ctx context.Context, d Docker, s ContainerSpec) (id string, err
 			Resources: container.Resources{
 				Memory:    memory,
 				PidsLimit: &pids,
+				NanoCPUs:  int64(s.CPUs) * 1e9,
 			},
 			AutoRemove: true,
 			Mounts:     []mount.Mount{s.Mount},
