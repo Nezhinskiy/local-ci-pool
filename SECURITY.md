@@ -105,6 +105,15 @@ repositories' jobs use, and give the ones that matter their own authentication. 
 filtering would need root inside the job container (or a firewall in the Docker VM) and is out of
 scope for this pool.
 
+A docker-class job (`docs/docker-class.md`, not yet wired into the pool) runs in a Lima VM, and it
+reaches the same: Lima's user-mode gateway `192.168.5.2` (`host.lima.internal`) leads to the Mac's
+loopback. Measured with Lima 2.3.0 (`vz`, `--plain`): from the VM, a listener bound to `127.0.0.1`
+on the Mac, one bound to `0.0.0.0`, and a Docker Desktop port published on `127.0.0.1` all
+answered. The other direction is closed: in plain mode a port opened inside the VM is not forwarded
+to the Mac. No Lima setting closes the gateway while keeping the VM usable, because Lima's own SSH
+and agent traffic use that network; a firewall inside the VM would not count either, since the job
+is root there.
+
 ## Residual risk: no disk cap
 
 A job can fill the Docker VM's disk by writing to its container's filesystem. Concurrent jobs of
