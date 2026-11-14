@@ -6,17 +6,22 @@ import (
 )
 
 // Without a settings file, or with one that sets no cap, the slots are the
-// machine's own: every one of them takes a job.
+// machine's own: every one of them takes a job, and the docker VM runs
+// beside them.
 func TestNoJobsCapKeepsTheSlots(t *testing.T) {
 	for name, settings := range map[string]*fakeSettings{"no file": nil, "no cap": {}} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t, 3, 1000, "alpha")
+			h.withDocker("alpha")
 			h.settings = settings
 			h.start()
-			h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+			h.eventually("both classes healthy", func() bool { return h.healthy(alphaRepo) && h.dockerHealthy(alphaRepo) })
 			h.actions.Assign(alphaSet, 3)
+			h.actions.Assign(alphaDockerSet, 1)
 			img := h.imageOf("alpha")
-			h.eventually("three runners", func() bool { return len(h.docker.runners(img)) == 3 })
+			h.eventually("three runners and a docker VM", func() bool {
+				return len(h.docker.runners(img)) == 3 && len(h.lima.running()) == 1
+			})
 			if snap := h.sup.Snapshot(); snap.Slots != 3 || snap.Jobs != (JobsHealth{}) {
 				t.Fatalf("slots %d, jobs %+v; want 3 and no cap", snap.Slots, snap.Jobs)
 			}
