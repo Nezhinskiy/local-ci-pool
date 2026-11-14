@@ -24,9 +24,12 @@ container is code from those repositories. It is not a sandbox for untrusted cod
   login's rights over every repository the account owns. The token is read from `gh auth token`,
   never written to disk, never logged and never passed to a container. The `git` calls that fetch a
   project's image inputs get it in their environment, never in an argument or a git config file.
-- Jobs never see that token. A job sees the `GITHUB_TOKEN` its workflow grants it. Jobs that need
-  `contents: write` should stay on hosted runners, so that no token that can move a default branch
-  reaches the Mac.
+- Jobs never see that token. A job sees the `GITHUB_TOKEN` its workflow grants it. By default, keep
+  jobs that need `contents: write` on hosted runners, so that no token that can move a default branch
+  reaches the Mac. A repository may opt such jobs onto the pool all the same, as its owner's decision:
+  the token is scoped to its job and expires with it, it lives only in that job's throwaway container,
+  and the Mac already holds the owner's own `gh` login, which can do more. Record the decision in the
+  repository that makes it.
 - A job container mounts only the runner image mount, read-only: no host volumes and no Docker socket.
   It runs with `--init`, a 4 GiB memory limit and a limit of 4096 processes and threads, and is
   removed after its job. With the core budget on, it is also capped at its grant of CPUs; with the
