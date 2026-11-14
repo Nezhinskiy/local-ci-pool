@@ -251,3 +251,14 @@ func TestLocalName(t *testing.T) {
 		t.Fatalf("bad host name = %v, want ErrHostName", err)
 	}
 }
+
+func TestParseMemsize(t *testing.T) {
+	if n, err := parseMemsize("51539607552\n"); err != nil || n != 51539607552 {
+		t.Fatalf("parseMemsize = %d, %v", n, err)
+	}
+	for _, bad := range []string{"", "0", "-1", "48G"} {
+		if _, err := parseMemsize(bad); err == nil {
+			t.Fatalf("parseMemsize(%q) accepted", bad)
+		}
+	}
+}

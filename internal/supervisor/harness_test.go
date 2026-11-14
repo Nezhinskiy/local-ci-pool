@@ -63,8 +63,9 @@ type fakeContainer struct {
 	labels map[string]string
 	image  string
 	mount  string // the runner mount's source
-	// nanoCPUs is the container's CPU quota.
+	// nanoCPUs is the container's CPU quota, memory its memory limit.
 	nanoCPUs int64
+	memory   int64
 	state    container.ContainerState
 }
 
@@ -99,7 +100,7 @@ func newFakeDocker() *fakeDocker {
 }
 
 func (f *fakeDocker) ContainerCreate(ctx context.Context, o client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
-	c := &fakeContainer{labels: o.Config.Labels, image: o.Config.Image, state: container.StateCreated, nanoCPUs: o.HostConfig.NanoCPUs}
+	c := &fakeContainer{labels: o.Config.Labels, image: o.Config.Image, state: container.StateCreated, nanoCPUs: o.HostConfig.NanoCPUs, memory: o.HostConfig.Memory}
 	if len(o.HostConfig.Mounts) == 1 {
 		c.mount = o.HostConfig.Mounts[0].Source
 	}
@@ -679,6 +680,8 @@ type harness struct {
 	logs    *syncBuffer
 	// settings is Deps.JobsMax; nil reads no settings file.
 	settings *fakeSettings
+	// hostMem is the Mac's memory Deps.HostMem reports; 0 leaves HostMem nil.
+	hostMem int64
 	// serve is Deps.Serve, the health endpoint; nil serves none.
 	serve func(ctx context.Context, ln net.Listener)
 	// lima is Deps.VM's limactl and mirror Deps.Mirror (dockerclass_test.go);
@@ -800,7 +803,9 @@ func (h *harness) deps() Deps {
 			if err != nil {
 				return machine.Machine{}, "", err
 			}
-			return machine.Machine{Name: "examplemac", Owner: owner, Slots: h.slots, FP: testFP}, "arm64", nil
+			fp := testFP
+			fp.Mem = h.docker.info.MemTotal // a test may give the Docker VM more memory before start
+			return machine.Machine{Name: "examplemac", Owner: owner, Slots: h.slots, FP: fp}, "arm64", nil
 		},
 		Mount: func(context.Context, string) (runnermount.Mount, error) {
 			h.mu.Lock()
@@ -841,6 +846,7 @@ func (h *harness) deps() Deps {
 		Caffeinate: h.caff.start,
 		Serve:      h.serve,
 		JobsMax:    h.jobsMax(),
+		HostMem:    h.hostMemDep(),
 		VM:         h.vmBackend(),
 		Mirror:     h.mirrorDep(),
 		StateDir:   h.stateDir,
@@ -854,6 +860,15 @@ func (h *harness) start() {
 	h.cancel = cancel
 	h.done = make(chan error, 1)
 	go func() { h.done <- h.sup.Run(ctx) }()
+}
+
+// hostMemDep is Deps.HostMem: hostMem, or nil when it is 0.
+func (h *harness) hostMemDep() func() (int64, error) {
+	if h.hostMem == 0 {
+		return nil
+	}
+	mem := h.hostMem
+	return func() (int64, error) { return mem, nil }
 }
 
 // jobsMax is Deps.JobsMax: the fake settings' read, or nil without them.
