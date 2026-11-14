@@ -27,6 +27,8 @@ type fakeLima struct {
 	fail  map[string]error
 	list  string
 	hold  chan struct{}
+	// noEngine makes the base report no Docker Engine version.
+	noEngine bool
 }
 
 func (f *fakeLima) Run(ctx context.Context, stdin io.Reader, args ...string) ([]byte, error) {
@@ -55,6 +57,9 @@ func (f *fakeLima) Run(ctx context.Context, stdin io.Reader, args ...string) ([]
 	}
 	if args[0] == "list" {
 		return []byte(f.list), nil
+	}
+	if strings.Contains(joined, "docker version") && !f.noEngine {
+		return []byte("29.9.3\n"), nil
 	}
 	return nil, nil
 }
@@ -94,7 +99,11 @@ const (
 
 func build(t *testing.T, f *fakeLima) error {
 	t.Helper()
-	return backend(f, 50).BuildBase(context.Background(), "alpha", strings.NewReader("TREE"), strings.NewReader("SRC"), "ci/vm/provision.sh")
+	engine, err := backend(f, 50).BuildBase(context.Background(), "alpha", strings.NewReader("TREE"), strings.NewReader("SRC"), "ci/vm/provision.sh")
+	if err == nil && engine != "29.9.3" {
+		t.Fatalf("engine %q", engine)
+	}
+	return err
 }
 
 func TestBuildBaseBuildsAsideThenSwapsTheOldOneOut(t *testing.T) {
@@ -111,6 +120,7 @@ func TestBuildBaseBuildsAsideThenSwapsTheOldOneOut(t *testing.T) {
 		"shell " + building + ` -- sudo sh -c mkdir -p "$1" && tar -x -C "$1" sh /opt/local-ci-source`,
 		"shell " + building + " -- sudo sh -c " + provisionScript + " sh /opt/local-ci-source ci/vm/provision.sh",
 		"shell " + building + " -- sudo rm -rf /opt/local-ci-source",
+		"shell " + building + " -- sudo docker version --format {{.Server.Version}}",
 		"stop " + building,
 		"list --format json",
 		"delete --force " + old,
@@ -167,7 +177,7 @@ func TestAFailedSwapPutsTheOldBaseBack(t *testing.T) {
 	if tail := strings.Join(got[len(got)-2:], "\n"); tail != "rename "+old+" "+base+"\nprotect "+base {
 		t.Fatalf("the old base was not put back and protected:\n%s", strings.Join(got, "\n"))
 	}
-	for _, c := range got[11:] {
+	for _, c := range got[12:] {
 		if c == "delete --force "+old {
 			t.Fatalf("the old base was deleted after the failed swap: %v", got)
 		}
@@ -193,7 +203,7 @@ func TestTheSwapRunsToItsEndWhenTheBuildIsCancelled(t *testing.T) {
 	f := &fakeLima{list: `{"name":"` + base + `"}`}
 	ctx, cancel := context.WithCancel(context.Background())
 	b := backend(cancelAfter{f, "stop " + building, cancel}, 50)
-	if err := b.BuildBase(ctx, "alpha", strings.NewReader(""), strings.NewReader(""), "p.sh"); err != nil {
+	if _, err := b.BuildBase(ctx, "alpha", strings.NewReader(""), strings.NewReader(""), "p.sh"); err != nil {
 		t.Fatalf("the swap must finish after a cancel: %v", err)
 	}
 	if c, ok := f.find("protect " + base); !ok || c.ctxErr != nil {
@@ -204,7 +214,7 @@ func TestTheSwapRunsToItsEndWhenTheBuildIsCancelled(t *testing.T) {
 func TestBuildBaseRefusesWhatCouldEscapeOrCollide(t *testing.T) {
 	for _, p := range []string{"a'b.sh", "/etc/x.sh", "../x.sh", "a\nb", "a b.sh", "a;b.sh", "$(x).sh", "-x.sh", "ci/../../x.sh"} {
 		f := &fakeLima{}
-		if err := backend(f, 50).BuildBase(context.Background(), "alpha", strings.NewReader(""), strings.NewReader(""), p); err == nil {
+		if _, err := backend(f, 50).BuildBase(context.Background(), "alpha", strings.NewReader(""), strings.NewReader(""), p); err == nil {
 			t.Fatalf("accepted provision %q", p)
 		}
 		if len(f.calls) != 0 {
@@ -213,7 +223,7 @@ func TestBuildBaseRefusesWhatCouldEscapeOrCollide(t *testing.T) {
 	}
 	for _, id := range []string{"Alpha", "a_b", strings.Repeat("a", 30)} {
 		f := &fakeLima{}
-		if err := backend(f, 50).BuildBase(context.Background(), id, strings.NewReader(""), strings.NewReader(""), "p.sh"); err == nil || len(f.calls) != 0 {
+		if _, err := backend(f, 50).BuildBase(context.Background(), id, strings.NewReader(""), strings.NewReader(""), "p.sh"); err == nil || len(f.calls) != 0 {
 			t.Fatalf("identity %q: err %v, calls %v", id, err, f.argsList())
 		}
 	}
@@ -225,7 +235,7 @@ func TestBuildBaseRefusesWhatCouldEscapeOrCollide(t *testing.T) {
 
 func TestBuildBaseRefusesOnAShortDisk(t *testing.T) {
 	f := &fakeLima{}
-	err := backend(f, 9).BuildBase(context.Background(), "alpha", strings.NewReader(""), strings.NewReader(""), "p.sh")
+	_, err := backend(f, 9).BuildBase(context.Background(), "alpha", strings.NewReader(""), strings.NewReader(""), "p.sh")
 	if !errors.Is(err, ErrDiskShort) || len(f.calls) != 0 {
 		t.Fatalf("err %v, calls %v", err, f.argsList())
 	}
@@ -419,5 +429,17 @@ func wait(t *testing.T, done chan error) error {
 	case <-time.After(5 * time.Second):
 		t.Fatal("done was not called")
 		return nil
+	}
+}
+
+func TestABaseWithNoEngineVersionFailsAndKeepsTheOldOne(t *testing.T) {
+	f := &fakeLima{list: `{"name":"` + base + `"}`, noEngine: true}
+	if err := build(t, f); err == nil || !strings.Contains(err.Error(), "no Docker Engine version") {
+		t.Fatalf("err %v", err)
+	}
+	for _, c := range f.argsList() {
+		if strings.Contains(c, base) {
+			t.Fatalf("the old base was touched: %q", c)
+		}
 	}
 }

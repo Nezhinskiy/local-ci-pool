@@ -45,20 +45,20 @@ docker info >/dev/null || exit 14
 exit 0
 `
 	// A symlinked provision is refused inside the VM: the build fails and leaves no base.
-	if err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
+	if _, err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
 		tarWithLink(t, "ci/vm/provision.sh", "/etc/hostname"), "ci/vm/provision.sh"); err == nil {
 		t.Fatal("a symlinked provision built a base")
 	}
-	if err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
+	if _, err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
 		tarWithLink(t, "ci", "/etc"), "ci/hostname"); err == nil {
 		t.Fatal("a provision under a symlinked directory built a base")
 	}
-	if err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
+	if _, err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
 		tarOf(t, map[string]string{"ci/vm/provision.sh": "touch /etc/local-ci-provisioned\n"}), "ci/vm/provision.sh"); err != nil {
 		t.Fatal(err)
 	}
 	// A second build replaces the first through the swap; the first base is gone afterwards.
-	if err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
+	if _, err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
 		tarOf(t, map[string]string{"ci/vm/provision.sh": "touch /etc/local-ci-provisioned\n"}), "ci/vm/provision.sh"); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}

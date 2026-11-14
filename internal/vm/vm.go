@@ -140,21 +140,22 @@ const provisionScript = `cd "$1" && p="$1/$2" && r="$(realpath -e -- "$p")" && [
 // BuildBase builds identity's base from runnerTree (a tar of the runner tree) and source, running provision
 // (a path inside source) as root. source must be the default branch's archive of the docker block's inputs,
 // never a pull request's or probe mode's ref. It builds under its own name, and swaps the new base in only
-// once it is complete and stopped: a failed build, or a failed swap, keeps the old base.
-func (b *Backend) BuildBase(ctx context.Context, identity string, runnerTree, source io.Reader, provision string) error {
+// once it is complete and stopped: a failed build, or a failed swap, keeps the old base. It returns the
+// Docker Engine version of the new base, for the caller's record of the base's key.
+func (b *Backend) BuildBase(ctx context.Context, identity string, runnerTree, source io.Reader, provision string) (string, error) {
 	if !provisionRE.MatchString(provision) || strings.Contains(provision, "..") {
-		return fmt.Errorf("provision path %q is not a plain relative path of letters, digits and ._/-", provision)
+		return "", fmt.Errorf("provision path %q is not a plain relative path of letters, digits and ._/-", provision)
 	}
 	base, err := b.BaseName(identity)
 	if err != nil {
-		return err
+		return "", err
 	}
 	building, err := b.name("building", identity)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := b.diskOK(); err != nil {
-		return err
+		return "", err
 	}
 	_ = b.remove(ctx, building) // a build a killed pool left behind
 	steps := []struct {
@@ -169,15 +170,25 @@ func (b *Backend) BuildBase(ctx context.Context, identity string, runnerTree, so
 		{source, []string{"shell", building, "--", "sudo", "sh", "-c", `mkdir -p "$1" && tar -x -C "$1"`, "sh", SourceDir}},
 		{nil, []string{"shell", building, "--", "sudo", "sh", "-c", provisionScript, "sh", SourceDir, provision}},
 		{nil, []string{"shell", building, "--", "sudo", "rm", "-rf", SourceDir}},
+		{nil, []string{"shell", building, "--", "sudo", "docker", "version", "--format", "{{.Server.Version}}"}},
 		{nil, []string{"stop", building}},
 	}
-	for _, s := range steps {
-		if _, err := b.Lima.Run(ctx, s.stdin, s.args...); err != nil {
+	var engine string
+	for i, s := range steps {
+		out, err := b.Lima.Run(ctx, s.stdin, s.args...)
+		if err != nil {
 			_ = b.remove(context.WithoutCancel(ctx), building)
-			return fmt.Errorf("building the docker base of %s: %w", identity, err)
+			return "", fmt.Errorf("building the docker base of %s: %w", identity, err)
+		}
+		if i == len(steps)-2 {
+			engine = strings.TrimSpace(string(out))
 		}
 	}
-	return b.swap(context.WithoutCancel(ctx), identity, base, building)
+	if engine == "" {
+		_ = b.remove(context.WithoutCancel(ctx), building)
+		return "", fmt.Errorf("building the docker base of %s: the base reports no Docker Engine version", identity)
+	}
+	return engine, b.swap(context.WithoutCancel(ctx), identity, base, building)
 }
 
 // swap puts building in place of base. The old base is renamed aside first and deleted only once the new
