@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -187,4 +188,21 @@ func detect(ctx context.Context, run runFunc, info func(ctx context.Context) (Fi
 		Slots: Slots(fp.Mem, fp.CPUs),
 		FP:    fp,
 	}, nil
+}
+
+// HostMemory is the Mac's physical memory in bytes, from sysctl hw.memsize.
+func HostMemory() (int64, error) {
+	out, err := exec.Command("/usr/sbin/sysctl", "-n", "hw.memsize").Output()
+	if err != nil {
+		return 0, fmt.Errorf("sysctl hw.memsize: %w", err)
+	}
+	return parseMemsize(string(out))
+}
+
+func parseMemsize(s string) (int64, error) {
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("sysctl hw.memsize: not a positive byte count: %q", strings.TrimSpace(s))
+	}
+	return n, nil
 }

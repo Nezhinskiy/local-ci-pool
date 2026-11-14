@@ -67,6 +67,8 @@ func newRealPool(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, erro
 			s, invalid := settings.Load()
 			return s.JobsMax, invalid
 		},
+		// The Mac's memory, which bounds a job's memory share.
+		HostMem: machine.HostMemory,
 		// The docker class's VMs (docs/docker-class.md): one at a time, below
 		// MinFreeGiB of free disk where Lima keeps them none.
 		VM: &vm.Backend{

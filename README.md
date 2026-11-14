@@ -54,8 +54,8 @@ is; [bench/](bench/README.md) is a harness to measure your own jobs. Check
 - The job runs in your marker image, not in GitHub's runner image, so the tools GitHub preinstalls
   are not there unless your image has them.
 - A job runs as a non-root user outside group root (the image's own non-root `USER`, otherwise
-  `1001:1001`) under a 4 GiB memory limit, a 4096-process limit and a CPU cap at its share of the
-  Docker VM's CPUs. Install what the job needs in
+  `1001:1001`) under a memory limit and a CPU cap at its share of the Docker VM (at least 4 GiB, and
+  never more than the Mac holds beside macOS) and a 4096-process limit. Install what the job needs in
   the image, not with `sudo apt-get` in a step.
 - Jobs cannot reach each other's ports: every job container of the pool joins one bridge network
   with traffic between containers turned off.
@@ -451,7 +451,7 @@ code: everything a job runs is code from those repositories. In short:
   writes it to disk, logs it or passes it to a container. A job sees only the `GITHUB_TOKEN` its
   workflow grants it.
 - A job container mounts only the read-only runner, with no host folders and no Docker socket. It
-  runs as a non-root user outside group root, with `--init`, a 4 GiB memory limit and a limit of 4096
+  runs as a non-root user outside group root, with `--init`, a memory limit of at least 4 GiB and a limit of 4096
   processes, and is removed after its job.
 - A public repository is refused. Before each runner starts, the pool needs GitHub's answer, at most a
   minute old, that the repository is private; a failed check is a refusal.

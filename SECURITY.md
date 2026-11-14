@@ -31,8 +31,8 @@ container is code from those repositories. It is not a sandbox for untrusted cod
   and the Mac already holds the owner's own `gh` login, which can do more. Record the decision in the
   repository that makes it.
 - A job container mounts only the runner image mount, read-only: no host volumes and no Docker socket.
-  It runs with `--init`, a 4 GiB memory limit and a limit of 4096 processes and threads, and is
-  removed after its job. It is capped at its share of the VM's CPUs (the CPUs divided by the cap
+  It runs with `--init`, a memory limit of at least 4 GiB (its share of the VM's memory) and a limit
+  of 4096 processes and threads, and is removed after its job. It is capped at its share of the VM's CPUs (the CPUs divided by the cap
   on jobs, or by the slots; the runbook's "Limiting concurrent jobs"). The consequence is that nothing inside a job can use Docker (`services:`, a job `container:`,
   Docker container actions, `docker build`); see [What does not work](README.md#what-does-not-work).
 - A job runs as a non-root user, outside group root. The image's `USER` is kept unless it is root,

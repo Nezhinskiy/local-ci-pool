@@ -255,6 +255,11 @@ type Deps struct {
 	// pool could not use, whose last valid cap stays in force
 	// (config.File). Nil: no cap.
 	JobsMax func() (max int, invalid bool)
+	// HostMem reads the Mac's physical memory in bytes (sysctl hw.memsize),
+	// once at start: a job's memory share never counts on more of it than
+	// there is (memoryPerJob). Nil or an error: the share follows the Docker
+	// VM alone.
+	HostMem func() (int64, error)
 	// VM runs the docker class's base VMs and job clones (dockerclass.go).
 	// Nil: a docker-class project fails its setup.
 	VM *vm.Backend
@@ -342,6 +347,8 @@ type Supervisor struct {
 	jobs          *runner.Slots
 	jobsMax       int
 	configInvalid bool
+	// hostMem is the Mac's physical memory in bytes, 0 when unknown (Deps.HostMem).
+	hostMem int64
 	// vmLeak is set when a docker VM may still run (a delete, or the start-up
 	// sweep, failed): no docker VM starts until a restart.
 	vmLeak   string
@@ -507,7 +514,17 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	s.vmSlots.Within(s.jobs)
 	s.dockerOK = true
 	s.mu.Unlock()
+	if s.deps.HostMem != nil {
+		mem, err := s.deps.HostMem()
+		if err != nil {
+			s.log.Warn("reading the Mac's memory; a job's memory share follows the Docker VM alone", "error", err.Error())
+		}
+		s.mu.Lock()
+		s.hostMem = max(mem, 0)
+		s.mu.Unlock()
+	}
 	s.readSettings()
+	s.log.Info("a job's share", "memory_gib", s.memoryPerJob()>>30, "cpus", s.cpusPerJob(), "host_memory_gib", s.hostMem>>30)
 	// The pid lets the installer tell this process's lines in the shared log
 	// from an earlier run's: it must not send a second SIGTERM to a pool that
 	// is already draining (cmd/pool restores the default action after the
@@ -647,7 +664,7 @@ func (s *Supervisor) readSettings() {
 		limit = n
 	}
 	s.jobs.SetCap(limit)
-	s.log.Info("cap on jobs", "max", n, "slots", s.slots.Cap())
+	s.log.Info("cap on jobs", "max", n, "slots", s.slots.Cap(), "job_memory_gib", s.memoryPerJob()>>30, "job_cpus", s.cpusPerJob())
 	s.requestCapacity()
 }
 
@@ -660,11 +677,50 @@ func (s *Supervisor) readSettings() {
 func (s *Supervisor) cpusPerJob() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	div := s.machine.Slots
+	return max(s.machine.FP.CPUs/s.jobsAtOnceLocked(), 1)
+}
+
+// jobsAtOnceLocked is how many container jobs can run at once: the cap on
+// jobs, never more than the slots. The pool never starts with fewer than 1 slot.
+func (s *Supervisor) jobsAtOnceLocked() int {
 	if s.jobsMax > 0 {
-		div = min(s.jobsMax, div)
+		return min(s.jobsMax, s.machine.Slots)
 	}
-	return max(s.machine.FP.CPUs/div, 1)
+	return s.machine.Slots
+}
+
+// memoryPerJob is the memory limit of one container job (JobMemory).
+func (s *Supervisor) memoryPerJob() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return JobMemory(s.machine.FP.Mem, s.hostMem, s.jobsAtOnceLocked())
+}
+
+// What a job's memory share leaves alone, in GiB: of the Docker VM, what
+// Slots leaves to Docker itself; of the Mac, room for macOS and its apps. The
+// docker class's VM counts as one of the jobs.
+const (
+	dockerReserveGiB = 2
+	hostReserveGiB   = 8
+	jobMemoryMinGiB  = 4 // what every job had before the share: never less
+)
+
+// JobMemory is the memory limit of one of jobs container jobs running at once:
+//
+//	max(4 GiB, floor(min(Docker VM GiB - 2, Mac GiB - 8) / jobs))
+//
+// with both sizes rounded to the nearest GiB as Slots rounds them (Docker
+// Desktop reports MemTotal slightly below its slider). The Docker VM term
+// keeps all jobs inside the VM; the Mac's term keeps them inside the Mac when
+// the VM is given nearly all of it, since the VM keeps the memory its guests
+// touch. hostBytes 0 (unknown) leaves the Mac's term out.
+func JobMemory(dockerBytes, hostBytes int64, jobs int) int64 {
+	const gib = 1 << 30
+	avail := (dockerBytes+gib/2)/gib - dockerReserveGiB
+	if hostBytes > 0 {
+		avail = min(avail, (hostBytes+gib/2)/gib-hostReserveGiB)
+	}
+	return max(avail/int64(max(jobs, 1)), jobMemoryMinGiB) * gib
 }
 
 // FailOnLoginLoss ends Run with a terminal error if err means the GitHub login

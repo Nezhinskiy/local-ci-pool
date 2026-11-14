@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -29,7 +30,8 @@ const (
 	entrypoint = runnermount.Target + "/entrypoint.sh"
 	homeDir    = "/tmp/home"
 	shmSize    = 1 << 30
-	memory     = 4 << 30
+	// DefaultMemory is a job container's memory limit when its spec sets none.
+	DefaultMemory = 4 << 30
 	// pidsLimit caps a job's processes and threads, so a fork or thread bomb
 	// stops in its own container and not at the VM's threads-max, where
 	// every other job and Docker itself would fail with it.
@@ -82,6 +84,8 @@ type ContainerSpec struct {
 	// workers by os.availableParallelism, which follows the quota, takes its share and not the whole VM;
 	// nproc and os.cpus() still see every CPU of the VM. 0 sets no cap.
 	CPUs int
+	// Memory is the container's memory limit in bytes, the tmpfs HOME included; 0 is DefaultMemory.
+	Memory int64
 }
 
 // NetworkName is the bridge network the runners of an instance join.
@@ -200,7 +204,7 @@ func StartRunner(ctx context.Context, d Docker, s ContainerSpec) (id string, err
 			ShmSize:     shmSize,
 			NetworkMode: container.NetworkMode(NetworkName(s.Instance)),
 			Resources: container.Resources{
-				Memory:    memory,
+				Memory:    cmp.Or(s.Memory, DefaultMemory),
 				PidsLimit: &pids,
 				NanoCPUs:  int64(s.CPUs) * 1e9,
 			},

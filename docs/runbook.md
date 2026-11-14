@@ -497,6 +497,18 @@ throttled. A job left running by a previous pool (a survivor, after a kill or la
 keeps the CPU limit it started with, which from a release before this one is none. A docker VM keeps
 its own 4 CPUs and counts as one job.
 
+Its memory limit is shared the same way, and bounded by the Mac:
+`max(4 GiB, floor(min(Docker VM GiB - 2, Mac GiB - 8) / jobs))`, with `jobs` the cap (never more than
+the slots), or the slots without a cap, and both sizes rounded to the nearest GiB. The 2 GiB are Docker's
+own, as in the slot count. The 8 GiB are left to macOS and its apps, because Docker Desktop's VM keeps
+the memory its jobs touch: on a 48 GiB Mac whose Docker VM has 47 GiB, the VM's term alone would allow
+four jobs 11 GiB each, 44 GiB in all, and the Mac would swap. With the Mac's term and a cap of 4, each job
+gets 10 GiB. A docker VM (6 GiB) counts as one of the jobs, so it always fits beside the others. The
+limit includes the job's HOME, a tmpfs. On a 16 GiB Mac with a 9.7 GiB Docker VM and 2 slots, a job
+keeps 4 GiB. The pool reads the Mac's memory once at start (`sysctl hw.memsize`) and logs each job's
+share then (`a job's share`) and on every change of the cap. A survivor keeps the limit it started
+with.
+
 **Where.** The pool resolves the path on every read:
 
 1. `$XDG_CONFIG_HOME/local-ci-pool/config.toml` when `XDG_CONFIG_HOME` is set and absolute,

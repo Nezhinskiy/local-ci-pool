@@ -564,6 +564,7 @@ func (pr *project) start(ctx context.Context, name, jit string) error {
 		Mount:    m.Spec,
 		JIT:      jit,
 		CPUs:     pr.s.cpusPerJob(),
+		Memory:   pr.s.memoryPerJob(),
 	})
 	return err
 }

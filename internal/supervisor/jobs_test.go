@@ -203,3 +203,67 @@ func TestEveryContainerGetsItsShareOfTheCPUs(t *testing.T) {
 		})
 	}
 }
+
+// A job's memory is the Docker VM's, less Docker's own share, divided among the
+// jobs that can run at once, and never more than the Mac can hold beside macOS,
+// nor less than the 4 GiB every job had before.
+func TestJobMemory(t *testing.T) {
+	const gib = int64(1) << 30
+	for _, tc := range []struct {
+		name         string
+		docker, host int64
+		jobs         int
+		wantGiB      int64
+	}{
+		{"a 48 GiB Mac with a 47 GiB Docker VM and 4 jobs: the Mac's term", 50425344000, 48 * gib, 4, 10},
+		{"the same Mac, one job: the Mac's term", 50425344000, 48 * gib, 1, 40},
+		{"the same VM on a Mac of unknown memory: the VM's term", 50425344000, 0, 4, 11},
+		{"a small VM on a large Mac: the VM's term", 16 * gib, 64 * gib, 2, 7},
+		{"a 16 GiB Mac with a 9.7 GiB Docker VM and 2 jobs", 10416644096, 16 * gib, 2, 4},
+		{"never below 4 GiB", 8 * gib, 16 * gib, 2, 4},
+		{"7.75 GiB rounds to 8, as Slots rounds it", 8321499136, 64 * gib, 1, 6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := JobMemory(tc.docker, tc.host, tc.jobs); got != tc.wantGiB*gib {
+				t.Fatalf("JobMemory(%d, %d, %d) = %d GiB, want %d", tc.docker, tc.host, tc.jobs, got/gib, tc.wantGiB)
+			}
+		})
+	}
+}
+
+// Every container job gets that memory as its limit, divided by the cap (never
+// more than the slots) and bounded by the Mac's memory the pool read at start.
+func TestEveryContainerGetsItsShareOfTheMemory(t *testing.T) {
+	const gib = int64(1) << 30
+	for _, tc := range []struct {
+		name     string
+		hostMem  int64
+		settings *fakeSettings
+		wantGiB  int64
+	}{
+		{"a 30 GiB VM, a cap of 2, a 64 GiB Mac", 64 * gib, &fakeSettings{max: 2}, 14},
+		{"the same, a 24 GiB Mac", 24 * gib, &fakeSettings{max: 2}, 8},
+		{"no cap: 4 slots, the Mac unknown", 0, nil, 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, 4, 1000, "alpha")
+			h.docker.info.MemTotal = 30 * gib
+			h.hostMem = tc.hostMem
+			if tc.settings != nil {
+				h.settings = tc.settings
+			}
+			h.start()
+			h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+			h.actions.Assign(alphaSet, 1)
+			img := h.imageOf("alpha")
+			h.eventually("a runner", func() bool { return len(h.docker.runners(img)) == 1 })
+			h.docker.mu.Lock()
+			defer h.docker.mu.Unlock()
+			for name, c := range h.docker.containers {
+				if c.image == img && c.memory != tc.wantGiB*gib {
+					t.Fatalf("%s: Memory %d GiB, want %d", name, c.memory/gib, tc.wantGiB)
+				}
+			}
+		})
+	}
+}
