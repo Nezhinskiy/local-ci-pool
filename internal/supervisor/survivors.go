@@ -3,7 +3,6 @@ package supervisor
 import (
 	"context"
 	"fmt"
-	"strconv"
 
 	"github.com/moby/moby/api/types/container"
 
@@ -20,11 +19,6 @@ import (
 // watcher and the reconcile release each one exactly once, and only a
 // survivor a slot was held for gives one back.
 //
-// With the budget on (Deps.Budget enabled at start), each survivor is also
-// adopted into it, under the project and the need its labels name, once the
-// exit watcher has subscribed; its adoption is released with its slot. With
-// the budget off, survivors are kept as above and never adopted.
-//
 // A survivor's job still counts in its scale set's assigned jobs, so the
 // listener's desired count includes it. Each project's scaler counts that
 // project's survivors against the count (survivorsOf), so it starts no idle
@@ -34,38 +28,29 @@ import (
 
 // survivor is one runner of a previous run kept at start.
 type survivor struct {
-	held    bool        // a slot was taken for it
-	project string      // its project label; empty for a runner of an older pool
-	need    int         // its need label as a number, else 0; the gate takes a need outside 1..256 as its cpu
-	mode    runner.Mode // set by its adoption
-	release func()      // its adoption's Release; runner.NoRelease before
+	held    bool   // a slot was taken for it
+	project string // its project label; empty for a runner of an older pool
 }
 
 // sweep removes the containers a previous run of this instance left that are
 // not running (created, exited or dead), and only those. A running one is kept
-// as a survivor, with the project and the need its labels name. A running
-// container without a runner name is not one this pool started, and is
-// removed as before. With the budget on, sweep returns the survivors' names:
-// they are adopted into the budget once the exit watcher has subscribed
-// (adoptSurvivors), never here.
-func (s *Supervisor) sweep(ctx context.Context) ([]string, error) {
+// as a survivor, with the project its labels name. A running container
+// without a runner name is not one this pool started, and is removed as
+// before.
+func (s *Supervisor) sweep(ctx context.Context) error {
 	list, err := s.listContainers(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("sweeping orphaned runner containers: %w", err)
+		return fmt.Errorf("sweeping orphaned runner containers: %w", err)
 	}
-	var kept []string
 	for _, c := range list {
 		if c.Labels[runner.LabelInstance] != s.instance {
 			continue
 		}
 		name := c.Labels[runner.LabelRunner]
 		if name != "" && !sweepable(c.State) {
-			// A survivor of an older pool names no project: it is adopted
-			// with none (the gate labels it as the pool's own) and counts
-			// under no project in the health.
-			if s.keepSurvivor(name, c.Labels[runner.LabelProject], survivorNeed(c.Labels)) {
-				kept = append(kept, name)
-			}
+			// A survivor of an older pool names no project: it counts for
+			// none.
+			s.keepSurvivor(name, c.Labels[runner.LabelProject])
 			continue
 		}
 		rctx, cancel := context.WithTimeout(ctx, callTimeout)
@@ -77,21 +62,7 @@ func (s *Supervisor) sweep(ctx context.Context) ([]string, error) {
 		}
 		s.log.Info("removed an orphaned runner container", "runner", name)
 	}
-	if s.deps.Budget == nil || !s.deps.Budget.Enabled() {
-		return nil, nil
-	}
-	return kept, nil
-}
-
-// survivorNeed is the need a survivor's labels name, when it is a number;
-// otherwise 0. The gate takes any need outside 1..256 (0 included) as the
-// configured one, as runner.Admission says.
-func survivorNeed(labels map[string]string) int {
-	n, err := strconv.Atoi(labels[runner.LabelNeed])
-	if err != nil {
-		return 0
-	}
-	return n
+	return nil
 }
 
 // sweepable reports whether a container in state st has no job to finish.
@@ -105,87 +76,38 @@ func sweepable(st container.ContainerState) bool {
 
 // keepSurvivor records a running runner of the previous run and holds a slot
 // for it if one is free. With more survivors than slots the rest run without
-// one, and the machine is oversubscribed until enough of them exit. It
-// reports whether name was recorded now.
-func (s *Supervisor) keepSurvivor(name, project string, need int) bool {
+// one, and the machine is oversubscribed until enough of them exit.
+func (s *Supervisor) keepSurvivor(name, project string) {
 	s.mu.Lock()
 	if _, ok := s.survivors[name]; ok {
 		s.mu.Unlock()
-		return false
+		return
 	}
 	held := s.slots.TryAcquire()
-	s.survivors[name] = &survivor{held: held, project: project, need: need, release: runner.NoRelease}
+	s.survivors[name] = &survivor{held: held, project: project}
 	s.mu.Unlock()
 	if held {
 		s.log.Info("left a runner of the previous run running to finish its job; it holds a slot until it exits", "runner", name)
-		return true
+		return
 	}
 	s.log.Warn("left a runner of the previous run running to finish its job, but every slot is held: the Mac runs more runners than slots until enough of them exit", "runner", name)
-	return true
 }
 
-// adoptSurvivors adopts each survivor still recorded into the budget, one at
-// a time. Adopt runs outside s.mu (the gate bounds it). A survivor released
-// meanwhile (its die event, a reconcile) has its adoption released at once,
-// after unlocking; otherwise the entry keeps the adoption's mode and Release.
-// A survivor whose adoption failed open runs on, unbudgeted.
-func (s *Supervisor) adoptSurvivors(ctx context.Context, names []string) {
-	for _, name := range names {
-		// After the pool's life ended an Adopt could only fail open: the
-		// survivors left keep running unbudgeted, as before adoption.
-		if ctx.Err() != nil {
-			return
-		}
-		s.mu.Lock()
-		e, ok := s.survivors[name]
-		var a runner.Admission
-		if ok {
-			a = runner.Admission{Runner: name, Project: e.project, Need: e.need}
-		}
-		s.mu.Unlock()
-		if !ok {
-			continue
-		}
-		adm := s.deps.Budget.Adopt(ctx, a)
-		s.mu.Lock()
-		if s.survivors[name] == e {
-			e.mode, e.release = adm.Mode, adm.Release
-			s.mu.Unlock()
-			continue
-		}
-		s.mu.Unlock()
-		adm.Release()
-	}
-}
-
-// releaseSurvivor forgets a survivor (forgetSurvivorLocked) and releases its
-// adoption after unlocking. It reports whether name was a survivor; a second
-// call for the same name does nothing, so a replayed die event and a reconcile
-// never release twice.
+// releaseSurvivor forgets a survivor and gives back the slot held for it, if
+// any. It reports whether name was a survivor; a second call for the same name
+// does nothing, so a replayed die event and a reconcile never release twice.
 func (s *Supervisor) releaseSurvivor(name string) bool {
 	s.mu.Lock()
-	release, ok := s.forgetSurvivorLocked(name)
-	s.mu.Unlock()
-	release()
-	return ok
-}
-
-// forgetSurvivorLocked forgets a survivor: it deletes its entry, gives back
-// the slot held for it, if any, and detaches its adoption. It returns the
-// adoption's Release, which the caller calls after unlocking, never under
-// s.mu, and whether name was a survivor; for a name that was not, the Release
-// is runner.NoRelease. s.mu is held.
-func (s *Supervisor) forgetSurvivorLocked(name string) (release func(), ok bool) {
+	defer s.mu.Unlock()
 	e, ok := s.survivors[name]
 	if !ok {
-		return runner.NoRelease, false
+		return false
 	}
 	delete(s.survivors, name)
 	if e.held {
 		s.slots.Release()
 	}
-	release, e.release = e.release, runner.NoRelease
-	return release, true
+	return true
 }
 
 // removeSurvivors removes the containers of the survivors whose labels name
@@ -225,28 +147,6 @@ func (s *Supervisor) survivorsOf(project string) int {
 		}
 	}
 	return n
-}
-
-// survivorCountsLocked counts the survivors admitted into the budget, by the
-// project their labels name and by the mode of their adoption: adopted or
-// fail_open. A survivor of an older pool names no project: it is counted
-// under "", which no served project's identity is (discovery skips an empty
-// one), so it counts under none. s.mu is held.
-func (s *Supervisor) survivorCountsLocked() map[string]AdmittedHealth {
-	out := map[string]AdmittedHealth{}
-	for _, e := range s.survivors {
-		c := out[e.project]
-		switch e.mode {
-		case runner.ModeAdopted:
-			c.Adopted++
-		case runner.ModeFailOpen:
-			c.FailOpen++
-		default:
-			continue
-		}
-		out[e.project] = c
-	}
-	return out
 }
 
 // survivorNames returns the current survivors' names.

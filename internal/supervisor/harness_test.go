@@ -23,7 +23,6 @@ import (
 	"github.com/moby/moby/api/types/system"
 	"github.com/moby/moby/client"
 
-	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
 	"github.com/Nezhinskiy/local-ci-pool/internal/fakeactions"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
@@ -64,7 +63,9 @@ type fakeContainer struct {
 	labels map[string]string
 	image  string
 	mount  string // the runner mount's source
-	state  container.ContainerState
+	// nanoCPUs is the container's CPU quota.
+	nanoCPUs int64
+	state    container.ContainerState
 }
 
 // fakeDocker keeps containers by name (the ID is the name) and broadcasts die
@@ -88,8 +89,6 @@ type fakeDocker struct {
 	createErr   error  // every ContainerCreate fails with it
 	// removeHang makes every ContainerRemove wait for its context to end.
 	removeHang bool
-	// subscriptions counts the Events calls.
-	subscriptions int
 }
 
 func newFakeDocker() *fakeDocker {
@@ -100,7 +99,7 @@ func newFakeDocker() *fakeDocker {
 }
 
 func (f *fakeDocker) ContainerCreate(ctx context.Context, o client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
-	c := &fakeContainer{labels: o.Config.Labels, image: o.Config.Image, state: container.StateCreated}
+	c := &fakeContainer{labels: o.Config.Labels, image: o.Config.Image, state: container.StateCreated, nanoCPUs: o.HostConfig.NanoCPUs}
 	if len(o.HostConfig.Mounts) == 1 {
 		c.mount = o.HostConfig.Mounts[0].Source
 	}
@@ -176,19 +175,11 @@ func (f *fakeDocker) ContainerRemove(ctx context.Context, id string, _ client.Co
 func (f *fakeDocker) Events(context.Context, client.EventsListOptions) client.EventsResult {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.subscriptions++
 	ch := make(chan events.Message, 64)
 	errs := make(chan error, 1)
 	f.subs = append(f.subs, ch)
 	f.subErrs = append(f.subErrs, errs)
 	return client.EventsResult{Messages: ch, Err: errs}
-}
-
-// subscribed is the number of Events calls so far.
-func (f *fakeDocker) subscribed() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.subscriptions
 }
 
 // breakEvents ends every events stream with an error, as a Docker restart
@@ -632,94 +623,26 @@ func (c *fakeCaffeinate) state() (starts, stops int, running bool) {
 	return c.starts, c.stops, c.running
 }
 
-// ---- fake budget ----
+// ---- fake settings ----
 
-// fakeBudget is a budget gate the test scripts. Admit and Adopt call the
-// test's functions when set; by default Admit admits at once (queued, need 2)
-// and Adopt adopts with the need asked. Every Release it hands out counts its
-// calls by runner name, then runs onRelease, which the harness sets.
-type fakeBudget struct {
-	mu        sync.Mutex
-	enabled   bool
-	state     budget.State
-	admit     func(ctx context.Context, a runner.Admission) (runner.Admitted, error)
-	adopt     func(ctx context.Context, a runner.Admission) runner.Admitted
-	admits    []runner.Admission
-	adopts    []runner.Admission
-	released  map[string]int
-	onRelease func(name string)
+// fakeSettings is the cap on jobs the settings file holds (Deps.JobsMax),
+// set by the test while the pool runs.
+type fakeSettings struct {
+	mu      sync.Mutex
+	max     int
+	invalid bool
 }
 
-func newFakeBudget(enabled bool) *fakeBudget {
-	return &fakeBudget{enabled: enabled, state: budget.State{State: "on"}, released: map[string]int{}}
+func (f *fakeSettings) jobsMax() (int, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.max, f.invalid
 }
 
-func (b *fakeBudget) Enabled() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.enabled
-}
-
-func (b *fakeBudget) State() budget.State {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.state
-}
-
-func (b *fakeBudget) Admit(ctx context.Context, a runner.Admission) (runner.Admitted, error) {
-	b.mu.Lock()
-	b.admits = append(b.admits, a)
-	f := b.admit
-	b.mu.Unlock()
-	if f == nil {
-		return b.grant(a.Runner, runner.ModeQueued, 2), nil
-	}
-	return f(ctx, a)
-}
-
-func (b *fakeBudget) Adopt(ctx context.Context, a runner.Admission) runner.Admitted {
-	b.mu.Lock()
-	b.adopts = append(b.adopts, a)
-	f := b.adopt
-	b.mu.Unlock()
-	if f == nil {
-		return b.grant(a.Runner, runner.ModeAdopted, a.Need)
-	}
-	return f(ctx, a)
-}
-
-// grant is an admission whose Release counts its calls.
-func (b *fakeBudget) grant(name string, mode runner.Mode, need int) runner.Admitted {
-	return runner.Admitted{Mode: mode, Need: need, Release: func() {
-		b.mu.Lock()
-		b.released[name]++
-		on := b.onRelease
-		b.mu.Unlock()
-		if on != nil {
-			on(name)
-		}
-	}}
-}
-
-func (b *fakeBudget) releases(name string) int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.released[name]
-}
-
-func (b *fakeBudget) admitted() []runner.Admission {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return slices.Clone(b.admits)
-}
-
-// adopted lists the Adopt calls, sorted by runner name.
-func (b *fakeBudget) adopted() []runner.Admission {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	out := slices.Clone(b.adopts)
-	slices.SortFunc(out, func(x, y runner.Admission) int { return strings.Compare(x.Runner, y.Runner) })
-	return out
+func (f *fakeSettings) set(max int, invalid bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.max, f.invalid = max, invalid
 }
 
 // ---- log ----
@@ -754,8 +677,8 @@ type harness struct {
 	cfg     Config
 	slots   int
 	logs    *syncBuffer
-	// budget is Deps.Budget; nil leaves the budget off.
-	budget Budget
+	// settings is Deps.JobsMax; nil reads no settings file.
+	settings *fakeSettings
 	// serve is Deps.Serve, the health endpoint; nil serves none.
 	serve func(ctx context.Context, ln net.Listener)
 	// lima is Deps.VM's limactl and mirror Deps.Mirror (dockerclass_test.go);
@@ -917,7 +840,7 @@ func (h *harness) deps() Deps {
 		},
 		Caffeinate: h.caff.start,
 		Serve:      h.serve,
-		Budget:     h.budget,
+		JobsMax:    h.jobsMax(),
 		VM:         h.vmBackend(),
 		Mirror:     h.mirrorDep(),
 		StateDir:   h.stateDir,
@@ -927,30 +850,18 @@ func (h *harness) deps() Deps {
 func (h *harness) start() {
 	h.t.Helper()
 	h.sup = New(h.cfg, h.deps())
-	if b, ok := h.budget.(*fakeBudget); ok && b != nil {
-		b.mu.Lock()
-		b.onRelease = h.releasedOutsideLock
-		b.mu.Unlock()
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
 	h.done = make(chan error, 1)
 	go func() { h.done <- h.sup.Run(ctx) }()
 }
 
-// releasedOutsideLock fails the test if a Release ran under the supervisor's
-// lock: it takes that lock on another goroutine, which then blocks.
-func (h *harness) releasedOutsideLock(name string) {
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		h.sup.survivorNames()
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		h.t.Errorf("Release of %s ran under the supervisor's lock: its lock blocked for 2s", name)
+// jobsMax is Deps.JobsMax: the fake settings' read, or nil without them.
+func (h *harness) jobsMax() func() (int, bool) {
+	if h.settings == nil {
+		return nil
 	}
+	return h.settings.jobsMax
 }
 
 // wait returns Run's result, failing the test if it does not return in time.

@@ -1,7 +1,6 @@
 package supervisor
 
 import (
-	"context"
 	"errors"
 	"slices"
 	"strings"
@@ -9,7 +8,6 @@ import (
 	"time"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
-	"github.com/Nezhinskiy/local-ci-pool/internal/runner"
 )
 
 const stuckRun = "https://github.example/example/alpha/actions/runs/11"
@@ -49,19 +47,9 @@ func TestQueuedJobWithFreeSlotsIsReported(t *testing.T) {
 }
 
 // Nothing is reported, and GitHub is not asked, while a runner of the project
-// waits for the job; the report clears once one does.
-func TestQueuedJobWithARunnerWaitingIsNotReported(t *testing.T) {
+// is idle for the job; the report clears once one is.
+func TestQueuedJobWithAnIdleRunnerIsNotReported(t *testing.T) {
 	h := newHarness(t, 2, 1000, "alpha")
-	h.budget = newFakeBudget(true)
-	hold := make(chan struct{})
-	h.budget.(*fakeBudget).admit = func(ctx context.Context, a runner.Admission) (runner.Admitted, error) {
-		select {
-		case <-hold:
-		case <-ctx.Done():
-		}
-		return runner.Admitted{Release: runner.NoRelease}, ctx.Err()
-	}
-	t.Cleanup(func() { close(hold) })
 	h.gh.setQueued(alphaRepo, github.QueuedJob{RunURL: stuckRun, ID: 1, Name: "frontend",
 		Labels: []string{"alpha-local"}, Created: h.clock.Now().Add(-time.Hour)})
 	h.start()
@@ -70,14 +58,14 @@ func TestQueuedJobWithARunnerWaitingIsNotReported(t *testing.T) {
 		return len(p.Stuck) == 1
 	})
 	h.actions.Assign(alphaSet, 1)
-	h.eventually("the report cleared while a runner waits", func() bool {
+	h.eventually("the report cleared while a runner is idle", func() bool {
 		p, _ := h.health(alphaRepo)
-		return p.Waiting == 1 && len(p.Stuck) == 0
+		return len(h.docker.runners(h.imageOf("alpha"))) == 1 && len(p.Stuck) == 0
 	})
 	calls := h.gh.calls()
 	time.Sleep(2 * queuedPoll / 1000)
 	if got := h.gh.calls(); got != calls {
-		t.Fatalf("GitHub asked %d more times while a runner waits, want none", got-calls)
+		t.Fatalf("GitHub asked %d more times while a runner is idle, want none", got-calls)
 	}
 }
 

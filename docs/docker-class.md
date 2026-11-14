@@ -70,7 +70,8 @@ before a repository commits the block.**
 
   A job's writes, and its image builds and caches, stay in its clone; the base is never booted again.
 - One docker VM runs at a time on a machine, whatever the repository (one machine-wide slot), with its own
-  CPU and memory (4 CPUs, 6 GiB, a 30 GiB disk), outside Docker Desktop's slots and the core budget. A base
+  CPU and memory (4 CPUs, 6 GiB, a 30 GiB disk), outside Docker Desktop's slots, but it counts with the
+  container jobs against the [cap on jobs](runbook.md#limiting-concurrent-jobs), when one is set. A base
   build is a VM too and takes the same slot: it waits for a running job, and no job starts while it builds.
   Below 15 GiB free where Lima keeps its VMs (`$LIMA_HOME`, else `~/.lima`) the pool registers no runner and starts no VM, and
   `/healthz` reports the class unhealthy (`docker vm: not enough free disk …`). The job stays queued; the pool never moves it elsewhere.

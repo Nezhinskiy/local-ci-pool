@@ -6,7 +6,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 // fakeVet answers the scaler's Vet with err, and counts the calls.
@@ -66,31 +65,23 @@ func TestVetRefusalMintsNothing(t *testing.T) {
 	}
 }
 
-// A runner admitted by the gate is vetted again right before its mint: the
-// vet that passed when it was queued does not let it through once it refuses.
+// The vet runs again right before each mint: a refusal that comes after
+// Desired's own vet passed still mints nothing, and gives the slot back.
 func TestVetRunsBeforeEachMint(t *testing.T) {
 	v := &fakeVet{}
-	g := newFakeGate()
 	h := newHarnessWith(NewSlots(2), func(c *ScalerConfig) {
-		c.Gate = g
-		c.Vet = v.vet
-	})
-	t.Cleanup(func() {
-		h.scaler.Abort()
-		if !h.scaler.Join(2 * time.Second) {
-			t.Error("waiter goroutines still running after cleanup")
+		c.Vet = func(ctx context.Context) error {
+			err := v.vet(ctx)
+			v.set(errors.New("the repository is no longer private"))
+			return err
 		}
 	})
 	desired(t, h.scaler, 1)
-	req := g.next(t)
-	v.set(errors.New("the repository is no longer private"))
-	req.reply(g.admitted(req.name, ModeQueued, 2), nil)
-	eventually(t, "the refused runner released", func() bool { return h.scaler.slots.InUse() == 0 })
-	if m := h.jit.minted(); len(m) != 0 {
-		t.Fatalf("minted %v for a runner whose vet refused at the mint", m)
+	if n := v.count(); n != 2 {
+		t.Fatalf("%d vets, want Desired's and the mint's", n)
 	}
-	if g.releasedOf(req.name) != 1 {
-		t.Fatalf("the refused runner's grant released %d times, want 1", g.releasedOf(req.name))
+	if m := h.jit.minted(); len(m) != 0 || h.scaler.slots.InUse() != 0 {
+		t.Fatalf("minted %v, %d slots in use, for a runner whose vet refused at the mint", m, h.scaler.slots.InUse())
 	}
 }
 

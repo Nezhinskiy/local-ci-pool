@@ -79,3 +79,62 @@ func TestSlotsOnChange(t *testing.T) {
 		t.Fatalf("OnChange saw %v, want %v", seen, want)
 	}
 }
+
+// Two Slots within one parent never hold more than the parent's limit
+// together, whichever takes first, and a slot given back by either is free
+// for the other.
+func TestSlotsWithinAParentShareItsLimit(t *testing.T) {
+	jobs := NewSlots(3)
+	containers, vms := NewSlots(3), NewSlots(1)
+	containers.Within(jobs)
+	vms.Within(jobs)
+	if !vms.TryAcquire() {
+		t.Fatal("the VM slot could not be taken")
+	}
+	if containers.Cap() != 3 || containers.Free() != 2 {
+		t.Fatalf("containers Cap %d Free %d with the VM running, want 3 and 2", containers.Cap(), containers.Free())
+	}
+	for range 3 {
+		containers.TryAcquire()
+	}
+	if containers.InUse() != 2 {
+		t.Fatalf("containers took %d slots beside the VM, want 2", containers.InUse())
+	}
+	vms.Release()
+	if jobs.InUse() != 2 {
+		t.Fatalf("the parent holds %d after the VM ended, want 2", jobs.InUse())
+	}
+	if !containers.TryAcquire() || vms.TryAcquire() {
+		t.Fatalf("containers %d, VMs %d after the VM ended; want 3 and 0", containers.InUse(), vms.InUse())
+	}
+	if containers.InUse()+vms.InUse() != 3 {
+		t.Fatalf("children hold %d together, want the parent's 3", containers.InUse()+vms.InUse())
+	}
+}
+
+// A child refused by its parent takes nothing from either, and a lowered
+// parent keeps what is taken but gives nothing new until enough is released.
+func TestSlotsWithinALoweredParent(t *testing.T) {
+	jobs := NewSlots(4)
+	containers := NewSlots(4)
+	containers.Within(jobs)
+	for range 3 {
+		containers.TryAcquire()
+	}
+	jobs.SetCap(2)
+	if containers.Cap() != 2 || containers.Free() != 0 || containers.TryAcquire() {
+		t.Fatalf("Cap %d Free %d after the parent was lowered to 2, want 2, 0 and no acquire", containers.Cap(), containers.Free())
+	}
+	if containers.InUse() != 3 || jobs.InUse() != 3 {
+		t.Fatalf("in use %d and %d, want the 3 taken before", containers.InUse(), jobs.InUse())
+	}
+	containers.Release()
+	containers.Release()
+	if !containers.TryAcquire() || containers.TryAcquire() {
+		t.Fatalf("in use %d once below the lowered cap, want 2", containers.InUse())
+	}
+	jobs.SetCap(-1)
+	if jobs.Cap() != 0 {
+		t.Fatalf("parent cap %d, want 0", jobs.Cap())
+	}
+}

@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
 	"github.com/Nezhinskiy/local-ci-pool/internal/health"
 	"github.com/Nezhinskiy/local-ci-pool/internal/supervisor"
 )
@@ -28,7 +27,6 @@ func statusFixture() supervisor.Snapshot {
 		InUse:   2,
 		Docker:  true,
 		Login:   true,
-		Budget:  budget.State{State: "off"},
 		Projects: []supervisor.ProjectHealth{
 			{Repo: "example/DNA", Healthy: true},
 			{
@@ -82,16 +80,6 @@ func TestStatusPrintsProjects(t *testing.T) {
 	}
 }
 
-func TestStatusShowsWaitingForCores(t *testing.T) {
-	snap := statusFixture()
-	snap.Projects = []supervisor.ProjectHealth{{Repo: "example/DNA", Healthy: true, Waiting: 3}}
-	svc, _ := statusServices(http.StatusOK, snap, nil)
-	_, stdout, _ := do(t, svc, "status")
-	if want := "  example/DNA  healthy, 3 waiting for cores\n"; !strings.Contains(stdout, want) {
-		t.Fatalf("stdout lacks %q:\n%s", want, stdout)
-	}
-}
-
 func TestStatusNamesTheDockerClass(t *testing.T) {
 	snap := statusFixture()
 	snap.Projects = []supervisor.ProjectHealth{
@@ -109,24 +97,25 @@ func TestStatusNamesTheDockerClass(t *testing.T) {
 	}
 }
 
-func TestStatusShowsBudgetWhenOn(t *testing.T) {
+// The first line shows the cap on jobs when one is set, and a settings file
+// the pool cannot use; with neither, nothing.
+func TestStatusShowsTheJobsCap(t *testing.T) {
 	for _, tc := range []struct {
-		state, suffix string
+		jobs   supervisor.JobsHealth
+		suffix string
 	}{
-		{"wedged", ", budget wedged"},
-		{"on", ", budget on"},
-		{"off", ""},
+		{supervisor.JobsHealth{Max: 4}, ", at most 4 jobs"},
+		{supervisor.JobsHealth{Max: 4, Error: "config"}, ", at most 4 jobs, config invalid"},
+		{supervisor.JobsHealth{Error: "config"}, ", config invalid"},
+		{supervisor.JobsHealth{}, ""},
 	} {
 		snap := statusFixture()
-		snap.Budget = budget.State{State: tc.state}
+		snap.Jobs = tc.jobs
 		svc, _ := statusServices(http.StatusOK, snap, nil)
 		_, stdout, _ := do(t, svc, "status")
 		first, _, _ := strings.Cut(stdout, "\n")
 		if !strings.HasSuffix(first, "2 in use"+tc.suffix) {
-			t.Errorf("budget %q: first line %q should end with %q", tc.state, first, "2 in use"+tc.suffix)
-		}
-		if tc.state == "off" && strings.Contains(stdout, "budget") {
-			t.Errorf("budget off should print no budget text:\n%s", stdout)
+			t.Errorf("jobs %+v: first line %q should end with %q", tc.jobs, first, "2 in use"+tc.suffix)
 		}
 	}
 }
@@ -311,7 +300,7 @@ func TestFetchHealthSendsTheToken(t *testing.T) {
 }
 
 func TestStatusSaysWhenTheBodyIsRedacted(t *testing.T) {
-	snap := supervisor.Snapshot{Version: "v0.1.0", Docker: true, Login: true, Redacted: true, Budget: budget.State{State: "off"},
+	snap := supervisor.Snapshot{Version: "v0.1.0", Docker: true, Login: true, Redacted: true,
 		Projects: []supervisor.ProjectHealth{{Repo: "example/beta", Reason: "preflight", Class: "preflight"}}}
 	body, _ := json.Marshal(snap)
 	svc := services{fetchHealth: func(context.Context, string) (int, []byte, error) { return http.StatusOK, body, nil }}

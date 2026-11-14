@@ -257,31 +257,17 @@ func TestScaleLogsTheAcquisition(t *testing.T) {
 }
 
 // The 1af781f guard at the Adapter: an idle poll still calls Desired with the
-// last count, so a lasting dip gives the waiters up after the grace.
+// last count, so a runner that went away is replaced without a new message.
 func TestScaleNilMessageReusesTheLastStatistics(t *testing.T) {
-	h := newGateHarness(t, NewSlots(4))
+	h := newHarness(NewSlots(4))
 	h.scaler.names = scripted("a", "b", "c")
 	a := NewAdapter(h.scaler, &fakeAcquirer{})
 	ctx := context.Background()
-	scale(t, a, ctx, &scaleset.RunnerScaleSetMessage{MessageID: 1, Statistics: stats(3)})
-	reqs := map[string]*admitReq{}
-	for range 3 {
-		r := h.gate.next(t)
-		reqs[r.name] = r
-	}
-	scale(t, a, ctx, &scaleset.RunnerScaleSetMessage{MessageID: 2, Statistics: stats(1)})
-	for name, r := range reqs {
-		if ended(r.ctx) {
-			t.Fatalf("%s given up within the grace", name)
-		}
-	}
-	h.clock.advance(dipGrace)
+	scale(t, a, ctx, &scaleset.RunnerScaleSetMessage{MessageID: 1, Statistics: stats(2)})
+	h.scaler.Exited("b")
 	scale(t, a, ctx, nil)
-	if ended(reqs["a"].ctx) || !ended(reqs["b"].ctx) || !ended(reqs["c"].ctx) {
-		t.Fatalf("ctx ended: a %v, b %v, c %v; want the newest two given up on the idle poll", ended(reqs["a"].ctx), ended(reqs["b"].ctx), ended(reqs["c"].ctx))
-	}
-	if got := h.gate.admitCalls(); got != 3 {
-		t.Fatalf("%d Admit calls, want 3", got)
+	if got := h.starter.started(); !slices.Equal(got, []string{"a", "b", "c"}) {
+		t.Fatalf("started %v, want a and b, then c on the idle poll", got)
 	}
 }
 

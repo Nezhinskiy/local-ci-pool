@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # Install, upgrade or remove the pool on this Mac.
 #
-#   install.sh [--version vX.Y.Z] [--budget-cpu N] [--dry-run]
+#   install.sh [--version vX.Y.Z] [--dry-run]
 #   install.sh --uninstall [--dry-run]
 #
 # The release archive is downloaded with gh and its build provenance is verified
 # before anything is placed; a failed verification installs nothing. The script
-# writes the binary, one launchd agent and its log directory. The pool writes no
-# configuration. `config.toml` is yours; the installer creates it only when
-# asked: --budget-cpu N creates the budget settings file when there is none,
-# and never changes one that exists.
+# writes the binary, one launchd agent and its log directory. Neither it nor the
+# pool writes configuration: `config.toml` is yours.
 #
 # macOS ships bash 3.2, so this script avoids newer bash features.
 set -euo pipefail
@@ -25,7 +23,7 @@ BIN_DIR="$SUPPORT_DIR/bin"
 BIN="$BIN_DIR/pool"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/local-ci-pool"
-# The budget settings file the installed pool reads. The pool does not inherit
+# The settings file the installed pool reads. The pool does not inherit
 # your shell's environment (its agent sets PATH only), so a shell's
 # XDG_CONFIG_HOME does not reach it, and it resolves ~/.config, or the macOS
 # fallback beside bin/ when only that file exists. This script assumes that no
@@ -53,12 +51,6 @@ HEALTH_POLL="${LOCAL_CI_INSTALL_HEALTH_POLL:-2}"
 DRY=0
 UNINSTALL=0
 VERSION=""
-# BUDGET_CPU is the value of --budget-cpu; BUDGET_SET is 1 when it was given.
-BUDGET_CPU=""
-BUDGET_SET=0
-# HEALTH_BODY is what the new pool's /healthz answered, once it answered with
-# the version just installed.
-HEALTH_BODY=""
 # NEW_VERSION is the version the downloaded binary reports; /healthz must
 # report the same once it is loaded.
 NEW_VERSION=""
@@ -76,14 +68,10 @@ die() {
 
 usage() {
   cat <<'EOF'
-usage: install.sh [--version vX.Y.Z] [--budget-cpu N] [--dry-run]
+usage: install.sh [--version vX.Y.Z] [--dry-run]
        install.sh --uninstall [--dry-run]
 
   --version vX.Y.Z  install this release instead of the latest
-  --budget-cpu N    create the budget settings file, if there is none, with
-                    enabled = true and cpu = N (1 to 256): each CI job then
-                    waits for N cores of the machine's coreslot budget. An
-                    existing file is never changed; edit it instead
   --dry-run         verify the release, then print what would be placed or run
   --uninstall       stop the pool (SIGTERM, then wait until it has finished
                     its jobs and exited, up to 46 minutes), unload it from
@@ -138,16 +126,6 @@ parse_args() {
         shift
         ;;
       --version=*) VERSION="${1#--version=}" ;;
-      --budget-cpu)
-        [ $# -ge 2 ] || die "--budget-cpu needs a value from 1 to 256"
-        BUDGET_CPU="$2"
-        BUDGET_SET=1
-        shift
-        ;;
-      --budget-cpu=*)
-        BUDGET_CPU="${1#--budget-cpu=}"
-        BUDGET_SET=1
-        ;;
       -h | --help)
         usage
         exit 0
@@ -164,14 +142,6 @@ parse_args() {
   fi
   if [ "$UNINSTALL" = 1 ] && [ -n "$VERSION" ]; then
     die "--version does not apply to --uninstall"
-  fi
-  if [ "$BUDGET_SET" = 1 ]; then
-    [ "$UNINSTALL" = 0 ] || die "--budget-cpu does not apply to --uninstall"
-    # At most three digits before the numeric comparison, so that a long
-    # value cannot overflow it. TOML refuses a leading zero.
-    if ! [[ "$BUDGET_CPU" =~ ^[1-9][0-9]*$ ]] || [ "${#BUDGET_CPU}" -gt 3 ] || [ "$BUDGET_CPU" -gt 256 ]; then
-      die "--budget-cpu must be a whole number from 1 to 256, not '$BUDGET_CPU'"
-    fi
   fi
   if [ "$(id -u)" = 0 ]; then
     die "do not run this as root: the pool is a per-user launchd agent (gui/<uid>) and uses your gh login"
@@ -564,7 +534,6 @@ wait_new_pool() {
       got="$(printf '%s' "$body" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
     fi
     if [ "$got" = "$want" ]; then
-      HEALTH_BODY="$body"
       say "the pool $want answers on http://$addr/healthz"
       return 0
     fi
@@ -590,7 +559,7 @@ wait_new_pool() {
   warn "the pool does not answer on http://$addr/healthz yet; read $LOG_DIR/pool.log"
 }
 
-# settings_in_use prints the budget settings file the installed pool reads,
+# settings_in_use prints the settings file the installed pool reads,
 # resolved as the pool does: SETTINGS_XDG when it exists, else SETTINGS_MAC
 # when it exists, else nothing. A dangling symlink does not exist (stat fails),
 # so a dangling SETTINGS_XDG leaves the pool reading SETTINGS_MAC.
@@ -602,49 +571,9 @@ settings_in_use() {
   fi
 }
 
-# write_settings creates SETTINGS_XDG with the budget on and BUDGET_CPU cores
-# per job, in one step. noclobber refuses an existing regular file and creates
-# a missing one with O_EXCL, so a regular file created meanwhile, or a dangling
-# symlink, is refused rather than written through. It would still write into an
-# existing FIFO or other non-regular file: place_settings calls it only when no
-# such path exists. It never fails the install, which has stopped the old pool
-# by now.
-write_settings() {
-  local p="$SETTINGS_XDG"
-  if (
-    umask 077
-    mkdir -p "$(dirname "$p")"
-    set -C
-    printf '[budget]\nenabled = true\ncpu = %s\n' "$BUDGET_CPU" > "$p"
-  ) 2> /dev/null; then
-    return 0
-  fi
-  if [ -e "$p" ] || [ -L "$p" ]; then
-    say "the budget settings exist; edit $p"
-  else
-    warn "could not write $p; the budget stays off until it exists"
-  fi
-}
-
-# place_settings writes the budget settings for --budget-cpu when no file is in
-# use, and otherwise names the one that is. A dangling symlink at SETTINGS_XDG
-# is refused too: nothing is ever written through it.
-place_settings() {
-  local p
-  p="$(settings_in_use)"
-  if [ -z "$p" ] && [ -L "$SETTINGS_XDG" ]; then
-    p="$SETTINGS_XDG"
-  fi
-  if [ -n "$p" ]; then
-    say "the budget settings exist; edit $p"
-    return 0
-  fi
-  act "write $SETTINGS_XDG ([budget] enabled = true, cpu = $BUDGET_CPU)" write_settings
-}
-
 # warn_foreign_xdg says that a shell's XDG_CONFIG_HOME other than ~/.config is
-# not where the installed pool looks for its budget settings: the pool does not
-# inherit the shell's environment. It matters only with --budget-cpu, or when a settings file sits
+# not where the installed pool looks for its settings: the pool does not
+# inherit the shell's environment. It matters only when a settings file sits
 # under that XDG_CONFIG_HOME, which the installed pool never reads.
 warn_foreign_xdg() {
   local xdg="${XDG_CONFIG_HOME:-}"
@@ -654,40 +583,9 @@ warn_foreign_xdg() {
   esac
   xdg="${xdg%/}"
   [ "$xdg" != "$HOME/.config" ] || return 0
-  if [ "$BUDGET_SET" = 1 ] || [ -e "$xdg/local-ci-pool/config.toml" ]; then
-    warn "XDG_CONFIG_HOME is set in this shell, but the installed pool does not inherit the shell's environment: the installed pool reads the budget settings from $SETTINGS_XDG, not $xdg/local-ci-pool/config.toml"
+  if [ -e "$xdg/local-ci-pool/config.toml" ]; then
+    warn "XDG_CONFIG_HOME is set in this shell, but the installed pool does not inherit the shell's environment: the installed pool reads its settings from $SETTINGS_XDG, not $xdg/local-ci-pool/config.toml"
   fi
-}
-
-# check_budget_applied warns when the new pool's /healthz says the settings file
-# in use is invalid (the pool has judged it: the shell parses no TOML). It also
-# warns when the file seems to turn the budget on (a line setting enabled =
-# true, as a key of its own, a dotted key or in an inline table, the key bare
-# or quoted), or cannot be read as a regular file (the pool then reports it
-# invalid), and /healthz has no budget (a release before it) or shows it off.
-# A FIFO is never opened.
-check_budget_applied() {
-  local p budget
-  p="$(settings_in_use)"
-  [ -n "$p" ] || return 0
-  budget="$(printf '%s' "$1" | sed -n 's/.*"budget":{\([^}]*\)}.*/\1/p')"
-  case "$budget" in
-    *'"error":"config"'*'"state":"off"'* | *'"state":"off"'*'"error":"config"'*)
-      warn "the pool does not apply $p; the budget is off: the file is invalid. See the 'budget settings invalid' lines in $LOG_DIR/pool.log and the runbook's section on the budget settings"
-      return 0
-      ;;
-    *'"error":"config"'*)
-      warn "the pool does not apply $p as it is now: the file is invalid, and the last valid settings stay in force. See the 'budget settings invalid' lines in $LOG_DIR/pool.log and the runbook's section on the budget settings"
-      return 0
-      ;;
-  esac
-  if [ -f "$p" ] && [ -r "$p" ]; then
-    grep -Eq "^([^#]*[[:space:].{,])?[\"']?enabled[\"']?[[:space:]]*=[[:space:]]*true" "$p" 2> /dev/null || return 0
-  fi
-  case "$budget" in
-    '') warn "the pool does not apply $p; the budget is off: this release reports no budget in /healthz, so it predates the core budget and ignores the file" ;;
-    *'"state":"off"'*) warn "the pool does not apply $p; the budget is off: the file is invalid, or not the one the pool reads. See the 'budget settings' lines in $LOG_DIR/pool.log and the runbook's section on the budget settings" ;;
-  esac
 }
 
 install_pool() {
@@ -709,9 +607,6 @@ install_pool() {
   act "wait until launchd no longer lists it (gives up after $WAIT_LIMIT s)" wait_gone
   act "wait until nothing answers on $addr (gives up after $WAIT_LIMIT s)" wait_port_free "$addr"
   act "replace $BIN and $PLIST with the staged files" commit_staged
-  if [ "$BUDGET_SET" = 1 ]; then
-    place_settings
-  fi
   local mark
   mark="$(log_size)"
   act "load the agent: launchctl bootstrap $DOMAIN $PLIST" bootstrap_agent
@@ -720,9 +615,6 @@ install_pool() {
     say "would: wait for http://$addr/healthz to report $NEW_VERSION"
   else
     wait_new_pool "$addr" "$NEW_VERSION" "$mark"
-    if [ -n "$HEALTH_BODY" ]; then
-      check_budget_applied "$HEALTH_BODY"
-    fi
   fi
 }
 
@@ -754,7 +646,7 @@ uninstall_pool() {
   local p
   p="$(settings_in_use)"
   if [ -n "$p" ]; then
-    say "kept $p: your budget settings; delete it yourself if you no longer want it"
+    say "kept $p: your settings; delete it yourself if you no longer want it"
   fi
 }
 

@@ -71,9 +71,6 @@ launchctl kickstart -k gui/$(id -u)/com.local-ci-pool.pool
 [launchd's 60-second limit](#launchds-60-second-limit), where that was measured); stop it with
 `SIGTERM` as shown there if a job is running.
 
-To take CI jobs' cores from the machine's core budget as well, add `--budget-cpu 2`; see
-[the budget settings](#the-budget-settings).
-
 Run `./install.sh --dry-run` first if you want to see what it would do. The installer:
 
 1. refuses to run as root, checks `gh auth status`, `docker info` and the slot count, and picks the
@@ -99,18 +96,15 @@ Run `./install.sh --dry-run` first if you want to see what it would do. The inst
    new pool can bind it;
 6. renames the staged files into place (`~/Library/Application Support/local-ci-pool/bin/pool` and
    `~/Library/LaunchAgents/com.local-ci-pool.pool.plist`);
-7. with `--budget-cpu N`, creates the budget settings file when the pool would read none, and
-   otherwise names the one it reads (see [the budget settings](#the-budget-settings));
-8. runs `launchctl bootstrap` (retried a few times) and waits until `/healthz` reports the version it
+7. runs `launchctl bootstrap` (retried a few times) and waits until `/healthz` reports the version it
    just installed. If an older version answers, or the new pool logged `terminal:` (for example
    `already running`), it prints a `WARNING`, restarts the agent once with
    `launchctl kickstart -k gui/$UID/com.local-ci-pool.pool`, and fails if that did not help. A first
    start downloads the runner and builds images, so a pool that has not answered within a minute is
-   only reported, not treated as a failure. Once the new pool answers, the installer checks that it
-   applies the budget settings, and warns when it does not (see
-   [the budget settings](#the-budget-settings)).
+   only reported, not treated as a failure.
 
-The pool writes no configuration. `config.toml` is yours; the installer creates it only when asked.
+The pool writes no configuration, and neither does the installer: `config.toml` is yours (see
+[Limiting concurrent jobs](#limiting-concurrent-jobs)).
 The pool keeps derived state only: its git mirrors under
 `~/Library/Caches/local-ci-pool`, the Docker images `local-ci-pool/runner:<version>` (the runner
 trees) and `local-ci/<identity>:<digest>` (the job images), one Docker network per pool
@@ -225,7 +219,7 @@ variables are never touched), then removes the plist and the binary. The order m
 dies with the process, so a variable deleted before the pool is gone could be written again. Workflows
 fall back to hosted runners within five minutes, since a heartbeat is fresh for no longer than that.
 Logs, the cache and the Docker images stay; delete them by hand if you want the space back. The
-budget settings file stays too, and the installer prints its path.
+settings file stays too, and the installer prints its path.
 
 The pool deletes its scale sets while it drains. If it was not running when you uninstalled, or its
 drain hit the bound, a scale set can be left: check each served repository's Settings > Actions >
@@ -257,6 +251,8 @@ serves the same label.
 Change the memory slider in Docker Desktop. Docker restarts, the pool notices that the Docker VM
 changed, exits, and launchd starts it again with the slot count derived anew. Jobs running at that
 moment are lost with the containers; a job assigned to the pool at that time is requeued by GitHub.
+To run fewer jobs than the slots allow, without touching Docker, set a cap instead (see
+[Limiting concurrent jobs](#limiting-concurrent-jobs)).
 
 ## Opting a project in or out
 
@@ -380,13 +376,13 @@ The fields:
 |---|---|
 | `version`, `commit` | the running build |
 | `machine` | the machine name |
-| `slots`, `in_use`, `busy` | the slot limit; slots held by runners, including runners a killed previous run left running; runners known to be running a job, which excludes those left running |
+| `slots`, `in_use`, `busy` | the slot limit, after the cap on jobs; slots held by runners, including runners a killed previous run left running; runners known to be running a job, which excludes those left running |
 | `vm_in_use` | the docker class's one VM slot in use: 0 or 1 ([docs/docker-class.md](docker-class.md)) |
 | `docker` | whether Docker answers |
 | `login` | `false` while the last read of the token from `gh` failed (see [Install](#install)); `/healthz` answers 503 then too |
 | `probe` | whether this is a probe run |
-| `budget` | the core budget: `state`, an `error` class when there is one, and `oldest_wait_s` (see [CI is waiting](#ci-is-waiting)) |
-| `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, a `reason` and its `class` (`starting`, `draining`, `setup`, `down`, `image`, `preflight`, `vm` or `runners`) when not healthy, `docker_class` on [the docker class](#the-docker-class)'s entry and `not_installed` on such an entry on a Mac without Lima (healthy: it takes no docker jobs), the budget's `waiting` and `admitted` counts, and `stuck` when a job is queued that GitHub does not offer the pool (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)) |
+| `jobs` | the cap on jobs: `max` (0: none) and `error`, `config` while the settings file is invalid, absent otherwise (see [Limiting concurrent jobs](#limiting-concurrent-jobs)) |
+| `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, a `reason` and its `class` (`starting`, `draining`, `setup`, `down`, `image`, `preflight`, `vm` or `runners`) when not healthy, `docker_class` on [the docker class](#the-docker-class)'s entry and `not_installed` on such an entry on a Mac without Lima (healthy: it takes no docker jobs), and `stuck` when a job is queued that GitHub does not offer the pool (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)) |
 | `redacted` | `true` on the body served without the token; absent otherwise |
 
 `pool status` reads the same endpoint and prints it as text (see [CI went hosted](#ci-went-hosted)).
@@ -427,7 +423,7 @@ fresh heartbeat, so the question is why this one did not.
    ```
 
    ```
-   pool v0.6.0 (a4d3acb) on examplemacbo: docker ok, login ok, 3 slots, 0 in use, budget on
+   pool v0.6.0 (a4d3acb) on examplemacbo: docker ok, login ok, 3 slots, 0 in use, at most 4 jobs
      alice/alpha  healthy
      alice/beta   unhealthy: draining
        queued 12m0s: test https://github.com/alice/beta/actions/runs/1
@@ -450,7 +446,8 @@ fresh heartbeat, so the question is why this one did not.
      whose image and preflight are still on their way, as on a first start.
    - The repository is not listed at all: the pool does not serve it (see
      [A repository is not served](#a-repository-is-not-served)).
-   - `N waiting for cores`: the budget holds the jobs (see [CI is waiting](#ci-is-waiting)).
+   - `at most N jobs`: a cap is set (see [Limiting concurrent jobs](#limiting-concurrent-jobs));
+     `config invalid`: the settings file is invalid, and the last valid cap stays in force.
    - `queued <time>: <job> <run URL>`: GitHub has not offered the pool a job that has waited that
      long for a runner (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)).
 
@@ -483,11 +480,22 @@ fresh heartbeat, so the question is why this one did not.
    on a token it cannot read: it retries, and `pool status` shows `login lost` while `gh` cannot
    give a token (see [Install](#install)).
 
-## The budget settings
+## Limiting concurrent jobs
 
-The core budget is optional. When the settings file turns it on, each runner waits for its cores in
-the machine-wide [coreslot](https://github.com/core-slot/coreslot) budget, which local work shares,
-before its container starts. Without the file the pool runs as it always has.
+The pool runs as many container jobs at once as it has slots (see [Changing slots](#changing-slots)),
+and one docker VM beside them. To run fewer, for example to leave the Mac room for local builds, set
+a cap in the settings file. Without the file the pool runs as it always has.
+
+Every container job the pool starts is held to its share of the Docker VM's CPUs: the VM's CPUs divided
+by the jobs that can run at once (the cap, never more than the slots; the slots without a cap), at least
+1 (with a cap of 4 on 14 CPUs, 3 each). The share is a CPU quota, not a set of CPUs: Node's
+`os.availableParallelism()` follows it, while `nproc` and `os.cpus()` do not. Measured on a 14-CPU
+Docker VM under `--cpus=3` with Node 22: `os.availableParallelism()` gave 3, `nproc` and
+`os.cpus().length` gave 14. A job that sizes its workers by the former starts as many as
+its share holds; one that sizes them by the latter starts one per CPU of the whole VM and is only
+throttled. A job left running by a previous pool (a survivor, after a kill or launchd's 60-second limit)
+keeps the CPU limit it started with, which from a release before this one is none. A docker VM keeps
+its own 4 CPUs and counts as one job.
 
 **Where.** The pool resolves the path on every read:
 
@@ -501,161 +509,49 @@ The installed pool does not inherit your shell's environment (its launchd agent 
 an `XDG_CONFIG_HOME` set in a shell does not reach it, and it reads
 `~/.config/local-ci-pool/config.toml`, or the fallback. A value set for launchd itself with
 `launchctl setenv XDG_CONFIG_HOME` does reach it (`launchctl getenv XDG_CONFIG_HOME` prints it, if
-any), and the installer does not follow it. A pool started by hand (probe mode) resolves with its shell's `XDG_CONFIG_HOME`. `pool.log` logs `budget settings` with the `path` at start, and
-again whenever the resolution changes; `/healthz` never shows the path.
+any). A pool started by hand (probe mode) resolves with its shell's `XDG_CONFIG_HOME`. `pool.log`
+logs `config file` with the `path` at start, and again whenever the resolution changes; `/healthz`
+never shows the path. The installer never writes the file; it warns when its own `XDG_CONFIG_HOME`
+names another directory that holds one, which the installed pool does not read, and `--uninstall`
+leaves the file and prints its path.
 
-**Keys.** One table, `[budget]`, with exactly two keys. Key names are case-sensitive: `CPU = 2` is an
-unknown key, and makes the file invalid. So does a table spelled `[Budget]`, or `budget` in any
-other case. Keys in other tables are ignored.
-
-| Key | Value |
-|---|---|
-| `enabled` | `true` or `false` |
-| `cpu` | the most cores one job asks for, a whole number from 1 to 256. It has no default: `enabled = true` without `cpu` is invalid |
+**The key.** One table, `[jobs]`, with one key:
 
 ```toml
-[budget]
-enabled = true
-cpu = 2
+[jobs]
+max = 4
 ```
 
-Start at `cpu = 2`, the CPUs per slot the pool's sizing assumes. A job asks for `1..cpu`: it is
-admitted as soon as one core is free and takes up to `cpu` (a `cpu` above the whole budget takes
-at most the whole budget). The grant is fixed for the job's life, and `pool.log` logs it as
-`granted` beside the `need` asked.
+`max` is the most jobs the pool runs at once on the Mac, container jobs and docker VMs together (a
+docker base build is a VM too): a whole number of at least 1. The container slots become
+`min(slots, max)`, and a docker VM takes one of them while it runs: with `max = 4`, at most three
+container jobs run beside a docker job. `/healthz` shows the capped slots as `slots` and the cap as
+`jobs.max`; `pool status` adds `at most 4 jobs` to its first line. The heartbeat advertises the
+capped slots. Key names are case-sensitive: `Max = 4` is an unknown key and makes the file invalid,
+and so does a table spelled `[Jobs]`. Other tables are ignored.
 
-**The grant reaches the job** as `CORESLOT_CPU` in its environment (and as the container label
-`local-ci-pool.need`). A workflow sizes its parallelism to it, for example
-`pytest -n "${CORESLOT_CPU:-2}"` or `make -j "${CORESLOT_CPU:-2}"`; the default covers a job that
-runs without the budget, where the variable is unset. The container is capped at its grant (Docker's
-`--cpus`), so a job that ignores `CORESLOT_CPU` runs slower rather than oversubscribing the Mac.
-Go before 1.25 sizes `GOMAXPROCS` to the VM's CPUs whatever the cap, and is throttled hard under
-it; set `GOMAXPROCS="${CORESLOT_CPU:-}"` for such a toolchain. Before this release a job always got
-all of `cpu`, so a workflow that assumed that must read `CORESLOT_CPU` now. Without the budget a
-container has no CPU cap: a lone job uses the whole VM, and busy jobs share it by the kernel's
-equal default weights. Either way it has a limit of 4096 processes and threads.
-
-**Creating it.** `./install.sh --budget-cpu 2` creates `~/.config/local-ci-pool/config.toml` (mode
-0600) when the installed pool would read no file, and never changes one that exists: it prints
-`the budget settings exist; edit <path>` instead, naming the file the pool reads (a symlink to a
-missing file at the `~/.config` path is refused too, never written through). It warns when its own
-`XDG_CONFIG_HOME` names another directory, which the installed pool does not read, if you passed
-`--budget-cpu` or a settings file sits under that directory. `--dry-run` prints what it would write.
-After any install, the installer warns when the new pool's `/healthz` reports the file invalid
-(`budget.error = "config"`), and when the file seems to turn the budget on (the installer only
-looks for a line setting `enabled = true`; it parses no TOML) but `/healthz` shows it off (a path
-the pool does not read, or a release before the budget, which ignores the file).
-`--uninstall` leaves the file and prints its path.
-
-**Edits apply without a restart.** The pool reads the file on every decision, with no cache. A new
-`cpu` applies to the next runner; a runner already waiting keeps its place in the queue and the
-range it asked for. Turning the budget on or off applies to the next runner; nothing waiting or
-running is cancelled. Since the pool may read the file at any moment, save it by replacing it in
-one step: write a temporary file in the same directory, then rename it over `config.toml`. A
-half-written file is read as it is, which can make it invalid, turn the budget off or ask a
-truncated `cpu`, and a file briefly absent turns the budget off and forgets the last valid
-settings.
+**Edits apply without a restart.** The pool reads the file at start and every 30 seconds after. A
+raised cap starts the jobs that waited for it; a lowered one stops no running job, and starts none
+until enough have ended. Save the file by replacing it in one step: write a temporary file in the
+same directory, then rename it over `config.toml`. A half-written file can read as invalid, and a
+file briefly absent removes the cap.
 
 **An invalid file** is one that is not a regular file (a directory, a FIFO), is larger than 64 KiB,
 cannot be read, has more than 64 dots, braces and brackets outside its comments and strings (a
 bound on nesting, which the TOML decoder's cost grows with), is not valid TOML, has another key
-under `[budget]`, a value of the wrong type, `enabled = true` without `cpu`, or a `cpu` outside 1
-to 256. The last valid settings stay in force,
-`/healthz` shows `budget.error = "config"`, and `pool.log` logs `budget settings invalid` with the
-error. A file that is invalid when the pool starts leaves the budget off, with the same error. The
-pool never exits over the file.
+under `[jobs]`, or a `max` that is not a whole number of at least 1 (`0`, `2.5`, `"4"`). The last
+valid cap stays in force (none, when the file has been invalid since the start), `/healthz` shows
+`jobs.error = "config"`, `pool status` adds `config invalid`, and `pool.log` warns
+`config invalid; keeping the last valid settings` with the error, once per new error. The pool never
+exits over the file.
 
-**Off.** No file, an empty file, no `[budget]` table, or `enabled = false` leaves the budget off.
-Deleting the file turns it off and forgets the last valid settings.
-
-**Labels and priority.** The pool asks for each job's cores under the label `<identity>:ci` (for
-`alpha`, `alpha:ci`), always at priority 5. coreslot orders its queue by arrival less the priority
-in minutes, so a CI job goes ahead of local work that queued up to five minutes after it. Five
-minutes is GitHub's window: it completes a job request assigned to the pool that no runner took
-within 5 minutes (`job completed` with `result=canceled` and no runner), and a runner still
-waiting for cores by then has lost its job. A `[priorities]` entry in coreslot's own configuration
-does not apply to these labels.
-
-**Inside `coreslot run`.** A pool started by hand inside `coreslot run` would inherit that run's
-grant. It drops it first, before it opens anything, budget on or off: it closes the grant's
-descriptors and unsets the grant's variables (`CORESLOT_HELD_FD`, `CORESLOT_TOKEN_FDS`,
-`CORESLOT_UNBUDGETED` and every `CORESLOT_GRANTED_*`), then queues as itself.
-
-**Survivors.** A job container the previous pool left running (see
-[launchd's 60-second limit](#launchds-60-second-limit)) carries its project as a label, and its need
-as another when the budget admitted it (in any mode but `off`).
-With the budget on, the new pool takes a hold in the budget for each one shortly after it starts,
-and `pool.log` logs `runner admitted` with `mode=adopted`. A survivor that does not fit is not
-stopped, since a running job cannot be paused: `pool.log` warns `survivor oversubscribed` with the
-shortfall, and the hold is kept. A survivor of a release before the budget carries no project or need
-label and is adopted as `local-ci-pool:ci` with the configured `cpu`; in `/healthz` it counts under no
-project's `admitted`. From the old pool's exit until the adoption, survivors run outside the budget.
-A survivor's job still counts among its repository's assigned jobs, and the pool counts the
-project's survivors against them, so it starts no runner beside a survivor for the job the survivor
-already runs. A survivor of a release before the budget names no project, so its project may get one
-idle runner until that job ends.
-
-**Rolling back.** Set `enabled = false`, or delete the file: the next runner starts without the
-budget, with no restart. To leave the feature entirely, install the release before it with
-`./install.sh --version v0.1.1`, which ignores the file.
-
-## CI is waiting
-
-With the budget on, a runner waits until the budget has its cores, however long that takes: a full
-budget never lets a runner start without them. Its job shows as queued on GitHub meanwhile.
-
-`/healthz` shows where things stand:
-
-| Field | Meaning |
-|---|---|
-| `budget.state` | `off`, `on`, or `wedged` (below) |
-| `budget.error` | absent when there is none; `config` (the settings file is invalid), `open` (the pool could not open coreslot's state; it retries after a backoff of up to a minute), or `state` (coreslot's state failed during the last admission, for example its state directory was removed) |
-| `budget.oldest_wait_s` | the seconds the oldest waiting runner has waited |
-| `waiting`, per project | the project's runners waiting for cores |
-| `admitted`, per project | the project's runners and survivors holding an admission now: `queued` (admitted through the queue), `adopted` (survivors), `fail_open` (started without a grant) |
-
-`pool.log` logs `runner waiting for the budget` when a runner queues, `runner admitted` (with
-`mode`, `need`, `granted`, `shortfall` and `wait_s`) when it starts, and
-`runner given up before admission` when it was given up before it started (`reason=cancelled`: no
-longer needed; `reason=coreslot_cancel`: cancelled through coreslot). A runner is no longer needed when
-its repository's assigned jobs have stayed below its waiting runners for 30 seconds: GitHub
-completes an assigned job request that no runner took within 5 minutes (`job completed` with
-`result=canceled` and `runner=""`) and reissues it about 0.3 seconds later, and the brief dip in
-between gives no waiting runner up, so the reissued job finds its runner still in the queue. The
-pool logs `assigned jobs below the waiting runners; keeping them for the grace` when such a dip
-begins. Once the oldest runner has waited
-30 minutes, it warns `budget full`, once every 30 minutes, with `oldest_wait_s` and the three
-largest holds as `holds="<label> cpu=<n>, …"`. `/healthz` never names a hold.
-
-To get CI moving:
-
-1. See who holds the cores: `coreslot status` lists the holds and the queue, and the `budget full`
-   line names the largest holds.
-2. End the holder, or let it finish.
-3. Or set `enabled = false` in the settings file: the next runner starts without the budget. A
-   runner already waiting keeps its ticket; withdraw it with coreslot, and the runner is given up
-   without starting (`reason=coreslot_cancel`) and the pool starts another for the job, which now
-   runs without the budget. `coreslot cancel --label <identity>:ci` works when that runner is the
-   project's only waiting one. All of a project's runners share the label, so with several waiting
-   it refuses and names their ticket ids (the `id` column of `coreslot status`); cancel each with
-   `coreslot cancel <ticket-id>`.
-
-**Wedged.** `budget.state` is `wedged` when one process has held coreslot's admission section for 2
-minutes, with no admission going through it meanwhile. A healthy client holds it for milliseconds,
-so the holder is stopped (for example by Ctrl-Z) or stuck, and nobody can be admitted, local gates
-included. `pool.log` warns `budget wedged` with `recorded_pid`, the pid in `admit.lock`'s
-informational body, and `self=true` when that pid is the pool's own (`recorded_pid=0`: the body
-could not be read). The body may be stale: a client that does not rewrite it leaves the previous
-holder's in place, often the pool's own. Before stopping anything, find the real holder with
-`lsof "<state directory>/admit.lock"`; `coreslot status` prints the state directory, and its
-`admission section` line comes from the same body. Meanwhile the pool's runners start without a
-grant: resume the holder (`kill -CONT <pid>`) or end it. The wedge clears at the next check that
-finds the section free or held by another, and `pool.log` logs `budget unwedged`.
-
-**Started without a grant.** When coreslot itself fails (it cannot be opened, its state fails, or it
-is wedged), a runner starts anyway rather than block CI: `pool.log` warns `runner admitted` with
-`mode=fail_open` and a `class` saying why, and `/healthz` counts it in `admitted.fail_open`.
-`coreslot status` does not list such a runner, so its cores are not counted in the budget.
+**A `[budget]` table** left from a release with the core budget is not read: `pool.log` warns
+`config: [budget] is no longer read; the core budget was removed, set [jobs] max instead` once, and
+the pool runs on. Delete the table. The core budget gave each job a share of the Mac's cores through
+coreslot and capped its container at that share; a job container is now capped at a static share
+instead (above), `CORESLOT_CPU` is no longer set in a job's
+environment, so a workflow that read `"${CORESLOT_CPU:-2}"` gets its default, and
+`install.sh --budget-cpu` is gone.
 
 ## Probe mode
 
@@ -691,15 +587,15 @@ The specific commands live in each project's own runbook.
 
 ## A job stays queued on a free pool
 
-GitHub completes a job request assigned to the pool that no runner took within 5 minutes and
-reissues it (see [Labels and priority](#the-budget-settings)). After such a reissue it has been
+GitHub completes a job request assigned to the pool that no runner took within 5 minutes (`job
+completed` with `result=canceled` and no runner) and reissues it. After such a reissue it has been
 seen to stop counting the job against the pool's scale set: the job stays queued on GitHub, every
 slot is free, and the pool never hears of it. The pool watches for this and only reports it; it
 cancels and re-runs nothing.
 
 When a job with the project's label (`<identity>-local`, or the scale set's name) has been queued
-for 10 minutes while the pool had a free slot and the project had no runner waiting, starting or
-idle, `pool.log` warns `a job is queued while the pool has a free slot and no runner waits for it`
+for 10 minutes while the pool had a free slot, within the cap on jobs, and the project had no
+runner starting or idle, `pool.log` warns `a job is queued while the pool has a free slot and no runner waits for it`
 with the `run` URL, the `job` name and `queued_s`, once per job, and the project's `/healthz` entry
 lists it under `stuck` (`run_url`, `job`, `queued_s`) until it is no longer queued or the pool gets
 busy. The report does not change `healthy`.

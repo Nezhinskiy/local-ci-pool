@@ -25,7 +25,7 @@ func testSpec() ContainerSpec {
 		Project:  "alpha",
 		Mount:    mount.Mount{Type: mount.TypeImage, Source: "local-ci-pool/runner:2.338.0", Target: "/opt/local-ci", ReadOnly: true},
 		JIT:      testJIT,
-		CPUs:     2.5,
+		CPUs:     3,
 	}
 }
 
@@ -98,14 +98,18 @@ func TestStartRunnerContract(t *testing.T) {
 	if hc.PidsLimit == nil || *hc.PidsLimit != 4096 {
 		t.Fatalf("PidsLimit %v, want 4096", hc.PidsLimit)
 	}
-	if hc.NanoCPUs != 2_500_000_000 {
-		t.Fatalf("NanoCPUs %d, want the spec's 2.5 CPUs", hc.NanoCPUs)
+	// The spec's CPUs, as a quota: a job sizes its workers to its share, not to the whole VM.
+	if hc.NanoCPUs != 3_000_000_000 || hc.CPUQuota != 0 || hc.CpusetCpus != "" {
+		t.Fatalf("NanoCPUs %d, CPUQuota %d, CpusetCpus %q, want the spec's 3 CPUs", hc.NanoCPUs, hc.CPUQuota, hc.CpusetCpus)
 	}
 	if want := []string{"host.docker.internal:127.0.0.1", "gateway.docker.internal:127.0.0.1"}; !slices.Equal(hc.ExtraHosts, want) {
 		t.Fatalf("ExtraHosts %q, want %q", hc.ExtraHosts, want)
 	}
 	if want := map[string]string{"local-ci-pool": "main", "local-ci-pool.runner": s.Name, "local-ci-pool.project": "alpha"}; !maps.Equal(c.Labels, want) {
 		t.Fatalf("Labels %v, want %v", c.Labels, want)
+	}
+	if want := []string{"HOME=/tmp/home"}; !slices.Equal(c.Env, want) {
+		t.Fatalf("Env %q, want %q", c.Env, want)
 	}
 
 	raw, err := json.Marshal(o)
@@ -121,43 +125,6 @@ func TestStartRunnerContract(t *testing.T) {
 
 	if got := d.stdinOf(t, id); got != s.JIT+"\n" {
 		t.Fatalf("stdin %q, want the JIT and a newline", got)
-	}
-}
-
-func TestStartRunnerLabels(t *testing.T) {
-	for _, c := range []struct {
-		name string
-		need int
-		want map[string]string
-		env  []string
-	}{
-		{"with a need", 3, map[string]string{
-			"local-ci-pool": "main", "local-ci-pool.runner": "local-ci-alpha-1",
-			"local-ci-pool.project": "alpha", "local-ci-pool.need": "3",
-		}, []string{"HOME=/tmp/home", "CORESLOT_CPU=3"}},
-		{"without a need", 0, map[string]string{
-			"local-ci-pool": "main", "local-ci-pool.runner": "local-ci-alpha-1",
-			"local-ci-pool.project": "alpha",
-		}, []string{"HOME=/tmp/home"}},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			d := newFakeDocker()
-			s := testSpec()
-			s.Need = c.need
-			if _, err := StartRunner(context.Background(), d, s); err != nil {
-				t.Fatal(err)
-			}
-			if len(d.creates) != 1 || d.creates[0].Config == nil {
-				t.Fatalf("%d creates, want 1 with a config", len(d.creates))
-			}
-			if got := d.creates[0].Config.Labels; !maps.Equal(got, c.want) {
-				t.Fatalf("Labels %v, want %v", got, c.want)
-			}
-			// The job reads its grant to size its parallelism.
-			if got := d.creates[0].Config.Env; !slices.Equal(got, c.env) {
-				t.Fatalf("Env %q, want %q", got, c.env)
-			}
-		})
 	}
 }
 
@@ -285,38 +252,6 @@ func TestStartRunnerNetworkInspectFailure(t *testing.T) {
 	}
 	if slices.Contains(d.callLog(), "create") {
 		t.Fatalf("a container was created: %v", d.callLog())
-	}
-}
-
-func TestStartRunnerWithoutACPUCap(t *testing.T) {
-	d := newFakeDocker()
-	s := testSpec()
-	s.CPUs = 0
-	if _, err := StartRunner(context.Background(), d, s); err != nil {
-		t.Fatal(err)
-	}
-	if got := d.creates[0].HostConfig.NanoCPUs; got != 0 {
-		t.Fatalf("NanoCPUs %d, want none", got)
-	}
-}
-
-func TestCPUCap(t *testing.T) {
-	for _, c := range []struct {
-		need, cpus int
-		want       float64
-	}{
-		{3, 8, 3},  // the budget's grant
-		{12, 8, 8}, // a grant above the VM: Docker refuses more than it has
-		{1, 8, 1},
-		// Without a grant there is no hard cap: a lone job keeps the VM, and
-		// busy jobs share it by the kernel's default weights.
-		{0, 8, 0},
-		{0, 10, 0},
-		{3, 0, 0}, // nothing known about the VM
-	} {
-		if got := CPUCap(c.need, c.cpus); got != c.want {
-			t.Errorf("CPUCap(%d, %d) = %v, want %v", c.need, c.cpus, got, c.want)
-		}
 	}
 }
 

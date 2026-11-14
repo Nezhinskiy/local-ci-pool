@@ -23,7 +23,6 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/moby/moby/client"
 
-	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
 	"github.com/Nezhinskiy/local-ci-pool/internal/image"
@@ -100,11 +99,6 @@ var afterBound = DefaultAfterBound
 // its runners start (project.vet): the longest a repository that turned
 // public can still get a runner. A variable so tests can change it.
 var visibleFor = time.Minute
-
-// joinBound bounds a drain's wait, after its abort, for the scaler's waiter
-// goroutines, and Run's own after a fatal error: a waiter whose Admit outlives
-// the abort is waited for this long. A variable so tests can shorten it.
-var joinBound = 10 * time.Second
 
 // Config configures a Supervisor. Zero durations take their defaults.
 type Config struct {
@@ -222,12 +216,6 @@ type realClock struct{}
 func (realClock) Now() time.Time                         { return time.Now() }
 func (realClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
-// Budget is the machine-wide gate and its health. *budget.Gate satisfies it.
-type Budget interface {
-	runner.Gate
-	State() budget.State
-}
-
 // Image is a project's job image and the user its jobs run as.
 type Image struct{ Ref, User string }
 
@@ -261,9 +249,12 @@ type Deps struct {
 	// Serve, if set, serves the health endpoint on the bound listener until
 	// ctx is cancelled.
 	Serve func(ctx context.Context, ln net.Listener)
-	// Budget admits the runners into the machine's budget, and adopts the
-	// survivors of a previous run into it. Nil: the budget is off.
-	Budget Budget
+	// JobsMax reads the machine-wide cap on jobs, container jobs and docker
+	// VMs together, from the settings file, at start and on every watchdog
+	// tick: 0 is no cap beyond the slots, and invalid reports a file the
+	// pool could not use, whose last valid cap stays in force
+	// (config.File). Nil: no cap.
+	JobsMax func() (max int, invalid bool)
 	// VM runs the docker class's base VMs and job clones (dockerclass.go).
 	// Nil: a docker-class project fails its setup.
 	VM *vm.Backend
@@ -286,8 +277,8 @@ type Snapshot struct {
 	// pool waits for gh and takes no jobs meanwhile.
 	Login bool `json:"login"`
 	Probe bool `json:"probe"`
-	// Budget is the budget's state: {State: "off"} when none is wired.
-	Budget   budget.State    `json:"budget"`
+	// Jobs is the cap on jobs from the settings file.
+	Jobs     JobsHealth      `json:"jobs"`
 	Projects []ProjectHealth `json:"projects"`
 	// Redacted is set on the body /healthz serves without the pool's token:
 	// each reason is cut to its Class, and images and stuck jobs are left out.
@@ -311,23 +302,18 @@ type ProjectHealth struct {
 	// NotInstalled marks a docker-class entry on a Mac without limactl: it
 	// serves no docker jobs, and that is no fault (Healthy stays true).
 	NotInstalled bool `json:"not_installed,omitempty"`
-	// Waiting is the project's runners waiting for the budget.
-	Waiting int `json:"waiting"`
-	// Admitted is the project's runners and survivors that hold an
-	// admission now, by mode.
-	Admitted AdmittedHealth `json:"admitted"`
 	// Stuck is the jobs the queued-job watch reports (queued.go); absent
 	// when there are none.
 	Stuck []StuckJob `json:"stuck,omitempty"`
 }
 
-// AdmittedHealth counts a project's runners and survivors admitted into the
-// budget, by mode: queued and fail_open runners, adopted and fail_open
-// survivors.
-type AdmittedHealth struct {
-	Queued   int `json:"queued"`
-	Adopted  int `json:"adopted"`
-	FailOpen int `json:"fail_open"`
+// JobsHealth is the machine-wide cap on jobs, container jobs and docker VMs
+// together ([jobs] max in config.toml). Max 0 is no cap beyond the slots.
+// Error is "config" while the settings file is invalid; the last valid cap
+// stays in force.
+type JobsHealth struct {
+	Max   int    `json:"max"`
+	Error string `json:"error,omitempty"`
 }
 
 // Supervisor runs the pool; see Run.
@@ -350,6 +336,12 @@ type Supervisor struct {
 	slots    *runner.Slots
 	// vmSlots is the docker class's one slot: one docker VM at a time.
 	vmSlots *runner.Slots
+	// jobs holds every container slot and VM slot taken, within the cap on
+	// jobs; jobsMax is that cap as read, 0 for none, and configInvalid
+	// whether the last read failed (readSettings).
+	jobs          *runner.Slots
+	jobsMax       int
+	configInvalid bool
 	// vmLeak is set when a docker VM may still run (a delete, or the start-up
 	// sweep, failed): no docker VM starts until a restart.
 	vmLeak   string
@@ -509,16 +501,20 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	s.slots.OnChange(s.requestCapacity)
 	s.vmSlots = runner.NewSlots(1)
 	s.vmSlots.OnChange(s.requestCapacity)
+	// Without a cap, every slot of both kinds: no limit beyond theirs.
+	s.jobs = runner.NewSlots(m.Slots + 1)
+	s.slots.Within(s.jobs)
+	s.vmSlots.Within(s.jobs)
 	s.dockerOK = true
 	s.mu.Unlock()
+	s.readSettings()
 	// The pid lets the installer tell this process's lines in the shared log
 	// from an earlier run's: it must not send a second SIGTERM to a pool that
 	// is already draining (cmd/pool restores the default action after the
 	// first, so a second one kills it).
 	s.log.Info("pool starting", "pid", os.Getpid(), "machine", m.Name, "slots", m.Slots, "instance", instance, "runner", mount.Version, "probe", s.cfg.Probe)
 	s.prune(ctx)
-	adopt, err := s.sweep(ctx)
-	if err != nil {
+	if err := s.sweep(ctx); err != nil {
 		return err
 	}
 	s.sweepVMs(ctx)
@@ -538,24 +534,8 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			f()
 		}()
 	}
-	// The survivors are adopted once the exit watcher has subscribed, so a die
-	// event during an Adopt is not lost.
-	subscribed := make(chan struct{})
-	var once sync.Once
-	exits := subscribeHook{Docker: s.deps.Docker, onSubscribe: func() {
-		once.Do(func() { close(subscribed) })
-		s.requestReconcile()
-	}}
+	exits := subscribeHook{Docker: s.deps.Docker, onSubscribe: s.requestReconcile}
 	start(func() { runner.WatchExits(life, exits, instance, s.exited) })
-	if len(adopt) > 0 {
-		start(func() {
-			select {
-			case <-subscribed:
-				s.adoptSurvivors(life, adopt)
-			case <-life.Done():
-			}
-		})
-	}
 	start(func() { s.watchdog(life) })
 	start(func() { s.watchQueued(life) })
 	start(func() { s.capacities(life) })
@@ -565,7 +545,6 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	err = s.loop(ctx, life, stopLife)
 
 	stopLife()
-	s.stopWaiters()
 	s.wg.Wait()
 	s.closeSessions()
 	bg.Wait()
@@ -646,23 +625,46 @@ func (s *Supervisor) shutdown(life context.Context, stopLife context.CancelFunc)
 	}
 }
 
-// stopWaiters gives up every project's waiting runners and waits for their
-// waiter goroutines, which s.wg does not count: after a fatal error no drain
-// ran, and a runner the budget admitted after Run returned would start. The
-// projects join at once, each within joinBound; a project whose drain already
-// joined is not joined again, and one whose scaler was never built is
-// skipped.
-func (s *Supervisor) stopWaiters() {
-	s.mu.Lock()
-	prs := s.projectList()
-	s.mu.Unlock()
-	var wg sync.WaitGroup
-	for _, pr := range prs {
-		if sc := pr.getScaler(); sc != nil {
-			wg.Go(func() { pr.stopWaiters(sc, joinBound) })
-		}
+// readSettings reads the cap on jobs (Deps.JobsMax) and applies it to the
+// slots of both kinds together: at start and on every watchdog tick, so an
+// edit of the settings file takes effect without a restart. A lowered cap
+// stops no job: it only starts none until enough have ended.
+func (s *Supervisor) readSettings() {
+	if s.deps.JobsMax == nil {
+		return
 	}
-	wg.Wait()
+	n, invalid := s.deps.JobsMax()
+	s.mu.Lock()
+	s.configInvalid = invalid
+	changed := n != s.jobsMax
+	s.jobsMax = n
+	limit := s.machine.Slots + 1
+	s.mu.Unlock()
+	if !changed {
+		return
+	}
+	if n > 0 {
+		limit = n
+	}
+	s.jobs.SetCap(limit)
+	s.log.Info("cap on jobs", "max", n, "slots", s.slots.Cap())
+	s.requestCapacity()
+}
+
+// cpusPerJob is the CPUs one container job may use: the Docker VM's CPUs shared
+// by the jobs that can run at once (the cap on jobs, never more than the slots),
+// and at least 1. A job that sizes its workers by os.availableParallelism, which
+// follows the quota, then starts as many as its share holds; all jobs together
+// never ask for more CPUs than there are. The docker VM keeps its own CPUs and
+// counts as one job. The pool never starts with fewer than 1 slot.
+func (s *Supervisor) cpusPerJob() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	div := s.machine.Slots
+	if s.jobsMax > 0 {
+		div = min(s.jobsMax, div)
+	}
+	return max(s.machine.FP.CPUs/div, 1)
 }
 
 // FailOnLoginLoss ends Run with a terminal error if err means the GitHub login
@@ -915,9 +917,12 @@ func (s *Supervisor) Snapshot() Snapshot {
 		Login:   s.deps.Token == nil || s.deps.Token.ReadErr() == nil,
 		Probe:   s.cfg.Probe,
 	}
+	snap.Jobs.Max = s.jobsMax
+	if s.configInvalid {
+		snap.Jobs.Error = "config"
+	}
 	slots, vmSlots := s.slots, s.vmSlots
 	prs := s.projectList()
-	survivors := s.survivorCountsLocked()
 	var gone []ProjectHealth
 	for _, key := range slices.Sorted(maps.Keys(s.public)) {
 		if s.projects[key] == nil {
@@ -931,19 +936,8 @@ func (s *Supervisor) Snapshot() Snapshot {
 	if vmSlots != nil {
 		snap.VMInUse = vmSlots.InUse()
 	}
-	// State reads the settings file: never under s.mu.
-	snap.Budget = budget.State{State: "off"}
-	if s.deps.Budget != nil {
-		snap.Budget = s.deps.Budget.State()
-	}
 	for _, pr := range prs {
-		h := pr.health()
-		if !pr.docker {
-			c := survivors[pr.identity]
-			h.Admitted.Adopted += c.Adopted
-			h.Admitted.FailOpen += c.FailOpen
-		}
-		snap.Projects = append(snap.Projects, h)
+		snap.Projects = append(snap.Projects, pr.health())
 	}
 	snap.Projects = append(snap.Projects, gone...)
 	return snap

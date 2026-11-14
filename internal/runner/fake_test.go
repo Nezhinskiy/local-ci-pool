@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -301,7 +300,6 @@ type fakeStarter struct {
 	mu      sync.Mutex
 	names   []string
 	jits    map[string]string
-	needs   map[string]int
 	err     error
 	onStart func(name string)
 	// hangs makes a start wait for its context, like a stuck daemon.
@@ -309,23 +307,16 @@ type fakeStarter struct {
 	// block, when set, makes a start wait until it is closed or its context
 	// ends.
 	block chan struct{}
-	ctxs  map[string]context.Context
 }
 
-func (s *fakeStarter) start(ctx context.Context, name, jit string, need int) error {
+func (s *fakeStarter) start(ctx context.Context, name, jit string) error {
 	s.mu.Lock()
 	hook := s.onStart
 	if s.jits == nil {
 		s.jits = map[string]string{}
-		s.needs = map[string]int{}
 	}
 	s.names = append(s.names, name)
 	s.jits[name] = jit
-	s.needs[name] = need
-	if s.ctxs == nil {
-		s.ctxs = map[string]context.Context{}
-	}
-	s.ctxs[name] = ctx
 	err := s.err
 	hangs := s.hangs
 	block := s.block
@@ -351,20 +342,6 @@ func (s *fakeStarter) started() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.names...)
-}
-
-// ctxOf is the context a runner's start ran on.
-func (s *fakeStarter) ctxOf(name string) context.Context {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.ctxs[name]
-}
-
-// needOf is the need a runner was started with.
-func (s *fakeStarter) needOf(name string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.needs[name]
 }
 
 // logBuffer is a concurrency-safe log sink.
@@ -425,217 +402,19 @@ func newHarnessWith(slots *Slots, configure func(*ScalerConfig)) *harness {
 	return h
 }
 
-// fakeGate is a budget gate the test drives by hand. Each Admit hands the
-// test an admitReq and returns exactly what the test answers, even after its
-// ctx ended: it never watches the ctx itself.
-type fakeGate struct {
-	enabled      atomic.Bool
-	reqs         chan *admitReq
-	enabledCalls atomic.Int32
-	// returned counts the Admit calls that returned.
-	returned atomic.Int32
-	// onEnabled runs inside every Enabled call.
-	onEnabled func()
-	// onRelease runs after a release is counted.
-	onRelease func(name string)
-
-	mu       sync.Mutex
-	all      []*admitReq
-	released map[string]int
-	// closed answers every later Admit at once with context.Canceled.
-	closed bool
+// stateOf is the state of the runner, or 0 when there is none.
+func stateOf(s *Scaler, name string) runnerState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.runners[name]
 }
 
-type admitAnswer struct {
-	adm Admitted
-	err error
-}
-
-// admitReq is one Admit call waiting for the test's answer.
-type admitReq struct {
-	name, project string
-	ctx           context.Context
-	answer        chan admitAnswer
-	once          sync.Once
-}
-
-// reply answers the request; only the first answer counts.
-func (r *admitReq) reply(adm Admitted, err error) {
-	r.once.Do(func() { r.answer <- admitAnswer{adm, err} })
-}
-
-// answerOnCancel answers the request with its ctx's error once its ctx ends.
-func answerOnCancel(r *admitReq) {
-	go func() {
-		<-r.ctx.Done()
-		r.reply(Admitted{}, r.ctx.Err())
-	}()
-}
-
-func newFakeGate() *fakeGate {
-	g := &fakeGate{reqs: make(chan *admitReq, 64), released: map[string]int{}}
-	g.enabled.Store(true)
-	return g
-}
-
-func (g *fakeGate) Enabled() bool {
-	g.enabledCalls.Add(1)
-	if g.onEnabled != nil {
-		g.onEnabled()
-	}
-	return g.enabled.Load()
-}
-
-func (g *fakeGate) Admit(ctx context.Context, a Admission) (Admitted, error) {
-	defer g.returned.Add(1)
-	r := &admitReq{name: a.Runner, project: a.Project, ctx: ctx, answer: make(chan admitAnswer, 1)}
-	g.mu.Lock()
-	if g.closed {
-		g.mu.Unlock()
-		return Admitted{}, context.Canceled
-	}
-	g.all = append(g.all, r)
-	g.mu.Unlock()
-	g.reqs <- r
-	ans := <-r.answer
-	return ans.adm, ans.err
-}
-
-func (g *fakeGate) Adopt(context.Context, Admission) Admitted {
-	return Admitted{Release: func() {}, Mode: ModeAdopted}
-}
-
-// admitted builds an Admitted whose Release counts towards released[name],
-// then runs onRelease.
-func (g *fakeGate) admitted(name string, mode Mode, need int) Admitted {
-	return Admitted{Mode: mode, Need: need, Release: func() {
-		g.mu.Lock()
-		g.released[name]++
-		hook := g.onRelease
-		g.mu.Unlock()
-		if hook != nil {
-			hook(name)
-		}
-	}}
-}
-
-// releasedOf is how many times the grant of name was released.
-func (g *fakeGate) releasedOf(name string) int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.released[name]
-}
-
-// admitCalls is the number of Admit calls so far.
-func (g *fakeGate) admitCalls() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return len(g.all)
-}
-
-// next waits for the next Admit call.
-func (g *fakeGate) next(t *testing.T) *admitReq {
-	t.Helper()
-	select {
-	case r := <-g.reqs:
-		return r
-	case <-time.After(2 * time.Second):
-		t.Fatal("no Admit call within 2s")
-		return nil
-	}
-}
-
-// gateHarness is a harness whose scaler admits runners through a fakeGate,
-// on a manual clock.
-type gateHarness struct {
-	*harness
-	gate  *fakeGate
-	clock *manualClock
-}
-
-// manualClock is a clock that moves only when the test advances it.
-type manualClock struct {
-	mu sync.Mutex
-	t  time.Time
-}
-
-func (c *manualClock) now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.t
-}
-
-func (c *manualClock) advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.t = c.t.Add(d)
-}
-
-// lower calls Desired(count) twice, dipGrace apart, so that the waiting
-// runners beyond count are given up, and returns the second call's result.
-func (h *gateHarness) lower(t *testing.T, count int) int {
-	t.Helper()
-	desired(t, h.scaler, count)
-	h.clock.advance(dipGrace)
-	return desired(t, h.scaler, count)
-}
-
-// newGateHarness wires a fakeGate into a harness. By default the gate's
-// Enabled and every Release call s.Held() within 2s, so a call made under
-// the scaler's lock fails the test. At cleanup the scaler is aborted, every
-// unanswered or later Admit is answered with a ctx error, and every waiter goroutine
-// must return within 2s.
-func newGateHarness(t *testing.T, slots *Slots) *gateHarness {
-	t.Helper()
-	g := newFakeGate()
-	clock := &manualClock{t: time.Unix(1_800_000_000, 0)}
-	h := newHarnessWith(slots, func(c *ScalerConfig) {
-		c.Gate = g
-		c.Project = "alpha"
-		c.Now = clock.now
-	})
-	held := func(what string) {
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			h.scaler.Held()
-		}()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Errorf("%s ran under the scaler's lock: Held() blocked for 2s", what)
-		}
-	}
-	g.onEnabled = func() { held("Enabled") }
-	g.onRelease = func(name string) { held("Release of " + name) }
-	t.Cleanup(func() {
-		h.scaler.Abort()
-		g.mu.Lock()
-		g.closed = true
-		all := append([]*admitReq(nil), g.all...)
-		g.mu.Unlock()
-		for _, r := range all {
-			r.reply(Admitted{}, context.Canceled)
-		}
-		if !waitGroupWithin(&h.scaler.wg, 2*time.Second) {
-			t.Error("waiter goroutines still running 2s after cleanup")
-		}
-	})
-	return &gateHarness{harness: h, gate: g, clock: clock}
-}
-
-// waitGroupWithin reports whether wg is done within d.
-func waitGroupWithin(wg *sync.WaitGroup, d time.Duration) bool {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return true
-	case <-time.After(d):
-		return false
+// scripted names runners from names, in order.
+func scripted(names ...string) func() (string, error) {
+	return func() (string, error) {
+		n := names[0]
+		names = names[1:]
+		return n, nil
 	}
 }
 

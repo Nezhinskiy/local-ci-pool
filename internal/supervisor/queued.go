@@ -9,10 +9,10 @@ import (
 
 // The queued-job watch reports, and only reports, a job GitHub keeps queued
 // while the pool could take it: the job has the project's label, and for
-// queuedAfter both it was queued and the pool had a free slot while the
-// project had no runner waiting, starting or idle. GitHub then does not offer
-// the job to the pool (seen after a revoked request was reissued and never
-// counted again). Nothing is cancelled or re-run.
+// queuedAfter both it was queued and the pool had a free slot, within the cap
+// on jobs, while the project had no runner starting or idle. GitHub then does
+// not offer the job to the pool (seen after a revoked request was reissued and
+// never counted again). Nothing is cancelled or re-run.
 const (
 	// queuedAfter is twice GitHub's 5-minute window for an unacquired
 	// request.
@@ -55,13 +55,12 @@ func (s *Supervisor) watchQueued(ctx context.Context) {
 func (s *Supervisor) checkQueued(ctx context.Context, pr *project) {
 	clock := s.deps.Clock
 	now := clock.Now()
-	free := pr.slots.InUse() < pr.slots.Cap()
+	free := pr.slots.Free() > 0
 	pr.mu.Lock()
 	sc, ready := pr.scaler, pr.up && !pr.draining && !pr.failed
 	pr.mu.Unlock()
 	if ready && sc != nil {
-		waiting, _ := sc.BudgetCounts()
-		ready = waiting == 0 && sc.Idle() == 0
+		ready = sc.Idle() == 0
 	}
 	pr.mu.Lock()
 	if !free || !ready {

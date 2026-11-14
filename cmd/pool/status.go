@@ -97,8 +97,11 @@ func formatStatus(s supervisor.Snapshot) string {
 	}
 	fmt.Fprintf(&b, "pool %s (%s) on %s: docker %s, login %s, %d slots, %d in use",
 		clean(s.Version), clean(s.Commit), clean(s.Machine), docker, login, s.Slots, s.InUse)
-	if s.Budget.State != "off" {
-		fmt.Fprintf(&b, ", budget %s", clean(s.Budget.State))
+	if s.Jobs.Max > 0 {
+		fmt.Fprintf(&b, ", at most %d jobs", s.Jobs.Max)
+	}
+	if s.Jobs.Error != "" {
+		fmt.Fprintf(&b, ", %s invalid", clean(s.Jobs.Error))
 	}
 	b.WriteByte('\n')
 
@@ -119,9 +122,6 @@ func formatStatus(s supervisor.Snapshot) string {
 		}
 		if !p.Healthy {
 			state = "unhealthy: " + clean(p.Reason)
-		}
-		if p.Waiting > 0 {
-			state += fmt.Sprintf(", %d waiting for cores", p.Waiting)
 		}
 		fmt.Fprintf(&b, "  %-*s  %s\n", width, name(p), state)
 		for _, j := range p.Stuck {
