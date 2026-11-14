@@ -422,7 +422,7 @@ func TestProbeOptionsReadMarkerAtRef(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Repo != "o/probe" || got[0].Ref != "feature/probe" {
+	if len(got) != 1 || got[0].Repo != "o/probe" || got[0].Ref != "feature/probe" || got[0].DefaultBranch != "main" {
 		t.Fatalf("projects = %+v", got)
 	}
 	if strings.Join(src.readCalls, ",") != "o/probe@feature/probe" {

@@ -19,6 +19,7 @@ import (
 	"github.com/Nezhinskiy/local-ci-pool/internal/machine"
 	"github.com/Nezhinskiy/local-ci-pool/internal/mirror"
 	"github.com/Nezhinskiy/local-ci-pool/internal/supervisor"
+	"github.com/Nezhinskiy/local-ci-pool/internal/vm"
 )
 
 // realServices wires the pool to Docker, GitHub and this Mac. Nothing here
@@ -40,6 +41,10 @@ func newRealPool(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, erro
 	if err != nil {
 		return nil, nil, fmt.Errorf("finding the cache directory: %w", err)
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, nil, fmt.Errorf("finding the home directory: %w", err)
+	}
 	tok := ghauth.NewSource(nil)
 	gh := github.New(tok, "")
 	var sup *supervisor.Supervisor
@@ -58,6 +63,13 @@ func newRealPool(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, erro
 		// The settings file's path by the default rule. New reads nothing
 		// and opens nothing: coreslot opens at the first admission.
 		Budget: budgetDep(budget.New(budget.Config{Log: log})),
+		// The docker class's VMs (docs/docker-class.md): one at a time, below
+		// MinFreeGiB of free disk where Lima keeps them none.
+		VM: &vm.Backend{
+			Lima: vm.Exec{}, CPUs: 4, MemoryGiB: 6, DiskGiB: 30, MinFreeGiB: 15,
+			FreeGiB: vm.FreeGiBAt(filepath.Join(home, ".lima")),
+		},
+		StateDir: supportDir(),
 	})
 	return sup, gh, nil
 }

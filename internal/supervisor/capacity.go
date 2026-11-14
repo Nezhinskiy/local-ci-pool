@@ -41,16 +41,18 @@ func (s *Supervisor) capacities(life context.Context) {
 	}
 }
 
-// capacity is the slots pr could use now: the free slots plus its runners and
-// survivors, at most every slot. It takes the supervisor's and the scaler's
-// locks: never call it under pr.mu.
+// capacity is the slots pr could use now: the free slots of its class plus
+// its runners and survivors, at most every slot. It takes the supervisor's and
+// the scaler's locks: never call it under pr.mu.
 func (pr *project) capacity() int {
-	s := pr.s
-	own := s.survivorsOf(pr.identity)
+	own := 0
+	if !pr.docker {
+		own = pr.s.survivorsOf(pr.identity)
+	}
 	if sc := pr.getScaler(); sc != nil {
 		own += len(sc.Held())
 	}
-	return min(max(s.slots.Cap()-s.slots.InUse(), 0)+own, s.slots.Cap())
+	return min(max(pr.slots.Cap()-pr.slots.InUse(), 0)+own, pr.slots.Cap())
 }
 
 // advertise gives pr's listener its capacity, 0 while it drains.

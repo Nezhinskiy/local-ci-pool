@@ -20,18 +20,25 @@ import (
 	"github.com/Nezhinskiy/local-ci-pool/internal/runnermount"
 )
 
-// project serves one repository: its image, its scale set, one session at a
-// time and the listener on it, restarted in place when it dies.
+// project serves one repository's class: its image, its scale set, one
+// session at a time and the listener on it, restarted in place when it dies.
+// A repository has a container-class project and, with a docker block, a
+// docker-class one (dockerclass.go).
 type project struct {
 	s        *Supervisor
 	repo     string
 	identity string
+	key      string   // in s.projects: the repository, plus dockerKey for the docker class
+	docker   bool     // the docker class: each runner in a throwaway VM
 	name     string   // the scale set
 	labels   []string // the scale set's labels
-	log      *slog.Logger
-	ctx      context.Context
-	cancel   context.CancelFunc
-	done     chan struct{} // closed when run returns
+	slots    *runner.Slots
+	// remover removes a runner: its container, or a docker runner's VM.
+	remover runner.ContainerRemover
+	log     *slog.Logger
+	ctx     context.Context
+	cancel  context.CancelFunc
+	done    chan struct{} // closed when run returns
 
 	mu     sync.Mutex
 	p      discovery.Project
@@ -40,7 +47,9 @@ type project struct {
 	imgErr string            // the last image refresh failed
 	// mountErr: the newest runner failed the preflight with img, so the
 	// project's runners stay on the older mount.
-	mountErr   string
+	mountErr string
+	// launchErr: the docker class's last VM launch failed.
+	launchErr  string
 	up         bool   // a listener runs on an open session
 	reason     string // why the project is not up
 	failed     bool   // setup failed; the next discovery pass starts it again
@@ -90,19 +99,29 @@ var errLeft = errors.New("the repository is no longer served")
 // notPrivate is the reason of a project whose repository turned public.
 const notPrivate = "the repository is no longer private: its runners are refused and its containers removed"
 
-func newProject(s *Supervisor, life context.Context, p discovery.Project) *project {
+func newProject(s *Supervisor, life context.Context, p discovery.Project, docker bool) *project {
 	prefix := ""
 	if s.cfg.Probe {
 		prefix = "probe-"
 	}
-	name := machine.ScaleSetName(prefix+p.Identity, s.machine.Name, nameLimit)
+	set, label, key, slots := prefix+p.Identity, prefix+p.Identity+"-local", p.Repo, s.slots
+	var remover runner.ContainerRemover = s.deps.Docker
+	if docker {
+		set, key, slots, remover = p.Identity+"-docker", p.Repo+dockerKey, s.vmSlots, vmRemover{s.deps.VM}
+		label = set
+	}
+	name := machine.ScaleSetName(set, s.machine.Name, nameLimit)
 	ctx, cancel := context.WithCancel(life)
 	return &project{
 		s:        s,
 		repo:     p.Repo,
 		identity: p.Identity,
+		key:      key,
+		docker:   docker,
 		name:     name,
-		labels:   []string{name, prefix + p.Identity + "-local"},
+		labels:   []string{name, label},
+		slots:    slots,
+		remover:  remover,
 		log:      s.log.With("repo", p.Repo, "scaleSet", name),
 		ctx:      ctx,
 		cancel:   cancel,
@@ -167,6 +186,58 @@ func (pr *project) setup() error {
 	pr.mu.Lock()
 	p := pr.p
 	pr.mu.Unlock()
+	if pr.docker {
+		img, err := pr.ensureBase(pr.ctx, p, s.currentMount())
+		if err != nil {
+			return err
+		}
+		pr.mu.Lock()
+		pr.img = img
+		pr.mu.Unlock()
+	} else if err := pr.ensureImage(p); err != nil {
+		return err
+	}
+	if err := pr.connect(); err != nil {
+		return err
+	}
+	id, err := pr.ensureScaleSet()
+	if err != nil {
+		return err
+	}
+	// A nil Budget converts to a nil Gate: the budget is off. The docker class
+	// is never gated: a VM has CPUs of its own.
+	var gate runner.Gate = s.deps.Budget
+	start, survivors := pr.start, func() int { return s.survivorsOf(pr.identity) }
+	if pr.docker {
+		gate, start, survivors = nil, pr.startVM, nil
+	}
+	sc := runner.NewScaler(runner.ScalerConfig{
+		ScaleSetID: id,
+		Slots:      pr.slots,
+		Start:      start,
+		JIT:        clientRef{pr},
+		Registry:   clientRef{pr},
+		Docker:     pr.remover,
+		Log:        pr.log,
+		Gate:       gate,
+		Project:    pr.identity,
+		Survivors:  survivors,
+		Now:        s.deps.Clock.Now,
+		Vet:        pr.vet,
+	})
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	pr.scaleSetID, pr.scaler = id, sc
+	if pr.draining {
+		sc.Drain()
+	}
+	return nil
+}
+
+// ensureImage makes the container class's image available and preflights it
+// with the newest runner mount.
+func (pr *project) ensureImage(p discovery.Project) error {
+	s := pr.s
 	ref, err := s.deps.Ensure(pr.ctx, p)
 	if err != nil {
 		return fmt.Errorf("preparing the image: %w", err)
@@ -179,34 +250,6 @@ func (pr *project) setup() error {
 	pr.mu.Lock()
 	pr.img, pr.mount = Image{Ref: ref, User: user}, m
 	pr.mu.Unlock()
-	if err := pr.connect(); err != nil {
-		return err
-	}
-	id, err := pr.ensureScaleSet()
-	if err != nil {
-		return err
-	}
-	sc := runner.NewScaler(runner.ScalerConfig{
-		ScaleSetID: id,
-		Slots:      s.slots,
-		Start:      pr.start,
-		JIT:        clientRef{pr},
-		Registry:   clientRef{pr},
-		Docker:     s.deps.Docker,
-		Log:        pr.log,
-		// A nil Budget converts to a nil Gate: the budget is off.
-		Gate:      s.deps.Budget,
-		Project:   pr.identity,
-		Survivors: func() int { return s.survivorsOf(pr.identity) },
-		Now:       s.deps.Clock.Now,
-		Vet:       pr.vet,
-	})
-	pr.mu.Lock()
-	defer pr.mu.Unlock()
-	pr.scaleSetID, pr.scaler = id, sc
-	if pr.draining {
-		sc.Drain()
-	}
 	return nil
 }
 
@@ -544,6 +587,9 @@ func heldBack(newest, ref, kept string, err error) string {
 // later preflight with the newest mount passes (the next release check, or
 // the next image refresh).
 func (pr *project) adopt(m runnermount.Mount) {
+	if pr.docker {
+		return // a new runner release changes the base's key: the next refresh rebuilds it
+	}
 	pr.mu.Lock()
 	ready := pr.scaler != nil && !pr.draining && !pr.failed
 	img, cur := pr.img, pr.mount
@@ -583,6 +629,10 @@ func (pr *project) refresh(p discovery.Project) {
 		pr.refreshing = false
 		pr.mu.Unlock()
 	}()
+	if pr.docker {
+		pr.refreshBase(p)
+		return
+	}
 	newest := pr.s.currentMount()
 	pr.mu.Lock()
 	cur, kept, sc := pr.img, pr.mount, pr.scaler
@@ -708,7 +758,7 @@ func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	}
 	pr.removeLeft(post)
 	public := pr.isPublic()
-	if public {
+	if public && !pr.docker {
 		pr.s.removeSurvivors(post, pr.identity)
 	}
 	held := pr.closeSession(post)
@@ -769,8 +819,8 @@ func (pr *project) reopenToDelete(post context.Context) bool {
 	return true
 }
 
-// removeLeft removes the containers of runners still held after the drain
-// bound and releases their slots, all within post.
+// removeLeft removes the containers (or VMs) of runners still held after the
+// drain bound and releases their slots, all within post.
 func (pr *project) removeLeft(post context.Context) {
 	sc := pr.getScaler()
 	if sc == nil {
@@ -778,7 +828,7 @@ func (pr *project) removeLeft(post context.Context) {
 	}
 	for _, r := range sc.Held() {
 		ctx, cancel := context.WithTimeout(post, callTimeout)
-		if err := runner.RemoveContainer(ctx, pr.s.deps.Docker, r.Name); err != nil {
+		if err := runner.RemoveContainer(ctx, pr.remover, r.Name); err != nil {
 			pr.log.Warn("removing a runner left after the drain", "runner", r.Name, "error", err.Error())
 		}
 		// Best effort: GitHub refuses it while it still counts the job as
@@ -894,7 +944,7 @@ func (pr *project) isFailed() bool {
 
 func (pr *project) health() ProjectHealth {
 	pr.mu.Lock()
-	h := ProjectHealth{Repo: pr.repo, Identity: pr.identity, Image: pr.img.Ref}
+	h := ProjectHealth{Repo: pr.repo, Identity: pr.identity, Image: pr.img.Ref, DockerClass: pr.docker}
 	switch {
 	case pr.public:
 		h.Reason = notPrivate
@@ -910,6 +960,8 @@ func (pr *project) health() ProjectHealth {
 		h.Reason, h.Class = pr.imgErr, "image"
 	case pr.mountErr != "":
 		h.Reason, h.Class = pr.mountErr, "preflight"
+	case pr.launchErr != "":
+		h.Reason, h.Class = pr.launchErr, "vm"
 	default:
 		h.Healthy = true
 	}

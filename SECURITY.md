@@ -108,8 +108,8 @@ repositories' jobs use, and give the ones that matter their own authentication. 
 filtering would need root inside the job container (or a firewall in the Docker VM) and is out of
 scope for this pool.
 
-A docker-class job (`docs/docker-class.md`, not yet wired into the pool) runs in a Lima VM, and it
-reaches the same: Lima's user-mode gateway `192.168.5.2` (`host.lima.internal`) leads to the Mac's
+A docker-class job ([docs/docker-class.md](docs/docker-class.md)) is root inside its own throwaway
+Lima VM, which holds no other runner, no pool credentials and no host mounts. It reaches the same: Lima's user-mode gateway `192.168.5.2` (`host.lima.internal`) leads to the Mac's
 loopback. Measured with Lima 2.3.0 (`vz`, `--plain`): from the VM, a listener bound to `127.0.0.1`
 on the Mac, one bound to `0.0.0.0`, and a Docker Desktop port published on `127.0.0.1` all
 answered. The other direction is closed: in plain mode a port opened inside the VM is not forwarded

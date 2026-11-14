@@ -92,6 +92,20 @@ func TestStatusShowsWaitingForCores(t *testing.T) {
 	}
 }
 
+func TestStatusNamesTheDockerClass(t *testing.T) {
+	snap := statusFixture()
+	snap.Projects = []supervisor.ProjectHealth{
+		{Repo: "example/DNA", Healthy: true},
+		{Repo: "example/DNA", DockerClass: true, Reason: "docker class: limactl not found"},
+	}
+	svc, _ := statusServices(http.StatusOK, snap, nil)
+	_, stdout, _ := do(t, svc, "status")
+	want := "  example/DNA           healthy\n  example/DNA (docker)  unhealthy: docker class: limactl not found\n"
+	if !strings.Contains(stdout, want) {
+		t.Fatalf("stdout lacks %q:\n%s", want, stdout)
+	}
+}
+
 func TestStatusShowsBudgetWhenOn(t *testing.T) {
 	for _, tc := range []struct {
 		state, suffix string
