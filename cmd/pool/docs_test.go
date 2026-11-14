@@ -6,14 +6,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
 	"github.com/Nezhinskiy/local-ci-pool/internal/supervisor"
 )
 
 // The README's quickstart and the runbook's "CI went hosted" quote what
 // `pool status` prints. A reader compares their own output with those blocks,
 // so each must be what formatStatus prints for the state it describes,
-// character for character. The quickstart's pool runs without the budget,
+// character for character. The quickstart's pool runs without a cap on jobs,
 // which is what a plain ./install.sh gives.
 func TestDocsQuoteStatusOutput(t *testing.T) {
 	base := func() supervisor.Snapshot {
@@ -24,7 +23,6 @@ func TestDocsQuoteStatusOutput(t *testing.T) {
 			Slots:   3,
 			Docker:  true,
 			Login:   true,
-			Budget:  budget.State{State: "off"},
 			Projects: []supervisor.ProjectHealth{
 				{Repo: "alice/alpha", Healthy: true},
 				{Repo: "alice/beta", Healthy: true},
@@ -38,7 +36,7 @@ func TestDocsQuoteStatusOutput(t *testing.T) {
 	starting.Projects[0] = supervisor.ProjectHealth{Repo: "alice/alpha", Reason: "starting", Class: "starting"}
 
 	hosted := base()
-	hosted.Budget = budget.State{State: "on"}
+	hosted.Jobs = supervisor.JobsHealth{Max: 4}
 	hosted.Projects[1] = supervisor.ProjectHealth{
 		Repo:   "alice/beta",
 		Reason: "draining",

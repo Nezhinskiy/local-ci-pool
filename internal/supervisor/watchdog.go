@@ -12,11 +12,12 @@ import (
 	"github.com/Nezhinskiy/local-ci-pool/internal/runner"
 )
 
-// watchdog pings Docker every watchdogEvery. A changed fingerprint, or
-// maxPingFailures failed pings in a row, is a fatal non-terminal error: the
-// pool exits and launchd starts it again, deriving the slots anew. Every
-// successful ping, and every resubscription of the exit watcher, reconciles
-// the held runners with the live containers.
+// watchdog reads the settings file (readSettings) and pings Docker every
+// watchdogEvery. A changed fingerprint, or maxPingFailures failed pings in a
+// row, is a fatal non-terminal error: the pool exits and launchd starts it
+// again, deriving the slots anew. Every successful ping, and every
+// resubscription of the exit watcher, reconciles the held runners with the
+// live containers.
 func (s *Supervisor) watchdog(ctx context.Context) {
 	failures := 0
 	tick := s.deps.Clock.After(watchdogEvery)
@@ -29,6 +30,7 @@ func (s *Supervisor) watchdog(ctx context.Context) {
 			continue
 		case <-tick:
 			tick = s.deps.Clock.After(watchdogEvery)
+			s.readSettings()
 		}
 		info, err := s.info(ctx)
 		if err != nil {

@@ -274,13 +274,11 @@ func (h *harness) dockerHealthy(repo string) bool {
 // A repository with a docker block gets a second scale set, labelled
 // <identity>-docker, next to its container one; its base is built once; a VM
 // left by a killed pool is deleted at start; and its job runs in a clone of
-// the base, holding the docker slot and no container slot, outside the
-// budget, and uncounted against the container class's survivors.
+// the base, holding the docker slot and no container slot, and uncounted
+// against the container class's survivors.
 func TestDockerClassServesASecondScaleSet(t *testing.T) {
 	h := newHarness(t, 2, 1000, "alpha")
 	h.withDocker("alpha")
-	b := newFakeBudget(true)
-	h.budget = b
 	h.lima.list = `{"name":"local-ci-docker-base-main-alpha"}` + "\n" + `{"name":"local-ci-docker-job-main-local-ci-0badc0ffee00"}` + "\n"
 	survivor := instanceLabels("main", "local-ci-5u7v1v0r0000")
 	survivor[runner.LabelProject] = "alpha"
@@ -310,9 +308,6 @@ func TestDockerClassServesASecondScaleSet(t *testing.T) {
 	}
 	if got := h.docker.created(h.imageOf("alpha")); len(got) != 0 {
 		t.Fatalf("a docker job started containers %v", got)
-	}
-	if got := b.admitted(); len(got) != 0 {
-		t.Fatalf("the budget admitted %+v; the docker class is never gated", got)
 	}
 	h.actions.Started(alphaDockerSet, r)
 	h.actions.Completed(alphaDockerSet, r)

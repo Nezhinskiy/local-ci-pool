@@ -28,7 +28,7 @@ import (
 // class's project it runs its own visibility checks and its own drain, so it
 // leaves no later than the container class would. It shares nothing with it
 // but the identity: one machine-wide docker slot (one VM at a time) instead of the
-// container slots, no budget gate (a VM has its own CPUs), no survivors, no
+// container slots, counted with them against the cap on jobs, no survivors, no
 // heartbeat (the routing action does not route docker jobs), and no
 // container, so the Docker die events and the reconcile never see its runners:
 // a runner's exit is its Launch's done callback.
@@ -193,7 +193,7 @@ func (pr *project) refreshBase(p discovery.Project) {
 // is the project's reason until a launch succeeds; the scaler's failed-start
 // path unregisters the runner and frees the docker slot, and the job stays
 // queued.
-func (pr *project) startVM(ctx context.Context, name, jit string, _ int) error {
+func (pr *project) startVM(ctx context.Context, name, jit string) error {
 	err := pr.s.deps.VM.Launch(ctx, pr.identity, name, jit, func(err error) {
 		if err != nil {
 			pr.log.Info("a docker VM's runner ended", "runner", name, "error", err.Error())

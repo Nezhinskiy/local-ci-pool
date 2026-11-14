@@ -152,8 +152,8 @@ func TestVisibilityFlipRemovesTheProjectsSurvivors(t *testing.T) {
 	h := newHarness(t, 2, 1000, "alpha")
 	h.cfg.DiscoverEvery = 24 * time.Hour
 	h.cfg.Drain = 24 * time.Hour
-	h.docker.add(survivorA, labelled(survivorA, "alpha", "2"))
-	h.docker.add(survivorB, labelled(survivorB, "beta", "2")) // another project's
+	h.docker.add(survivorA, labelled(survivorA, "alpha"))
+	h.docker.add(survivorB, labelled(survivorB, "beta")) // another project's
 	h.start()
 	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
 	h.gh.edit(func() { h.gh.repos[alphaRepo].private = false })

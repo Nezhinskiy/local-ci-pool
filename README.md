@@ -54,8 +54,8 @@ is; [bench/](bench/README.md) is a harness to measure your own jobs. Check
 - The job runs in your marker image, not in GitHub's runner image, so the tools GitHub preinstalls
   are not there unless your image has them.
 - A job runs as a non-root user outside group root (the image's own non-root `USER`, otherwise
-  `1001:1001`) under a 4 GiB memory limit and a 4096-process limit, and with the core budget on, a
-  CPU cap at its grant. Install what the job needs in the image, not with `sudo apt-get` in a step.
+  `1001:1001`) under a 4 GiB memory limit and a 4096-process limit. Install what the job needs in
+  the image, not with `sudo apt-get` in a step.
 - Jobs cannot reach each other's ports: every job container of the pool joins one bridge network
   with traffic between containers turned off.
 - A Mac must be awake and logged in.
@@ -301,7 +301,7 @@ slots = min(floor((round(MemTotal / 2^30) - 2) / 4), floor(NCPU / 2), 8)
 
 `MemTotal` and `NCPU` come from `docker info`. The memory term rounds to the nearest GiB because the
 Docker Desktop VM reports slightly less than its slider value. The pool refuses to start when
-`slots` is below 1.
+`slots` is below 1. A [cap on jobs](#configuration-optional) can lower it.
 
 
 ## Routing
@@ -495,38 +495,26 @@ Each time a Mac could take the job, and `route` sent it there. The runners API l
 runner with no labels, so a label check cannot match it.
 
 
-## Core budget (optional)
+## Configuration (optional)
 
-With the core budget on, each CI job waits for its cores in the machine-wide
-[coreslot](https://github.com/core-slot/coreslot) budget that your local builds, tests and agents
-share, so CI and local work no longer oversubscribe the Mac. Nothing changes until you create the
-settings file.
-
-The file is `~/.config/local-ci-pool/config.toml`; when only
-`~/Library/Application Support/local-ci-pool/config.toml` exists, the pool reads that one. A pool
-started by hand from a shell whose `XDG_CONFIG_HOME` is an absolute path looks in
-`$XDG_CONFIG_HOME/local-ci-pool/` instead of `~/.config/local-ci-pool/`; the runbook has
-[the exact rule](docs/runbook.md#the-budget-settings). It has two keys:
+The pool needs no configuration. One optional setting caps the jobs it runs at once on the Mac,
+container jobs and [docker-class](docs/docker-class.md) VMs together, below what the slots allow,
+for example to leave room for local builds:
 
 ```toml
-[budget]
-enabled = true
-cpu = 2      # the most cores one job asks for: 1 to 256, no default
+[jobs]
+max = 4      # a whole number, 1 or more
 ```
 
-Start at 2, the CPUs per slot the pool's sizing assumes. A job starts once one core is free and
-takes up to `cpu`; it finds its grant in `CORESLOT_CPU`, and a workflow that runs its suite with
-`-n "${CORESLOT_CPU:-2}"` (or the like) stays within it. The installer writes the file for you
-when there is none, and never changes one that exists:
-
-```sh
-./install.sh --budget-cpu 2
-```
-
-Edit the file to change `cpu`; the next job asks for the new value, without a restart. To turn the
-budget off, set `enabled = false` or delete the file. The runbook covers
-[the settings](docs/runbook.md#the-budget-settings) in full and [what to do when CI
-waits](docs/runbook.md#ci-is-waiting).
+The file is `~/.config/local-ci-pool/config.toml`; when only
+`~/Library/Application Support/local-ci-pool/config.toml` exists, the pool reads that one
+([the exact rule](docs/runbook.md#limiting-concurrent-jobs)). Without the file, or without `max`, the
+slots alone decide. With it, at most `min(slots, max)` container jobs run, and container jobs and the
+docker VM together never exceed `max`. The pool reads the file again every 30 seconds, so an edit
+takes effect without a restart; a lowered cap stops no running job. `pool status` shows the cap
+(`at most 4 jobs`), and `/healthz` as `"jobs":{"max":4}`. A file the pool cannot use is ignored,
+the last valid cap staying in force, and reported (`config invalid`); the runbook has
+[the details](docs/runbook.md#limiting-concurrent-jobs). Nothing writes the file for you.
 
 
 ## Status

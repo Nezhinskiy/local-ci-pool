@@ -75,10 +75,6 @@ type project struct {
 	// opened and never refused.
 	opened, refused bool
 
-	// joinOnce runs stopWaiters once, for the drain or for Run's stop,
-	// whichever comes first; the other waits for it.
-	joinOnce sync.Once
-
 	// advertised is the capacity last given to the listener (capacity.go).
 	advertised int
 
@@ -214,12 +210,9 @@ func (pr *project) setup() error {
 	if err != nil {
 		return err
 	}
-	// A nil Budget converts to a nil Gate: the budget is off. The docker class
-	// is never gated: a VM has CPUs of its own.
-	var gate runner.Gate = s.deps.Budget
 	start, survivors := pr.start, func() int { return s.survivorsOf(pr.identity) }
 	if pr.docker {
-		gate, start, survivors = nil, pr.startVM, nil
+		start, survivors = pr.startVM, nil
 	}
 	sc := runner.NewScaler(runner.ScalerConfig{
 		ScaleSetID: id,
@@ -229,10 +222,7 @@ func (pr *project) setup() error {
 		Registry:   clientRef{pr},
 		Docker:     pr.remover,
 		Log:        pr.log,
-		Gate:       gate,
-		Project:    pr.identity,
 		Survivors:  survivors,
-		Now:        s.deps.Clock.Now,
 		Vet:        pr.vetFor(),
 	})
 	pr.mu.Lock()
@@ -560,8 +550,8 @@ func (pr *project) currentID() int {
 }
 
 // start is the scaler's Start: one runner container in the project's image
-// with the project's runner mount, labelled with the project and the need.
-func (pr *project) start(ctx context.Context, name, jit string, need int) error {
+// with the project's runner mount, labelled with the project.
+func (pr *project) start(ctx context.Context, name, jit string) error {
 	pr.mu.Lock()
 	img, m := pr.img, pr.mount
 	pr.mu.Unlock()
@@ -571,8 +561,6 @@ func (pr *project) start(ctx context.Context, name, jit string, need int) error 
 		Name:     name,
 		Instance: pr.s.instance,
 		Project:  pr.identity,
-		Need:     need,
-		CPUs:     runner.CPUCap(need, pr.s.machine.FP.CPUs),
 		Mount:    m.Spec,
 		JIT:      jit,
 	})
@@ -713,9 +701,8 @@ func (pr *project) claimRefresh() bool {
 // job still runs until the deadline. Everything after the wait shares one
 // budget, afterBound past the later of now and the deadline, so a stop never
 // outlasts the drain bound by more than that. At the bound an in-flight start
-// or reap is aborted, the waiter goroutines are joined within that budget, and
-// the runners left are removed. It reports false if life ended first, leaving
-// the session to Run.
+// or reap is aborted, and the runners left are removed. It reports false if
+// life ended first, leaving the session to Run.
 func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	clock := pr.s.deps.Clock
 	pr.mu.Lock()
@@ -756,9 +743,7 @@ func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	post, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	if sc := pr.getScaler(); sc != nil && len(sc.Held()) > 0 {
-		// The join is part of the work after the bound: what is left of
-		// post's budget, and never more than joinBound.
-		pr.stopWaiters(sc, min(joinBound, max(postEnd.Sub(clock.Now()), 0)))
+		sc.Abort()
 	}
 	pr.cancel()
 	select {
@@ -787,20 +772,6 @@ func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	}
 	pr.deleteScaleSet(life, post, deadline)
 	return true
-}
-
-// stopWaiters gives up sc's waiting runners, aborts its work in flight and
-// waits up to bound for its waiter goroutines, once per project: a second
-// call, from the drain or from Run's stop, waits for the first to end and
-// neither waits nor warns again.
-func (pr *project) stopWaiters(sc *runner.Scaler, bound time.Duration) {
-	pr.joinOnce.Do(func() {
-		sc.Drain()
-		sc.Abort()
-		if !sc.Join(bound) {
-			pr.log.Warn("waiter goroutines still running after the drain bound")
-		}
-	})
 }
 
 // mayReopen reports whether this process opened a session on the scale set
@@ -999,11 +970,6 @@ func (pr *project) health() ProjectHealth {
 	h.Stuck = slices.Clone(pr.stuck)
 	sc := pr.scaler
 	pr.mu.Unlock()
-	if sc != nil {
-		waiting, admitted := sc.BudgetCounts()
-		h.Waiting = waiting
-		h.Admitted.Queued, h.Admitted.FailOpen = admitted[runner.ModeQueued], admitted[runner.ModeFailOpen]
-	}
 	if h.Healthy && sc != nil {
 		if n := sc.NoJobExits(); n >= noJobLimit {
 			h.Healthy, h.Class = false, "runners"

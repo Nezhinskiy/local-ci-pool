@@ -9,12 +9,17 @@ import "sync"
 
 // Slots is the machine-wide limit on runner containers. It also counts the
 // runners that are running a job, for the supervisor's sleep assertion.
+//
+// Slots may sit within a parent Slots (Within) that other Slots share: then a
+// slot is taken from both or from neither, so the children together never
+// hold more than the parent's limit.
 type Slots struct {
 	mu       sync.Mutex
 	cap      int
 	inUse    int
 	busy     int
 	onChange func()
+	within   *Slots
 }
 
 // NewSlots returns a limit of n runners; a negative n is 0.
@@ -32,10 +37,27 @@ func (s *Slots) OnChange(f func()) {
 	s.onChange = f
 }
 
-// TryAcquire takes a slot if one is free. It never waits.
+// Within makes every slot of s a slot of parent too. Call it before the first
+// TryAcquire. The lock order is child, then parent.
+func (s *Slots) Within(parent *Slots) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.within = parent
+}
+
+// SetCap changes the limit; a negative n is 0. Slots taken beyond a lowered
+// limit stay taken until they are released.
+func (s *Slots) SetCap(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cap = max(n, 0)
+}
+
+// TryAcquire takes a slot if one is free here and in the parent. It never
+// waits.
 func (s *Slots) TryAcquire() bool {
 	s.mu.Lock()
-	if s.inUse >= s.cap {
+	if s.inUse >= s.cap || (s.within != nil && !s.within.TryAcquire()) {
 		s.mu.Unlock()
 		return false
 	}
@@ -57,6 +79,9 @@ func (s *Slots) Release() {
 		return
 	}
 	s.inUse--
+	if s.within != nil {
+		s.within.Release()
+	}
 	f := s.onChange
 	s.mu.Unlock()
 	if f != nil {
@@ -71,11 +96,26 @@ func (s *Slots) InUse() int {
 	return s.inUse
 }
 
-// Cap is the limit.
+// Cap is the limit, at most the parent's.
 func (s *Slots) Cap() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.within != nil {
+		return min(s.cap, s.within.Cap())
+	}
 	return s.cap
+}
+
+// Free is the number of slots TryAcquire could take now: those free here, at
+// most those free in the parent.
+func (s *Slots) Free() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := s.cap - s.inUse
+	if s.within != nil {
+		n = min(n, s.within.Free())
+	}
+	return max(n, 0)
 }
 
 // Busy is the number of runners known to be running a job.

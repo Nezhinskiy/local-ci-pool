@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,12 +25,6 @@ const (
 	LabelRunner = "local-ci-pool.runner"
 	// LabelProject carries the project's identity on every runner container.
 	LabelProject = "local-ci-pool.project"
-	// LabelNeed carries the cores the budget gate admitted the runner for; a
-	// runner the gate did not admit (the budget off) has none.
-	LabelNeed = "local-ci-pool.need"
-	// EnvCPU carries the same cores into the job's environment; a runner the
-	// gate did not admit has none.
-	EnvCPU = "CORESLOT_CPU"
 
 	entrypoint = runnermount.Target + "/entrypoint.sh"
 	homeDir    = "/tmp/home"
@@ -79,28 +72,12 @@ type ContainerRemover interface {
 // ContainerSpec is one runner container. Name is both the runner name and the
 // container name; Mount is the runner tree (runnermount.Mount.Spec); User is
 // the user the preflight found, never root (image.Preflight). Project is the
-// project's identity; Need is the cores the budget gate admitted the runner
-// for, 0 when it did not. A positive Need reaches the job as CORESLOT_CPU, so a
-// workflow can size its parallelism to its grant. CPUs caps the CPUs the
-// container may use (CPUCap); 0 sets no cap.
+// project's identity.
 type ContainerSpec struct {
 	Image, User, Name, Instance string
 	Project                     string
-	Need                        int
-	CPUs                        float64
 	Mount                       mount.Mount
 	JIT                         string
-}
-
-// CPUCap is the CPUs one runner may use: its budget grant, cut to the VM's
-// CPUs, more than which Docker refuses. A runner the gate did not admit (the
-// budget off) gets 0, no cap: a lone job on an idle pool keeps the whole VM,
-// and busy jobs share the CPUs by the kernel's equal default weights.
-func CPUCap(need, cpus int) float64 {
-	if need <= 0 || cpus <= 0 {
-		return 0
-	}
-	return float64(min(need, cpus))
 }
 
 // NetworkName is the bridge network the runners of an instance join.
@@ -200,11 +177,6 @@ func StartRunner(ctx context.Context, d Docker, s ContainerSpec) (id string, err
 		return "", fmt.Errorf("runner %s: %w", s.Name, err)
 	}
 	labels := map[string]string{LabelInstance: s.Instance, LabelRunner: s.Name, LabelProject: s.Project}
-	env := []string{"HOME=" + homeDir}
-	if s.Need > 0 {
-		labels[LabelNeed] = strconv.Itoa(s.Need)
-		env = append(env, EnvCPU+"="+strconv.Itoa(s.Need))
-	}
 	init := true
 	pids := int64(pidsLimit)
 	created, err := d.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -213,7 +185,7 @@ func StartRunner(ctx context.Context, d Docker, s ContainerSpec) (id string, err
 			Image:       s.Image,
 			User:        s.User,
 			Entrypoint:  []string{entrypoint},
-			Env:         env,
+			Env:         []string{"HOME=" + homeDir},
 			OpenStdin:   true,
 			StdinOnce:   true,
 			AttachStdin: true,
@@ -226,7 +198,6 @@ func StartRunner(ctx context.Context, d Docker, s ContainerSpec) (id string, err
 			Resources: container.Resources{
 				Memory:    memory,
 				PidsLimit: &pids,
-				NanoCPUs:  int64(s.CPUs * 1e9),
 			},
 			AutoRemove: true,
 			Mounts:     []mount.Mount{s.Mount},

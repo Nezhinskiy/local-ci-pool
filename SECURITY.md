@@ -32,9 +32,8 @@ container is code from those repositories. It is not a sandbox for untrusted cod
   repository that makes it.
 - A job container mounts only the runner image mount, read-only: no host volumes and no Docker socket.
   It runs with `--init`, a 4 GiB memory limit and a limit of 4096 processes and threads, and is
-  removed after its job. With the core budget on, it is also capped at its grant of CPUs; with the
-  budget off, it has no CPU cap, and busy jobs share the VM's CPUs by the kernel's equal default
-  weights. The consequence is that nothing inside a job can use Docker (`services:`, a job `container:`,
+  removed after its job. It has no CPU cap: busy jobs share the VM's CPUs by the kernel's equal
+  default weights. The consequence is that nothing inside a job can use Docker (`services:`, a job `container:`,
   Docker container actions, `docker build`); see [What does not work](README.md#what-does-not-work).
 - A job runs as a non-root user, outside group root. The image's `USER` is kept unless it is root,
   and root is refused in every spelling: `root`, any number Docker reads as 0 (`0`, `00`, `+0`,
@@ -98,10 +97,9 @@ The pool writes a new random token at each start to
 `~/Library/Application Support/local-ci-pool/health-<port>.token` (mode 0600), which `pool status`
 reads and no job can.
 
-With the core budget, `/healthz` also shows a top-level `budget` object (`state`, an `error` class,
-`oldest_wait_s`) and, per project, `waiting` and `admitted` counts. These carry only the pool's own
-data: its budget state, an error class (`config`, `open` or `state`), its oldest wait in seconds and
-its per-project counts. They never name another workload's label, a path or a library message.
+`/healthz` also shows a top-level `jobs` object: the cap on jobs from the settings file (`max`) and,
+while that file is invalid, the error class `config`. It never names the file's path or the error's
+text.
 
 Mitigation is owner discipline: run on the Mac only loopback services you would let your own
 repositories' jobs use, and give the ones that matter their own authentication. Real egress

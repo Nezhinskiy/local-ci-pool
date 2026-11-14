@@ -1,24 +1,24 @@
 //go:build unix
 
-package budget
+package config
 
 import (
 	"os"
 	"path/filepath"
 )
 
-// DefaultSettingsPath resolves the settings file's path from the process environment, on every
+// DefaultPath resolves the settings file's path from the process environment, on every
 // call: $XDG_CONFIG_HOME/local-ci-pool/config.toml when XDG_CONFIG_HOME is absolute, otherwise
 // ~/.config/local-ci-pool/config.toml; when that file does not exist and the one under
 // os.UserConfigDir() does, the latter.
-func DefaultSettingsPath() (string, error) {
+func DefaultPath() (string, error) {
 	return resolveSettingsPath(os.Getenv, os.UserHomeDir, os.UserConfigDir, func(p string) bool {
 		_, err := os.Stat(p)
 		return err == nil
 	})
 }
 
-// resolveSettingsPath is DefaultSettingsPath over its sources.
+// resolveSettingsPath is DefaultPath over its sources.
 func resolveSettingsPath(getenv func(string) string, home, userConfigDir func() (string, error),
 	exists func(string) bool) (string, error) {
 	h := "" // the home directory is needed only when XDG_CONFIG_HOME is not absolute

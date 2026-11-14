@@ -12,7 +12,7 @@ import (
 
 	"github.com/moby/moby/client"
 
-	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
+	"github.com/Nezhinskiy/local-ci-pool/internal/config"
 	"github.com/Nezhinskiy/local-ci-pool/internal/ghauth"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
 	"github.com/Nezhinskiy/local-ci-pool/internal/health"
@@ -45,6 +45,7 @@ func newRealPool(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, erro
 	if err != nil {
 		return nil, nil, fmt.Errorf("finding the home directory: %w", err)
 	}
+	settings := config.NewFile(nil, log)
 	tok := ghauth.NewSource(nil)
 	gh := github.New(tok, "")
 	var sup *supervisor.Supervisor
@@ -60,9 +61,12 @@ func newRealPool(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, erro
 		Mirror: mirror.Mirror{Root: filepath.Join(cache, "local-ci-pool", "mirror"), Token: tok.Token},
 		Log:    log,
 		Serve:  health.Serve(func() supervisor.Snapshot { return sup.Snapshot() }, supportDir(), log),
-		// The settings file's path by the default rule. New reads nothing
-		// and opens nothing: coreslot opens at the first admission.
-		Budget: budgetDep(budget.New(budget.Config{Log: log})),
+		// The settings file at its default path, read at start and on every
+		// watchdog tick.
+		JobsMax: func() (int, bool) {
+			s, invalid := settings.Load()
+			return s.JobsMax, invalid
+		},
 		// The docker class's VMs (docs/docker-class.md): one at a time, below
 		// MinFreeGiB of free disk where Lima keeps them none.
 		VM: &vm.Backend{
@@ -72,15 +76,6 @@ func newRealPool(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, erro
 		StateDir: supportDir(),
 	})
 	return sup, gh, nil
-}
-
-// budgetDep is the gate as the supervisor's Budget: a nil interface for a
-// nil gate, never a typed nil inside it.
-func budgetDep(g *budget.Gate) supervisor.Budget {
-	if g == nil {
-		return nil
-	}
-	return g
 }
 
 func newRealForgetter(*slog.Logger) (forgetter, error) {

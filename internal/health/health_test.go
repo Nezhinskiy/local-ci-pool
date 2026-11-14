@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Nezhinskiy/local-ci-pool/internal/budget"
 	"github.com/Nezhinskiy/local-ci-pool/internal/supervisor"
 )
 
@@ -22,10 +21,9 @@ func sample() supervisor.Snapshot {
 	return supervisor.Snapshot{
 		Version: "v0.1.0", Commit: "abc1234", Machine: "examplemac",
 		Slots: 2, InUse: 1, Busy: 1, Docker: true, Login: true,
-		Budget: budget.State{State: "wedged", Error: "state", OldestWaitS: 42},
+		Jobs: supervisor.JobsHealth{Max: 2, Error: "config"},
 		Projects: []supervisor.ProjectHealth{
-			{Repo: "example/alpha", Identity: "alpha", Image: "example.invalid/alpha@sha256:0", Healthy: true,
-				Waiting: 2, Admitted: supervisor.AdmittedHealth{Queued: 1, Adopted: 1, FailOpen: 1}},
+			{Repo: "example/alpha", Identity: "alpha", Image: "example.invalid/alpha@sha256:0", Healthy: true},
 			{Repo: "example/beta", Identity: "beta", Image: "local-ci/beta:0123456789ab", Reason: "preflight failed: no CA bundle; build arg SECRET_URL=https://example.invalid/x", Class: "preflight",
 				Stuck: []supervisor.StuckJob{{RunURL: "https://github.com/example/beta/actions/runs/1", Job: "deploy", QueuedS: 900}}},
 		},
@@ -85,7 +83,7 @@ func TestHealthzWithoutTheTokenIsRedacted(t *testing.T) {
 			if err := json.Unmarshal(rec.Body.Bytes(), &back); err != nil {
 				t.Fatal(err)
 			}
-			if !back.Redacted || back.Version != "v0.1.0" || back.Budget.State != "wedged" || len(back.Projects) != 2 {
+			if !back.Redacted || back.Version != "v0.1.0" || back.Jobs != snap.Jobs || len(back.Projects) != 2 {
 				t.Fatalf("redacted body %+v", back)
 			}
 			if p := back.Projects[1]; p.Repo != "example/beta" || p.Healthy || p.Reason != "preflight" || p.Class != "preflight" {
@@ -181,7 +179,7 @@ func TestHealthzStatusAndShape(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &fields); err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []string{"version", "commit", "machine", "slots", "in_use", "busy", "vm_in_use", "docker", "login", "probe", "budget", "projects"} {
+	for _, k := range []string{"version", "commit", "machine", "slots", "in_use", "busy", "vm_in_use", "docker", "login", "probe", "jobs", "projects"} {
 		if _, ok := fields[k]; !ok {
 			t.Errorf("no %q field in %s", k, rec.Body.String())
 		}
@@ -201,22 +199,17 @@ func TestHealthzStatusAndShape(t *testing.T) {
 	}
 }
 
-// The budget object and the per-project counts have exactly these shapes;
-// an error class is omitted when there is none.
-func TestHealthzBudgetShape(t *testing.T) {
+// The cap on jobs has exactly this shape; an error class is omitted when
+// there is none, and max 0 is no cap.
+func TestHealthzJobsShape(t *testing.T) {
 	snap := sample()
 	body := get(t, handler(func() supervisor.Snapshot { return snap }), http.MethodGet, "/healthz").Body.String()
-	for _, want := range []string{
-		`"budget":{"state":"wedged","error":"state","oldest_wait_s":42}`,
-		`"waiting":2,"admitted":{"queued":1,"adopted":1,"fail_open":1}`,
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("body %s lacks %s", body, want)
-		}
+	if want := `"jobs":{"max":2,"error":"config"}`; !strings.Contains(body, want) {
+		t.Errorf("body %s lacks %s", body, want)
 	}
-	snap.Budget = budget.State{State: "off"}
+	snap.Jobs = supervisor.JobsHealth{}
 	body = get(t, handler(func() supervisor.Snapshot { return snap }), http.MethodGet, "/healthz").Body.String()
-	if want := `"budget":{"state":"off","oldest_wait_s":0}`; !strings.Contains(body, want) {
+	if want := `"jobs":{"max":0}`; !strings.Contains(body, want) {
 		t.Errorf("body %s lacks %s", body, want)
 	}
 }
