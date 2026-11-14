@@ -7,10 +7,11 @@
 // and deletes the clone once the runner exits or its deadline passes. Nothing a job writes survives it: its
 // writes, image builds and caches live in its own clone. Sweep deletes what a killed pool left behind.
 //
-// Every VM name carries the pool instance, so a probe pool and the main one on the same Mac never touch
-// each other's VMs.
+// Every VM name carries the pool instance. Probe mode runs no docker VMs (and its longer instance name
+// would not fit MaxNameLen); the instance in the name keeps one pool's Sweep off another's VMs.
 //
 // Contracts for the caller:
+//   - Sweep runs once, at start-up, before any BuildBase or Launch of this instance.
 //   - BuildBase and Launch of one identity never run at once: a clone made during the swap fails.
 //   - A build is a VM too: it takes the machine's one docker-VM slot, like a job.
 //   - The error Launch hands to done can end with text the job wrote (it is root in its VM): treat it like
@@ -46,7 +47,8 @@ const (
 	// SourceDir is where the default branch's archive lies while provision runs; it is removed afterwards.
 	SourceDir = "/opt/local-ci-source"
 	// MaxNameLen bounds every VM name: Lima keeps sockets under ~/.lima/<name>/, and a Unix socket path is
-	// limited to about 104 bytes on macOS.
+	// limited to about 104 bytes on macOS. For the main instance that leaves 24 characters for a repository
+	// identity (local-ci-docker-base-main-<identity>).
 	MaxNameLen = 50
 	// DefaultJobTimeout bounds a job VM when Backend.JobTimeout is zero: GitHub's default job timeout of
 	// six hours, plus a margin for the boot and the runner's own start.
@@ -150,14 +152,14 @@ func (b *Backend) BuildBase(ctx context.Context, identity string, runnerTree, so
 	if err != nil {
 		return "", err
 	}
-	building, err := b.name("building", identity)
+	building, err := b.name("new", identity)
 	if err != nil {
 		return "", err
 	}
+	_ = b.remove(ctx, building) // a build a killed pool left behind, before the disk is judged
 	if err := b.diskOK(); err != nil {
 		return "", err
 	}
-	_ = b.remove(ctx, building) // a build a killed pool left behind
 	steps := []struct {
 		stdin io.Reader
 		args  []string
@@ -173,6 +175,7 @@ func (b *Backend) BuildBase(ctx context.Context, identity string, runnerTree, so
 		{nil, []string{"shell", building, "--", "sudo", "docker", "version", "--format", "{{.Server.Version}}"}},
 		{nil, []string{"stop", building}},
 	}
+	const engineStep = 7 // the docker version step above
 	var engine string
 	for i, s := range steps {
 		out, err := b.Lima.Run(ctx, s.stdin, s.args...)
@@ -180,7 +183,7 @@ func (b *Backend) BuildBase(ctx context.Context, identity string, runnerTree, so
 			_ = b.remove(context.WithoutCancel(ctx), building)
 			return "", fmt.Errorf("building the docker base of %s: %w", identity, err)
 		}
-		if i == len(steps)-2 {
+		if i == engineStep {
 			engine = strings.TrimSpace(string(out))
 		}
 	}
@@ -188,12 +191,16 @@ func (b *Backend) BuildBase(ctx context.Context, identity string, runnerTree, so
 		_ = b.remove(context.WithoutCancel(ctx), building)
 		return "", fmt.Errorf("building the docker base of %s: the base reports no Docker Engine version", identity)
 	}
-	return engine, b.swap(context.WithoutCancel(ctx), identity, base, building)
+	if err := b.swap(context.WithoutCancel(ctx), identity, base, building); err != nil {
+		_ = b.remove(context.WithoutCancel(ctx), building)
+		return "", err
+	}
+	return engine, nil
 }
 
-// swap puts building in place of base. The old base is renamed aside first and deleted only once the new
-// one is in place; a failure on the way renames it back. It runs to the end even when the build's context
-// is cancelled.
+// swap puts building in place of base. The old base is renamed aside first, and a failure until the new
+// one is in place renames it back. It runs to the end even when the build's context is cancelled, and it
+// always ends by deleting the old base set aside (a no-op when there is none).
 func (b *Backend) swap(ctx context.Context, identity, base, building string) error {
 	old, err := b.name("old", identity)
 	if err != nil {
@@ -211,7 +218,7 @@ func (b *Backend) swap(ctx context.Context, identity, base, building string) err
 			return fail(err)
 		}
 		if _, err := b.Lima.Run(ctx, nil, "rename", base, old); err != nil {
-			_, _ = b.Lima.Run(ctx, nil, "protect", base)
+			b.protect(ctx, base)
 			return fail(err)
 		}
 	}
@@ -220,19 +227,22 @@ func (b *Backend) swap(ctx context.Context, identity, base, building string) err
 			if _, rerr := b.Lima.Run(ctx, nil, "rename", old, base); rerr != nil {
 				b.logf("the old docker base could not be put back", "identity", identity, "error", rerr.Error())
 			} else {
-				_, _ = b.Lima.Run(ctx, nil, "protect", base)
+				b.protect(ctx, base)
 			}
 		}
 		return fail(err)
 	}
-	// limactl protect refuses a removal of the base, so nothing deletes it by accident.
-	if _, err := b.Lima.Run(ctx, nil, "protect", base); err != nil {
-		return fmt.Errorf("protecting the docker base of %s: %w", identity, err)
-	}
-	if hadBase {
-		_ = b.remove(ctx, old)
-	}
+	// The new base serves from here on: a failed protect is logged (Sweep protects it again), not a
+	// failed build. limactl protect refuses a removal of the base, so nothing deletes it by accident.
+	b.protect(ctx, base)
+	_ = b.remove(ctx, old)
 	return nil
+}
+
+func (b *Backend) protect(ctx context.Context, base string) {
+	if _, err := b.Lima.Run(ctx, nil, "protect", base); err != nil {
+		b.logf("protecting a docker base failed", "vm", base, "error", err.Error())
+	}
 }
 
 func (b *Backend) diskOK() error {
@@ -277,6 +287,9 @@ func (b *Backend) Launch(ctx context.Context, identity, runner, jit string, done
 		defer cancel()
 		_, err := b.Lima.Run(runCtx, strings.NewReader(jit+"\n"),
 			"shell", job, "--", "sudo", "-u", RunnerUser, "-H", TreeDir+"/entrypoint.sh")
+		if runCtx.Err() != nil { // a killed process reports "signal: killed", not the deadline
+			err = errors.Join(err, runCtx.Err())
+		}
 		done(errors.Join(err, b.remove(context.WithoutCancel(ctx), job)))
 	}()
 	return nil
@@ -313,7 +326,7 @@ func (b *Backend) Sweep(ctx context.Context) ([]string, error) {
 	var deleted []string
 	for n := range names {
 		switch {
-		case strings.HasPrefix(n, scope("job")), strings.HasPrefix(n, scope("building")):
+		case strings.HasPrefix(n, scope("job")), strings.HasPrefix(n, scope("new")):
 			if b.remove(ctx, n) == nil {
 				deleted = append(deleted, n)
 			}
@@ -323,9 +336,13 @@ func (b *Backend) Sweep(ctx context.Context) ([]string, error) {
 				if b.remove(ctx, n) == nil {
 					deleted = append(deleted, n)
 				}
-			} else if _, err := b.Lima.Run(ctx, nil, "rename", n, base); err == nil {
-				_, _ = b.Lima.Run(ctx, nil, "protect", base)
+			} else if _, err := b.Lima.Run(ctx, nil, "rename", n, base); err != nil {
+				b.logf("putting a docker base back failed", "vm", n, "error", err.Error())
+			} else {
+				b.protect(ctx, base)
 			}
+		case strings.HasPrefix(n, scope("base")):
+			b.protect(ctx, n) // a crash between rename and protect left it unprotected
 		}
 	}
 	return deleted, nil

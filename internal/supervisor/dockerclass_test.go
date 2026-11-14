@@ -274,7 +274,7 @@ func TestDockerClassServesASecondScaleSet(t *testing.T) {
 	if !h.logged("deleted a docker VM left by a previous run") || h.lima.count("delete --force local-ci-docker-job-main-local-ci-0badc0ffee00") != 1 {
 		t.Fatalf("the leftover job VM was not swept: %v", h.lima.all())
 	}
-	if n := h.lima.count("create --tty=false --plain --name=local-ci-docker-building-main-alpha"); n != 1 {
+	if n := h.lima.count("create --tty=false --plain --name=local-ci-docker-new-main-alpha"); n != 1 {
 		t.Fatalf("%d base builds, want 1", n)
 	}
 
@@ -451,7 +451,7 @@ func TestARebuildWaitsForTheRunningJobsVM(t *testing.T) {
 	h.start()
 	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
 	creates := func() int {
-		return h.lima.count("create --tty=false --plain --name=local-ci-docker-building-main-alpha")
+		return h.lima.count("create --tty=false --plain --name=local-ci-docker-new-main-alpha")
 	}
 	before := creates()
 	h.actions.Assign(alphaDockerSet, 1)
@@ -476,7 +476,7 @@ func TestFailedDockerRebuildKeepsServing(t *testing.T) {
 	h.withDocker("alpha")
 	h.start()
 	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
-	h.lima.set(func(f *fakeLima) { f.fail = "shell local-ci-docker-building-main-alpha -- sudo sh -c cd" })
+	h.lima.set(func(f *fakeLima) { f.fail = "shell local-ci-docker-new-main-alpha -- sudo sh -c cd" })
 	h.mirror.setDigest("d2")
 	h.eventually("unhealthy for the base", func() bool {
 		p, _ := h.dockerHealth(alphaRepo)
@@ -500,9 +500,9 @@ func TestDockerBaseIsBuiltFromTheDefaultBranch(t *testing.T) {
 	p := discovery.Project{Identity: "alpha", Repo: alphaRepo, Ref: "feature", DefaultBranch: "main",
 		Marker: discovery.Marker{Docker: &discovery.DockerVM{Provision: "ci/vm/provision.sh", Inputs: []string{"ci/vm"}}}}
 	m := runnermount.Mount{Version: "2.338.0", Spec: mount.Mount{Type: mount.TypeImage, Source: runnermount.Ref("2.338.0")}}
-	extract := "shell local-ci-docker-building-main-alpha -- sudo sh -c " + `mkdir -p "$1" && tar -x -C "$1"` + " sh " + vm.SourceDir
-	tree := "shell local-ci-docker-building-main-alpha -- sudo sh -c " + `mkdir -p "$1" && tar -x -C "$1"` + " sh " + vm.TreeDir
-	create := "create --tty=false --plain --name=local-ci-docker-building-main-alpha"
+	extract := "shell local-ci-docker-new-main-alpha -- sudo sh -c " + `mkdir -p "$1" && tar -x -C "$1"` + " sh " + vm.SourceDir
+	tree := "shell local-ci-docker-new-main-alpha -- sudo sh -c " + `mkdir -p "$1" && tar -x -C "$1"` + " sh " + vm.TreeDir
+	create := "create --tty=false --plain --name=local-ci-docker-new-main-alpha"
 
 	img, err := pr.ensureBase(context.Background(), p, m)
 	if err != nil {
@@ -527,7 +527,7 @@ func TestDockerBaseIsBuiltFromTheDefaultBranch(t *testing.T) {
 	key, _ := os.ReadFile(s.baseKeyPath("alpha"))
 
 	mirror.setDigest("d2")
-	lima.fail = "stop local-ci-docker-building-main-alpha"
+	lima.fail = "stop local-ci-docker-new-main-alpha"
 	if _, err := pr.ensureBase(context.Background(), p, m); err == nil || !strings.HasPrefix(err.Error(), "docker base: ") {
 		t.Fatalf("a failed build: %v", err)
 	}

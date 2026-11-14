@@ -47,8 +47,11 @@ before a repository commits the block.**
   `limactl --version`, the runner tree's image ID (the actions/runner release and the pool's entrypoint)
   and the VM's size. The Docker Engine version the build installed is read back from the new base and
   recorded beside the key. The template takes Engine from Docker's install script, so its version is not
-  pinned; a new runner release changes the key every few weeks and so picks up a newer Engine and Ubuntu,
-  and there is no scheduled rebuild. The key and the Engine version are stored in
+  pinned; a new runner release changes the key every few weeks and so picks up a newer Engine, and there
+  is no scheduled rebuild. Ubuntu is not upgraded that way: Lima's template pins a dated Ubuntu image, so
+  the base's packages change only with the `limactl` version (in the key), and nothing runs an upgrade.
+  A repository identity may have at most 24 characters, the room the VM names leave (Lima's socket paths
+  are limited); a longer one fails the base build with that reason. The key and the Engine version are stored in
   `~/Library/Application Support/local-ci-pool/docker-base-<identity>.key` once a build succeeds, and
   checked at start and on every discovery pass. A failed build keeps the old base and marks the class
   unhealthy (`docker base: …`), as a failed image build does, and is tried again on the next pass. One base
