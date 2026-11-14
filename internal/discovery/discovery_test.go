@@ -39,6 +39,14 @@ func TestParseMarkerForms(t *testing.T) {
 			"\n  {\"image\":\"x@" + digest + "\"}\n",
 			Marker{Image: "x@" + digest},
 		},
+		"docker block with the dockerfile form": {
+			`{"dockerfile":"ci/runner/Dockerfile","inputs":["ci/runner"],"docker":{"provision":"ci/vm/provision.sh","inputs":["ci/vm","sandbox"]}}`,
+			Marker{Dockerfile: "ci/runner/Dockerfile", Inputs: []string{"ci/runner"}, Docker: &DockerVM{Provision: "ci/vm/provision.sh", Inputs: []string{"ci/vm", "sandbox"}}},
+		},
+		"docker block with the image form, paths cleaned": {
+			`{"image":"x@` + digest + `","docker":{"provision":"./ci/vm/provision.sh","inputs":["./ci/vm"]}}`,
+			Marker{Image: "x@" + digest, Docker: &DockerVM{Provision: "ci/vm/provision.sh", Inputs: []string{"ci/vm"}}},
+		},
 	}
 	for name, tc := range good {
 		t.Run("accept/"+name, func(t *testing.T) {
@@ -48,6 +56,12 @@ func TestParseMarkerForms(t *testing.T) {
 			}
 			if got.Image != tc.want.Image || got.Dockerfile != tc.want.Dockerfile || strings.Join(got.Inputs, ",") != strings.Join(tc.want.Inputs, ",") {
 				t.Fatalf("got %+v, want %+v", got, tc.want)
+			}
+			if (got.Docker == nil) != (tc.want.Docker == nil) {
+				t.Fatalf("docker block: got %+v, want %+v", got.Docker, tc.want.Docker)
+			}
+			if got.Docker != nil && (got.Docker.Provision != tc.want.Docker.Provision || strings.Join(got.Docker.Inputs, ",") != strings.Join(tc.want.Docker.Inputs, ",")) {
+				t.Fatalf("docker block: got %+v, want %+v", *got.Docker, *tc.want.Docker)
 			}
 		})
 	}
@@ -87,6 +101,16 @@ func TestParseMarkerForms(t *testing.T) {
 		"not json":                       {`image: x`, ""},
 		"empty file":                     {``, ""},
 		"wrong type":                     {`{"image":3}`, ""},
+		"docker block without provision": {`{"image":"x@` + digest + `","docker":{"inputs":["ci/vm"]}}`, "provision"},
+		"docker block without inputs":    {`{"image":"x@` + digest + `","docker":{"provision":"ci/vm/p.sh"}}`, "inputs"},
+		"docker block, empty inputs":     {`{"image":"x@` + digest + `","docker":{"provision":"ci/vm/p.sh","inputs":[]}}`, "inputs"},
+		"docker provision outside":       {`{"image":"x@` + digest + `","docker":{"provision":"other/p.sh","inputs":["ci/vm"]}}`, "inside"},
+		"docker provision by prefix":     {`{"image":"x@` + digest + `","docker":{"provision":"ci/vm-evil/p.sh","inputs":["ci/vm"]}}`, "inside"},
+		"docker parent in input":         {`{"image":"x@` + digest + `","docker":{"provision":"ci/vm/p.sh","inputs":["ci/vm","../x"]}}`, ".."},
+		"docker absolute provision":      {`{"image":"x@` + digest + `","docker":{"provision":"/ci/vm/p.sh","inputs":["ci/vm"]}}`, "relative"},
+		"docker unknown field":           {`{"image":"x@` + digest + `","docker":{"provision":"ci/vm/p.sh","inputs":["ci/vm"],"root":true}}`, "root"},
+		"docker block not an object":     {`{"image":"x@` + digest + `","docker":true}`, ""},
+		"docker block alone":             {`{"docker":{"provision":"ci/vm/p.sh","inputs":["ci/vm"]}}`, "exactly one"},
 	}
 	for name, tc := range bad {
 		t.Run("reject/"+name, func(t *testing.T) {
