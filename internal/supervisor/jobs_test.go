@@ -185,6 +185,7 @@ func TestEveryContainerGetsItsShareOfTheCPUs(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, 4, 1000, "alpha")
+			h.docker.info.MemTotal = 34 << 30 // memory backs every CPU: the CPU share decides
 			if tc.settings != nil {
 				h.settings = tc.settings
 			}
@@ -265,5 +266,48 @@ func TestEveryContainerGetsItsShareOfTheMemory(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A job never gets more CPUs than its memory backs, 2 GiB each: its tools start
+// a worker per CPU they see.
+func TestJobCPUs(t *testing.T) {
+	const gib = int64(1) << 30
+	for _, tc := range []struct {
+		name       string
+		cpus, jobs int
+		memory     int64
+		want       int
+	}{
+		{"14 CPUs, 4 jobs of 10 GiB: the CPU share", 14, 4, 10 * gib, 3},
+		{"10 CPUs, 2 jobs of 4 GiB: the memory", 10, 2, 4 * gib, 2},
+		{"10 CPUs, 1 job of 8 GiB: the memory", 10, 1, 8 * gib, 4},
+		{"never below 1", 8, 1, 1 * gib, 1},
+		{"no jobs counts as one", 8, 0, 64 * gib, 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := JobCPUs(tc.cpus, tc.jobs, tc.memory); got != tc.want {
+				t.Fatalf("JobCPUs(%d, %d, %d GiB) = %d, want %d", tc.cpus, tc.jobs, tc.memory/gib, got, tc.want)
+			}
+		})
+	}
+}
+
+// On a small Docker VM a started job gets the CPUs its memory backs, not its
+// share of the VM's CPUs.
+func TestAJobsCPUsFollowItsMemory(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha") // 8 CPUs, 8 GiB: 2 jobs of 4 GiB, 4 CPUs each by share
+	h.settings = &fakeSettings{max: 2}
+	h.start()
+	h.eventually("alpha healthy", func() bool { return h.healthy(alphaRepo) })
+	h.actions.Assign(alphaSet, 1)
+	img := h.imageOf("alpha")
+	h.eventually("a runner", func() bool { return len(h.docker.runners(img)) == 1 })
+	h.docker.mu.Lock()
+	defer h.docker.mu.Unlock()
+	for name, c := range h.docker.containers {
+		if c.image == img && (c.nanoCPUs != 2e9 || c.memory != 4<<30) {
+			t.Fatalf("%s: NanoCPUs %d, Memory %d; want 2e9 and 4 GiB", name, c.nanoCPUs, c.memory)
+		}
 	}
 }

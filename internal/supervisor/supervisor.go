@@ -668,16 +668,32 @@ func (s *Supervisor) readSettings() {
 	s.requestCapacity()
 }
 
-// cpusPerJob is the CPUs one container job may use: the Docker VM's CPUs shared
-// by the jobs that can run at once (the cap on jobs, never more than the slots),
-// and at least 1. A job that sizes its workers by os.availableParallelism, which
-// follows the quota, then starts as many as its share holds; all jobs together
-// never ask for more CPUs than there are. The docker VM keeps its own CPUs and
-// counts as one job. The pool never starts with fewer than 1 slot.
+// cpusPerJob is the CPUs one container job may use (JobCPUs). The docker VM
+// keeps its own CPUs and counts as one job. The pool never starts with fewer
+// than 1 slot.
 func (s *Supervisor) cpusPerJob() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return max(s.machine.FP.CPUs/s.jobsAtOnceLocked(), 1)
+	jobs := s.jobsAtOnceLocked()
+	return JobCPUs(s.machine.FP.CPUs, jobs, JobMemory(s.machine.FP.Mem, s.hostMem, jobs))
+}
+
+// gibPerCPU is the memory a job's limit holds for each CPU it is given.
+const gibPerCPU = 2
+
+// JobCPUs is the CPU quota of one of jobs container jobs running at once,
+// whose memory limit is memory bytes:
+//
+//	max(1, min(floor(cpus / jobs), floor(memory GiB / 2)))
+//
+// The Docker VM's CPUs are shared, so all jobs together never ask for more
+// than there are. A job sizes its workers by the CPUs it sees: jest starts
+// os.availableParallelism() - 1 of them, and that follows the quota. Each
+// worker needs memory, so a job never gets more CPUs than its memory backs:
+// 10 cores beside 4 GiB start 9 workers that the cgroup's OOM killer then
+// takes.
+func JobCPUs(cpus, jobs int, memory int64) int {
+	return max(min(cpus/max(jobs, 1), int(memory>>30)/gibPerCPU), 1)
 }
 
 // jobsAtOnceLocked is how many container jobs can run at once: the cap on

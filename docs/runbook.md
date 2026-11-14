@@ -493,7 +493,10 @@ by the jobs that can run at once (the cap, never more than the slots; the slots 
 Docker VM under `--cpus=3` with Node 22: `os.availableParallelism()` gave 3, `nproc` and
 `os.cpus().length` gave 14. A job that sizes its workers by the former starts as many as
 its share holds; one that sizes them by the latter starts one per CPU of the whole VM and is only
-throttled. A job left running by a previous pool (a survivor, after a kill or launchd's 60-second limit)
+throttled. A job never gets more CPUs than its memory limit (below) backs, 2 GiB each: jest 30 starts
+`os.availableParallelism() - 1` workers, and 10 CPUs beside 4 GiB started 9 that the cgroup's OOM killer
+took. So a 16 GiB Mac with a 9.7 GiB Docker VM gives each of 2 jobs 4 GiB and 2 CPUs, and its single
+job with `max = 1` 8 GiB and 4 CPUs. A job left running by a previous pool (a survivor, after a kill or launchd's 60-second limit)
 keeps the CPU limit it started with, which from a release before this one is none. A docker VM keeps
 its own 4 CPUs and counts as one job.
 
