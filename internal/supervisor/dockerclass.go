@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/moby/moby/client"
 
@@ -101,12 +102,16 @@ func (pr *project) ensureBase(ctx context.Context, p discovery.Project, m runner
 	if old, err := os.ReadFile(path); err == nil && strings.SplitN(string(old), "\n", 2)[0] == key {
 		return img, nil
 	}
-	select {
-	case pr.s.vmBuild <- struct{}{}:
-		defer func() { <-pr.s.vmBuild }()
-	case <-ctx.Done():
-		return Image{}, ctx.Err()
+	// A build is a VM too: it takes the machine's one docker-VM slot, so it
+	// waits for a running job and no job starts while it builds.
+	for !pr.s.vmSlots.TryAcquire() {
+		select {
+		case <-ctx.Done():
+			return Image{}, ctx.Err()
+		case <-time.After(vmSlotPoll):
+		}
 	}
+	defer pr.s.vmSlots.Release()
 	pr.log.Info("building the docker base", "commit", commit, "runner", m.Version)
 	engine, err := pr.buildBase(ctx, p, commit, m)
 	if err != nil {
@@ -208,5 +213,38 @@ func (s *Supervisor) sweepVMs(ctx context.Context) {
 	}
 	for _, name := range deleted {
 		s.log.Info("deleted a docker VM left by a previous run", "vm", name)
+	}
+}
+
+// vmSlotPoll is how often a base build asks for the docker-VM slot while a
+// job holds it.
+const vmSlotPoll = 200 * time.Millisecond
+
+// vetFor is the scaler's Vet: the repository's visibility, and for the docker
+// class the free disk too, before a runner is registered. A short disk thus
+// registers nothing (no runner minted and dropped on every listener poll), and
+// its reason stays the project's until a launch succeeds.
+func (pr *project) vetFor() func(context.Context) error {
+	if !pr.docker {
+		return pr.vet
+	}
+	return func(ctx context.Context) error {
+		if err := pr.vet(ctx); err != nil {
+			return err
+		}
+		b := pr.s.deps.VM
+		free, err := b.FreeGiB()
+		if err == nil && free >= float64(b.MinFreeGiB) {
+			return nil
+		}
+		if err != nil {
+			err = fmt.Errorf("reading free disk: %w", err)
+		} else {
+			err = fmt.Errorf("%w: %.1f GiB free, needs %d", vm.ErrDiskShort, free, b.MinFreeGiB)
+		}
+		pr.mu.Lock()
+		pr.launchErr = "docker vm: " + err.Error()
+		pr.mu.Unlock()
+		return err
 	}
 }

@@ -223,7 +223,7 @@ func (pr *project) setup() error {
 		Project:    pr.identity,
 		Survivors:  survivors,
 		Now:        s.deps.Clock.Now,
-		Vet:        pr.vet,
+		Vet:        pr.vetFor(),
 	})
 	pr.mu.Lock()
 	defer pr.mu.Unlock()

@@ -46,7 +46,9 @@ is; [bench/](bench/README.md) is a harness to measure your own jobs. Check
 ## What does not work
 
 - No Docker inside jobs: `services:`, a job `container:`, Docker container actions and
-  `docker build` do not work, because a job container gets no Docker socket.
+  `docker build` do not work, because a job container gets no Docker socket. A repository whose
+  jobs need Docker opts them into the docker class instead, one throwaway VM per job
+  ([docs/docker-class.md](docs/docker-class.md)).
 - Linux jobs only, in the Mac's architecture: arm64 on Apple silicon.
 - Private repositories of a personal account only. A public repository is refused.
 - The job runs in your marker image, not in GitHub's runner image, so the tools GitHub preinstalls

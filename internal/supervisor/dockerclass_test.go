@@ -410,9 +410,10 @@ func TestDockerClassWithoutLimactl(t *testing.T) {
 	}
 }
 
-// Below the free-disk threshold a launch is refused: the runner is
-// unregistered, the slot freed, the reason says it, and the job stays queued.
-func TestDockerLaunchShortOfDisk(t *testing.T) {
+// Below the free-disk threshold no runner is registered at all: the vet
+// refuses before the mint, the reason says it, and the job stays queued. Once
+// the disk is free, the next poll starts the VM.
+func TestDockerShortOfDiskRegistersNothing(t *testing.T) {
 	h := newHarness(t, 2, 1000, "alpha")
 	h.withDocker("alpha")
 	h.start()
@@ -425,9 +426,10 @@ func TestDockerLaunchShortOfDisk(t *testing.T) {
 		p, _ := h.dockerHealth(alphaRepo)
 		return p.Class == "vm" && strings.HasPrefix(p.Reason, "docker vm: "+vm.ErrDiskShort.Error()+": 5.0 GiB free, needs 15")
 	})
-	h.eventually("no runner left registered, no slot held", func() bool {
-		return len(h.actions.Runners(alphaDockerSet)) == 0 && h.sup.vmSlots.InUse() == 0
-	})
+	time.Sleep(200 * time.Millisecond) // several listener polls
+	if n := h.actions.Count("JIT " + alphaDockerSet); n != 0 {
+		t.Fatalf("%d runners minted below the threshold", n)
+	}
 	if n := h.lima.count("clone"); n != 0 {
 		t.Fatalf("%d clones below the threshold", n)
 	}
@@ -435,10 +437,34 @@ func TestDockerLaunchShortOfDisk(t *testing.T) {
 	h.freeGiB = 50
 	h.mu.Unlock()
 	h.eventually("a VM once the disk is free", func() bool { return len(h.lima.running()) == 1 })
-	// The refused starts count as runners gone without a job, as any failed
-	// start does, until the job starts.
-	h.actions.Started(alphaDockerSet, h.lima.running()[0])
 	h.eventually("healthy again", func() bool { return h.dockerHealthy(alphaRepo) })
+	if snap := h.sup.Snapshot(); snap.VMInUse != 1 {
+		t.Fatalf("vm_in_use %d with a VM running", snap.VMInUse)
+	}
+}
+
+// A base build is a VM too: a rebuild waits while a job's VM runs, and builds
+// once the job has ended.
+func TestARebuildWaitsForTheRunningJobsVM(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha") // a discovery pass every 50 ms
+	h.withDocker("alpha")
+	h.start()
+	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	creates := func() int { return h.lima.count("create --tty=false --plain --name=local-ci-docker-building-main-alpha") }
+	before := creates()
+	h.actions.Assign(alphaDockerSet, 1)
+	h.eventually("alpha's VM runs", func() bool { return len(h.lima.running()) == 1 })
+	job := h.lima.running()[0]
+	h.actions.Started(alphaDockerSet, job)
+	h.mirror.setDigest("d2") // the next discovery pass wants a new base
+	time.Sleep(300 * time.Millisecond)
+	if n := creates(); n != before {
+		t.Fatalf("a rebuild started beside a running job's VM (%d builds)", n-before)
+	}
+	h.actions.Completed(alphaDockerSet, job)
+	h.delivered(alphaDockerSet)
+	h.lima.finish(job)
+	h.eventually("the rebuild runs once the job's VM is gone", func() bool { return creates() == before+1 })
 }
 
 // A rebuild that fails keeps the old base, and so the runners, and marks the
@@ -467,6 +493,7 @@ func TestDockerBaseIsBuiltFromTheDefaultBranch(t *testing.T) {
 		Docker: newFakeDocker(), Mirror: mirror, StateDir: t.TempDir(),
 		VM: &vm.Backend{Lima: lima, Instance: "main", CPUs: 4, MemoryGiB: 6, DiskGiB: 30, FreeGiB: func() (float64, error) { return 50, nil }},
 	})
+	s.vmSlots = runner.NewSlots(1)
 	pr := &project{s: s, identity: "alpha", log: s.log}
 	p := discovery.Project{Identity: "alpha", Repo: alphaRepo, Ref: "feature", DefaultBranch: "main",
 		Marker: discovery.Marker{Docker: &discovery.DockerVM{Provision: "ci/vm/provision.sh", Inputs: []string{"ci/vm"}}}}

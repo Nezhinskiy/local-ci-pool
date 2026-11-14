@@ -373,6 +373,7 @@ The fields:
 | `version`, `commit` | the running build |
 | `machine` | the machine name |
 | `slots`, `in_use`, `busy` | the slot limit; slots held by runners, including runners a killed previous run left running; runners known to be running a job, which excludes those left running |
+| `vm_in_use` | the docker class's one VM slot in use: 0 or 1 ([docs/docker-class.md](docker-class.md)) |
 | `docker` | whether Docker answers |
 | `login` | `false` while the last read of the token from `gh` failed (see [Install](#install)); `/healthz` answers 503 then too |
 | `probe` | whether this is a probe run |

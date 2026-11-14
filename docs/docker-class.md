@@ -52,7 +52,9 @@ before a repository commits the block.**
   `~/Library/Application Support/local-ci-pool/docker-base-<identity>.key` once a build succeeds, and
   checked at start and on every discovery pass. A failed build keeps the old base and marks the class
   unhealthy (`docker base: …`), as a failed image build does, and is tried again on the next pass. One base
-  builds at a time on the machine. A pull request's own `provision` never reaches the base, and probe mode
+  builds at a time on the machine. A failing build is retried on every discovery pass (10 minutes), with no backoff;
+  `/healthz` shows it failing, with the reason, until one passes. A launch that comes while a rebuild swaps the
+  base in fails, and its job is retried. A pull request's own `provision` never reaches the base, and probe mode
   does not build one.
 - A job gets a copy-on-write clone of the stopped base:
   - booted with no host mounts, with guest-to-host port forwarding off, and with no Rosetta or containerd
@@ -64,9 +66,9 @@ before a repository commits the block.**
   A job's writes, and its image builds and caches, stay in its clone; the base is never booted again.
 - One docker VM runs at a time on a machine, whatever the repository (one machine-wide slot), with its own
   CPU and memory (4 CPUs, 6 GiB, a 30 GiB disk), outside Docker Desktop's slots and the core budget. A base
-  build is a second VM and may run beside it. Below 15 GiB free where Lima keeps its VMs (`~/.lima`) the
-  pool starts no VM: the runner it registered is unregistered again, and `/healthz` reports the class
-  unhealthy (`docker vm: not enough free disk …`). The job stays queued; the pool never moves it elsewhere.
+  build is a VM too and takes the same slot: it waits for a running job, and no job starts while it builds.
+  Below 15 GiB free where Lima keeps its VMs (`~/.lima`) the pool registers no runner and starts no VM, and
+  `/healthz` reports the class unhealthy (`docker vm: not enough free disk …`). The job stays queued; the pool never moves it elsewhere.
 - A docker runner has no container: the Docker die events, the reconcile and the start-up sweep of
   containers never release or remove it. Its clone's end is its exit; an idle one beyond the assigned
   jobs, or one left at the drain bound, is removed by deleting its clone.

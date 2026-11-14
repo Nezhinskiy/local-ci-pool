@@ -279,7 +279,9 @@ type Snapshot struct {
 	Slots   int    `json:"slots"`
 	InUse   int    `json:"in_use"`
 	Busy    int    `json:"busy"`
-	Docker  bool   `json:"docker"`
+	// VMInUse is the docker class's VM slot in use, 0 or 1 (docs/docker-class.md).
+	VMInUse int  `json:"vm_in_use"`
+	Docker  bool `json:"docker"`
 	// Login is false while the last read of the token from gh failed: the
 	// pool waits for gh and takes no jobs meanwhile.
 	Login bool `json:"login"`
@@ -344,9 +346,7 @@ type Supervisor struct {
 	instance string
 	slots    *runner.Slots
 	// vmSlots is the docker class's one slot: one docker VM at a time.
-	vmSlots *runner.Slots
-	// vmBuild lets one docker base build at a time.
-	vmBuild  chan struct{}
+	vmSlots  *runner.Slots
 	mount    runnermount.Mount
 	dockerOK bool
 	projects map[string]*project // by project key: owner/name, plus dockerKey for the docker class
@@ -387,7 +387,6 @@ func New(cfg Config, deps Deps) *Supervisor {
 		fatal:     make(chan error, 1),
 		reconcile: make(chan struct{}, 1),
 		capacity:  make(chan struct{}, 1),
-		vmBuild:   make(chan struct{}, 1),
 		projects:  map[string]*project{},
 		public:    map[string]ProjectHealth{},
 		survivors: map[string]*survivor{},
@@ -909,7 +908,7 @@ func (s *Supervisor) Snapshot() Snapshot {
 		Login:   s.deps.Token == nil || s.deps.Token.ReadErr() == nil,
 		Probe:   s.cfg.Probe,
 	}
-	slots := s.slots
+	slots, vmSlots := s.slots, s.vmSlots
 	prs := s.projectList()
 	survivors := s.survivorCountsLocked()
 	var gone []ProjectHealth
@@ -921,6 +920,9 @@ func (s *Supervisor) Snapshot() Snapshot {
 	s.mu.Unlock()
 	if slots != nil {
 		snap.Slots, snap.InUse, snap.Busy = slots.Cap(), slots.InUse(), slots.Busy()
+	}
+	if vmSlots != nil {
+		snap.VMInUse = vmSlots.InUse()
 	}
 	// State reads the settings file: never under s.mu.
 	snap.Budget = budget.State{State: "off"}
