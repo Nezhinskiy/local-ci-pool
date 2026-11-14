@@ -117,6 +117,24 @@ func TestJobsCapIsReadAgainWithoutARestart(t *testing.T) {
 	})
 }
 
+// A cap removed without a restart gives back every slot of both kinds: the
+// docker VM runs beside a full set of container jobs again.
+func TestRemovingTheCapRunsTheDockerVMBesideEverySlot(t *testing.T) {
+	h := newHarness(t, 3, 1000, "alpha")
+	h.withDocker("alpha")
+	h.settings = &fakeSettings{max: 1}
+	h.start()
+	h.eventually("both classes healthy", func() bool { return h.healthy(alphaRepo) && h.dockerHealthy(alphaRepo) })
+	h.settings.set(0, false)
+	h.eventually("no cap", func() bool { return h.sup.Snapshot().Jobs == (JobsHealth{}) })
+	h.actions.Assign(alphaSet, 3)
+	h.actions.Assign(alphaDockerSet, 1)
+	img := h.imageOf("alpha")
+	h.eventually("three runners and a docker VM", func() bool {
+		return len(h.docker.runners(img)) == 3 && len(h.lima.running()) == 1
+	})
+}
+
 // A settings file the pool cannot use is reported as the class config, and
 // its last valid cap stays in force; at start, with none, there is no cap.
 func TestInvalidJobsCapIsReported(t *testing.T) {
