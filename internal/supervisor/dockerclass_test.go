@@ -78,12 +78,15 @@ func (f *fakeLima) Run(ctx context.Context, stdin io.Reader, args ...string) ([]
 	case args[0] == "list":
 		defer f.mu.Unlock()
 		return []byte(f.list), nil
+	case strings.Contains(joined, "docker version"):
+		f.mu.Unlock()
+		return []byte("29.9.3\n"), nil
 	case args[0] == "delete":
 		if ch := f.jobs[args[len(args)-1]]; ch != nil {
 			delete(f.jobs, args[len(args)-1])
 			ch <- errors.New("the VM is gone")
 		}
-	case args[0] == "shell" && strings.HasPrefix(args[1], vm.JobPrefix):
+	case args[0] == "shell" && strings.HasPrefix(args[1], testJobPrefix):
 		ch := make(chan error, 1)
 		f.jobs[args[1]] = ch
 		f.mu.Unlock()
@@ -104,7 +107,7 @@ func (f *fakeLima) running() []string {
 	defer f.mu.Unlock()
 	var out []string
 	for job := range f.jobs {
-		out = append(out, strings.TrimPrefix(job, vm.JobPrefix))
+		out = append(out, strings.TrimPrefix(job, testJobPrefix))
 	}
 	slices.Sort(out)
 	return out
@@ -114,8 +117,8 @@ func (f *fakeLima) running() []string {
 func (f *fakeLima) finish(runner string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if ch := f.jobs[vm.JobName(runner)]; ch != nil {
-		delete(f.jobs, vm.JobName(runner))
+	if ch := f.jobs[testJobName(runner)]; ch != nil {
+		delete(f.jobs, testJobName(runner))
 		ch <- nil
 	}
 }
@@ -257,7 +260,7 @@ func TestDockerClassServesASecondScaleSet(t *testing.T) {
 	h.withDocker("alpha")
 	b := newFakeBudget(true)
 	h.budget = b
-	h.lima.list = `{"name":"local-ci-docker-base-alpha"}` + "\n" + `{"name":"local-ci-docker-job-local-ci-0badc0ffee00"}` + "\n"
+	h.lima.list = `{"name":"local-ci-docker-base-main-alpha"}` + "\n" + `{"name":"local-ci-docker-job-main-local-ci-0badc0ffee00"}` + "\n"
 	survivor := instanceLabels("main", "local-ci-5u7v1v0r0000")
 	survivor[runner.LabelProject] = "alpha"
 	h.docker.addIn("local-ci-5u7v1v0r0000", survivor, container.StateRunning)
@@ -268,17 +271,17 @@ func TestDockerClassServesASecondScaleSet(t *testing.T) {
 	if ss == nil || !slices.Equal(labelNames(ss), []string{alphaDockerSet, "alpha-docker"}) {
 		t.Fatalf("docker scale set %+v", ss)
 	}
-	if !h.logged("deleted a docker VM left by a previous run") || h.lima.count("delete --force local-ci-docker-job-local-ci-0badc0ffee00") != 1 {
+	if !h.logged("deleted a docker VM left by a previous run") || h.lima.count("delete --force local-ci-docker-job-main-local-ci-0badc0ffee00") != 1 {
 		t.Fatalf("the leftover job VM was not swept: %v", h.lima.all())
 	}
-	if n := h.lima.count("create --tty=false --plain --name=local-ci-docker-base-alpha-building"); n != 1 {
+	if n := h.lima.count("create --tty=false --plain --name=local-ci-docker-building-main-alpha"); n != 1 {
 		t.Fatalf("%d base builds, want 1", n)
 	}
 
 	h.actions.Assign(alphaDockerSet, 1)
 	h.eventually("a docker VM runs", func() bool { return len(h.lima.running()) == 1 })
 	r := h.lima.running()[0]
-	if got := h.lima.count("clone --tty=false local-ci-docker-base-alpha " + vm.JobName(r)); got != 1 {
+	if got := h.lima.count("clone --tty=false local-ci-docker-base-main-alpha " + testJobName(r)); got != 1 {
 		t.Fatalf("the runner's clone: %v", h.lima.all())
 	}
 	if s := h.sup.Snapshot(); s.InUse != 1 || h.sup.vmSlots.InUse() != 1 {
@@ -360,7 +363,7 @@ func TestIdleDockerRunnerIsReapedByDeletingItsVM(t *testing.T) {
 	r := h.lima.running()[0]
 	h.actions.Assign(alphaDockerSet, -1)
 	h.eventually("its VM deleted and its slot freed", func() bool {
-		return h.lima.count("delete --force "+vm.JobName(r)) > 0 && h.sup.vmSlots.InUse() == 0
+		return h.lima.count("delete --force "+testJobName(r)) > 0 && h.sup.vmSlots.InUse() == 0
 	})
 }
 
@@ -412,9 +415,11 @@ func TestDockerClassWithoutLimactl(t *testing.T) {
 func TestDockerLaunchShortOfDisk(t *testing.T) {
 	h := newHarness(t, 2, 1000, "alpha")
 	h.withDocker("alpha")
-	h.freeGiB = 5
 	h.start()
 	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	h.mu.Lock()
+	h.freeGiB = 5 // after the base is built: a build checks the disk too
+	h.mu.Unlock()
 	h.actions.Assign(alphaDockerSet, 1)
 	h.eventually("unhealthy for the disk", func() bool {
 		p, _ := h.dockerHealth(alphaRepo)
@@ -443,7 +448,7 @@ func TestFailedDockerRebuildKeepsServing(t *testing.T) {
 	h.withDocker("alpha")
 	h.start()
 	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
-	h.lima.set(func(f *fakeLima) { f.fail = "shell local-ci-docker-base-alpha-building -- sudo sh -c cd" })
+	h.lima.set(func(f *fakeLima) { f.fail = "shell local-ci-docker-building-main-alpha -- sudo sh -c cd" })
 	h.mirror.setDigest("d2")
 	h.eventually("unhealthy for the base", func() bool {
 		p, _ := h.dockerHealth(alphaRepo)
@@ -460,15 +465,15 @@ func TestDockerBaseIsBuiltFromTheDefaultBranch(t *testing.T) {
 	lima, mirror := newFakeLima(), &fakeMirror{digest: "d1"}
 	s := New(Config{}, Deps{
 		Docker: newFakeDocker(), Mirror: mirror, StateDir: t.TempDir(),
-		VM: &vm.Backend{Lima: lima, CPUs: 4, MemoryGiB: 6, DiskGiB: 30},
+		VM: &vm.Backend{Lima: lima, Instance: "main", CPUs: 4, MemoryGiB: 6, DiskGiB: 30, FreeGiB: func() (float64, error) { return 50, nil }},
 	})
 	pr := &project{s: s, identity: "alpha", log: s.log}
 	p := discovery.Project{Identity: "alpha", Repo: alphaRepo, Ref: "feature", DefaultBranch: "main",
 		Marker: discovery.Marker{Docker: &discovery.DockerVM{Provision: "ci/vm/provision.sh", Inputs: []string{"ci/vm"}}}}
 	m := runnermount.Mount{Version: "2.338.0", Spec: mount.Mount{Type: mount.TypeImage, Source: runnermount.Ref("2.338.0")}}
-	extract := "shell local-ci-docker-base-alpha-building -- sudo sh -c mkdir -p " + vm.SourceDir + " && tar -x -C " + vm.SourceDir
-	tree := "shell local-ci-docker-base-alpha-building -- sudo sh -c mkdir -p " + vm.TreeDir + " && tar -x -C " + vm.TreeDir
-	create := "create --tty=false --plain --name=local-ci-docker-base-alpha-building"
+	extract := "shell local-ci-docker-building-main-alpha -- sudo sh -c " + `mkdir -p "$1" && tar -x -C "$1"` + " sh " + vm.SourceDir
+	tree := "shell local-ci-docker-building-main-alpha -- sudo sh -c " + `mkdir -p "$1" && tar -x -C "$1"` + " sh " + vm.TreeDir
+	create := "create --tty=false --plain --name=local-ci-docker-building-main-alpha"
 
 	img, err := pr.ensureBase(context.Background(), p, m)
 	if err != nil {
@@ -483,7 +488,7 @@ func TestDockerBaseIsBuiltFromTheDefaultBranch(t *testing.T) {
 	if !slices.Equal(mirror.fetched, []string{alphaRepo + "@main"}) {
 		t.Fatalf("fetched %v, want the default branch alone", mirror.fetched)
 	}
-	if !strings.HasPrefix(img.Ref, vm.BaseName("alpha")+"@") {
+	if !strings.HasPrefix(img.Ref, testBaseName("alpha")+"@") {
 		t.Fatalf("image %q", img.Ref)
 	}
 
@@ -493,7 +498,7 @@ func TestDockerBaseIsBuiltFromTheDefaultBranch(t *testing.T) {
 	key, _ := os.ReadFile(s.baseKeyPath("alpha"))
 
 	mirror.setDigest("d2")
-	lima.fail = "stop local-ci-docker-base-alpha-building"
+	lima.fail = "stop local-ci-docker-building-main-alpha"
 	if _, err := pr.ensureBase(context.Background(), p, m); err == nil || !strings.HasPrefix(err.Error(), "docker base: ") {
 		t.Fatalf("a failed build: %v", err)
 	}
@@ -505,3 +510,9 @@ func TestDockerBaseIsBuiltFromTheDefaultBranch(t *testing.T) {
 		t.Fatalf("a changed key: %v, %d builds, want 3", err, lima.count(create))
 	}
 }
+
+// The names a main-instance pool gives its docker VMs (vm.Backend.JobName and BaseName).
+const testJobPrefix = "local-ci-docker-job-main-"
+
+func testJobName(runner string) string    { return testJobPrefix + runner }
+func testBaseName(identity string) string { return "local-ci-docker-base-main-" + identity }

@@ -42,7 +42,11 @@ func (s *Supervisor) servesDocker(p discovery.Project) bool {
 
 // baseKey is what the base is built from: the docker block's inputs at the
 // default branch's commit and its provision path, Lima's template and version,
-// the runner tree's image, and the VM's size. A change of any rebuilds it.
+// the runner tree's image (the actions/runner release and the entrypoint), and
+// the VM's size. A change of any rebuilds it. The Docker Engine version the
+// build installs is recorded beside the key (ensureBase): the template takes
+// whatever Docker's install script gives, and a new runner release, which
+// changes the key, rebuilds regularly enough to pick up a newer one.
 // It returns the key and the commit the inputs were read at.
 func (pr *project) baseKey(ctx context.Context, p discovery.Project, m runnermount.Mount) (key, commit string, err error) {
 	s := pr.s
@@ -88,9 +92,13 @@ func (pr *project) ensureBase(ctx context.Context, p discovery.Project, m runner
 	if err != nil {
 		return Image{}, err
 	}
-	img := Image{Ref: vm.BaseName(pr.identity) + "@" + key[:12]}
+	name, err := pr.s.deps.VM.BaseName(pr.identity)
+	if err != nil {
+		return Image{}, fmt.Errorf("docker base: %w", err)
+	}
+	img := Image{Ref: name + "@" + key[:12]}
 	path := pr.s.baseKeyPath(pr.identity)
-	if old, err := os.ReadFile(path); err == nil && string(old) == key {
+	if old, err := os.ReadFile(path); err == nil && strings.SplitN(string(old), "\n", 2)[0] == key {
 		return img, nil
 	}
 	select {
@@ -100,29 +108,30 @@ func (pr *project) ensureBase(ctx context.Context, p discovery.Project, m runner
 		return Image{}, ctx.Err()
 	}
 	pr.log.Info("building the docker base", "commit", commit, "runner", m.Version)
-	if err := pr.buildBase(ctx, p, commit, m); err != nil {
+	engine, err := pr.buildBase(ctx, p, commit, m)
+	if err != nil {
 		return Image{}, fmt.Errorf("docker base: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return Image{}, fmt.Errorf("docker base: storing its key: %w", err)
 	}
-	if err := os.WriteFile(path, []byte(key), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(key+"\nengine="+engine+"\n"), 0o600); err != nil {
 		return Image{}, fmt.Errorf("docker base: storing its key: %w", err)
 	}
-	pr.log.Info("the docker base is built", "base", img.Ref)
+	pr.log.Info("the docker base is built", "base", img.Ref, "engine", engine)
 	return img, nil
 }
 
-func (pr *project) buildBase(ctx context.Context, p discovery.Project, commit string, m runnermount.Mount) error {
+func (pr *project) buildBase(ctx context.Context, p discovery.Project, commit string, m runnermount.Mount) (string, error) {
 	s := pr.s
 	src, err := s.deps.Mirror.Archive(ctx, s.deps.Mirror.Dir(p.Repo), commit, p.Marker.Docker.Inputs)
 	if err != nil {
-		return fmt.Errorf("archiving the docker inputs: %w", err)
+		return "", fmt.Errorf("archiving the docker inputs: %w", err)
 	}
 	defer func() { _ = src.Close() }()
 	tree, err := runnermount.Tree(ctx, s.deps.Docker, m)
 	if err != nil {
-		return fmt.Errorf("exporting the runner tree: %w", err)
+		return "", fmt.Errorf("exporting the runner tree: %w", err)
 	}
 	defer func() { _ = tree.Close() }()
 	return s.deps.VM.BuildBase(ctx, pr.identity, tree, src, p.Marker.Docker.Provision)
@@ -181,8 +190,7 @@ func (pr *project) startVM(ctx context.Context, name, jit string, _ int) error {
 type vmRemover struct{ b *vm.Backend }
 
 func (r vmRemover) ContainerRemove(ctx context.Context, name string, _ client.ContainerRemoveOptions) (client.ContainerRemoveResult, error) {
-	_, err := r.b.Lima.Run(ctx, nil, "delete", "--force", vm.JobName(name))
-	return client.ContainerRemoveResult{}, err
+	return client.ContainerRemoveResult{}, r.b.Remove(ctx, name)
 }
 
 // sweepVMs deletes the job clones a killed pool left, once at start. A probe

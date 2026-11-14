@@ -113,9 +113,9 @@ Lima VM, which holds no other runner, no pool credentials and no host mounts. It
 loopback. Measured with Lima 2.3.0 (`vz`, `--plain`): from the VM, a listener bound to `127.0.0.1`
 on the Mac, one bound to `0.0.0.0`, and a Docker Desktop port published on `127.0.0.1` all
 answered. The other direction is closed: in plain mode a port opened inside the VM is not forwarded
-to the Mac. No Lima setting closes the gateway while keeping the VM usable, because Lima's own SSH
-and agent traffic use that network; a firewall inside the VM would not count either, since the job
-is root there.
+to the Mac. A firewall inside the VM would not count, since the job is root there. Lima itself
+forwards a port on the Mac's loopback to the VM's SSH (how the pool runs the runner), so a local
+process holding Lima's key could open a shell in a job VM.
 
 ## Residual risk: no disk cap
 

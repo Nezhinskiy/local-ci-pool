@@ -477,6 +477,11 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if s.cfg.Probe {
 		instance = "probe-" + m.Owner
 	}
+	if s.deps.VM != nil {
+		// Every docker VM's name carries the instance, so a probe and the main pool never touch each
+		// other's VMs.
+		s.deps.VM.Instance = instance
+	}
 	var mount runnermount.Mount
 	err = s.retryTokenRead(ctx, func() error {
 		var err error

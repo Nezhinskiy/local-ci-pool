@@ -18,13 +18,17 @@ import (
 // network (the template's image). go test -tags lima ./internal/vm/
 func TestRealBaseAndJob(t *testing.T) {
 	home, _ := os.UserHomeDir()
-	b := &Backend{Lima: Exec{}, CPUs: 2, MemoryGiB: 2, DiskGiB: 20, MinFreeGiB: 10, FreeGiB: FreeGiBAt(filepath.Join(home, ".lima"))}
+	b := &Backend{Lima: Exec{}, Instance: "smoke", CPUs: 2, MemoryGiB: 2, DiskGiB: 20, MinFreeGiB: 10, FreeGiB: FreeGiBAt(filepath.Join(home, ".lima"))}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 	identity := "smoke-" + time.Now().Format("150405")
+	baseName, err := b.BaseName(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
-		_, _ = b.Lima.Run(context.Background(), nil, "unprotect", BaseName(identity))
-		_, _ = b.Lima.Run(context.Background(), nil, "delete", "--force", BaseName(identity))
+		_, _ = b.Lima.Run(context.Background(), nil, "unprotect", baseName)
+		_, _ = b.Lima.Run(context.Background(), nil, "delete", "--force", baseName)
 	})
 
 	// The entrypoint checks, from inside the job, what docs/docker-class.md promises, and fails otherwise.
@@ -41,13 +45,22 @@ docker info >/dev/null || exit 14
 exit 0
 `
 	// A symlinked provision is refused inside the VM: the build fails and leaves no base.
-	if err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
+	if _, err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
 		tarWithLink(t, "ci/vm/provision.sh", "/etc/hostname"), "ci/vm/provision.sh"); err == nil {
 		t.Fatal("a symlinked provision built a base")
 	}
-	if err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
+	if _, err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
+		tarWithLink(t, "ci", "/etc"), "ci/hostname"); err == nil {
+		t.Fatal("a provision under a symlinked directory built a base")
+	}
+	if _, err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
 		tarOf(t, map[string]string{"ci/vm/provision.sh": "touch /etc/local-ci-provisioned\n"}), "ci/vm/provision.sh"); err != nil {
 		t.Fatal(err)
+	}
+	// A second build replaces the first through the swap; the first base is gone afterwards.
+	if _, err := b.BuildBase(ctx, identity, tarOf(t, map[string]string{"entrypoint.sh": entrypoint}),
+		tarOf(t, map[string]string{"ci/vm/provision.sh": "touch /etc/local-ci-provisioned\n"}), "ci/vm/provision.sh"); err != nil {
+		t.Fatalf("rebuild: %v", err)
 	}
 	done := make(chan error, 1)
 	if err := b.Launch(ctx, identity, "local-ci-smoke", "JIT-SMOKE", func(err error) { done <- err }); err != nil {
@@ -65,7 +78,8 @@ exit 0
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(out), JobName("local-ci-smoke")) {
+	jobName, _ := b.JobName("local-ci-smoke")
+	if strings.Contains(string(out), jobName) {
 		t.Fatal("the job clone survived its runner")
 	}
 }

@@ -36,20 +36,24 @@ before a repository commits the block.**
   a workflow names `<identity>-docker` in `runs-on` directly, and such a job waits for the Mac; it never
   falls back to a hosted runner.
 - The pool keeps one base VM per repository (Lima, `vz`). It builds the base **only from the default branch**:
-  - the pool's pinned Linux image, Docker Engine and the verified actions/runner tarball;
+  - Lima's `docker-rootful` template (Ubuntu, with Docker Engine from Docker's install script, so the Engine
+    version is not pinned), and the verified actions/runner tarball;
   - then `provision` from the default branch's archive, run as root (for example: install gVisor, pull and
     build the images the jobs will need);
   - then it stops the base.
 
   The base is rebuilt when its key changes. The key is a SHA-256 over the block's inputs digest at the
-  default branch's commit and its `provision` path, Lima's template (`template:docker-rootful`, which pins
-  the Linux image and Docker Engine) and `limactl --version`, the runner tree's image ID (the actions/runner
-  release and the pool's entrypoint) and the VM's size, so a base never keeps an ageing runner. The key
-  is stored in `~/Library/Application Support/local-ci-pool/docker-base-<identity>.key` once a build
-  succeeds, and checked at start and on every discovery pass. A failed build keeps the old base and marks
-  the class unhealthy (`docker base: …`), as a failed image build does, and is tried again on the next
-  pass. One base builds at a time on the machine. A pull request's own `provision` never reaches the
-  base, and probe mode does not build one.
+  default branch's commit and its `provision` path, Lima's template (`template:docker-rootful`) and
+  `limactl --version`, the runner tree's image ID (the actions/runner release and the pool's entrypoint)
+  and the VM's size. The Docker Engine version the build installed is read back from the new base and
+  recorded beside the key. The template takes Engine from Docker's install script, so its version is not
+  pinned; a new runner release changes the key every few weeks and so picks up a newer Engine and Ubuntu,
+  and there is no scheduled rebuild. The key and the Engine version are stored in
+  `~/Library/Application Support/local-ci-pool/docker-base-<identity>.key` once a build succeeds, and
+  checked at start and on every discovery pass. A failed build keeps the old base and marks the class
+  unhealthy (`docker base: …`), as a failed image build does, and is tried again on the next pass. One base
+  builds at a time on the machine. A pull request's own `provision` never reaches the base, and probe mode
+  does not build one.
 - A job gets a copy-on-write clone of the stopped base:
   - booted with no host mounts, with guest-to-host port forwarding off, and with no Rosetta or containerd
     shares (Lima's plain mode);
@@ -74,9 +78,10 @@ before a repository commits the block.**
 - The internet and the LAN through the VM's NAT, like a container job.
 - **The Mac's loopback services**, as from a container job: Lima's user-mode gateway `192.168.5.2`
   (`host.lima.internal`) leads to the Mac's `127.0.0.1`. Listeners on `127.0.0.1` and `0.0.0.0` and a Docker
-  Desktop port published on `127.0.0.1` all answered from the VM. No Lima setting closes the gateway while
-  the VM stays usable (Lima's own SSH uses it), and firewall rules inside the VM do not count, because the
-  job is root there ([SECURITY.md](../SECURITY.md)).
+  Desktop port published on `127.0.0.1` all answered from the VM. Firewall rules inside the VM do not
+  count, because the job is root there ([SECURITY.md](../SECURITY.md)).
+- Lima itself reaches into the VM: it forwards a port on the Mac's loopback to the VM's SSH, which the pool
+  uses to run the runner. A local process on the Mac that holds Lima's key could open a shell in a job VM.
 - Not the other way: in plain mode a port opened inside the VM is not forwarded to the Mac.
 
 ## Measured cost (Apple Silicon, 4 CPU / 6 GiB per VM)
@@ -89,4 +94,4 @@ before a repository commits the block.**
 | A Docker-and-gVisor test suite in a warm clone (image builds from the base's cache) | 72 s (13 s of builds) |
 | Delete of a clone | 1 s |
 
-The base takes 9.4 GiB; a job clone's writes, about 2–4 GiB, go with the clone.
+The base takes 9.4 GiB; a job clone's writes (an estimate: about 2–4 GiB) go with the clone.

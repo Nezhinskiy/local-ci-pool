@@ -36,8 +36,9 @@ type Marker struct {
 // DockerVM is the marker's "docker" block. Planned, nothing acts on it yet:
 // the pool builds the class's base VM from the default branch only, running
 // Provision (a script inside Inputs) as root in it, and rebuilds the base when
-// Inputs change on the default branch, or when the pool's pinned Linux image,
-// Docker Engine or actions/runner release changes.
+// its key changes: the Inputs digest on the default branch, the limactl
+// version, the actions/runner release and the Docker Engine version recorded
+// from the built base.
 type DockerVM struct {
 	Provision string
 	Inputs    []string
