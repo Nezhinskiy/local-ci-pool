@@ -27,15 +27,17 @@ type Marker struct {
 	Image      string
 	Dockerfile string
 	Inputs     []string
-	// Docker opts the repository into the docker class: jobs labelled
-	// <identity>-docker, each in a throwaway Linux VM with its own Docker
-	// daemon. Nil when the marker has no "docker" block.
+	// Docker opts the repository into the docker class (planned; nothing acts
+	// on it yet): jobs labelled <identity>-docker, each in a throwaway Linux VM
+	// with its own Docker daemon. Nil when the marker has no "docker" block.
 	Docker *DockerVM
 }
 
-// DockerVM is the marker's "docker" block. The pool builds the class's base VM
-// from the default branch only: it runs Provision, a script inside Inputs, as
-// root in the base, and rebuilds the base when Inputs change.
+// DockerVM is the marker's "docker" block. Planned, nothing acts on it yet:
+// the pool builds the class's base VM from the default branch only, running
+// Provision (a script inside Inputs) as root in it, and rebuilds the base when
+// Inputs change on the default branch, or when the pool's pinned Linux image,
+// Docker Engine or actions/runner release changes.
 type DockerVM struct {
 	Provision string
 	Inputs    []string

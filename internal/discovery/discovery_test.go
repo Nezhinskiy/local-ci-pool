@@ -43,6 +43,14 @@ func TestParseMarkerForms(t *testing.T) {
 			`{"dockerfile":"ci/runner/Dockerfile","inputs":["ci/runner"],"docker":{"provision":"ci/vm/provision.sh","inputs":["ci/vm","sandbox"]}}`,
 			Marker{Dockerfile: "ci/runner/Dockerfile", Inputs: []string{"ci/runner"}, Docker: &DockerVM{Provision: "ci/vm/provision.sh", Inputs: []string{"ci/vm", "sandbox"}}},
 		},
+		"docker block, the whole repository as input": {
+			`{"image":"x@` + digest + `","docker":{"provision":"ci/vm/provision.sh","inputs":["."]}}`,
+			Marker{Image: "x@" + digest, Docker: &DockerVM{Provision: "ci/vm/provision.sh", Inputs: []string{"."}}},
+		},
+		"docker block, provision is itself an input": {
+			`{"image":"x@` + digest + `","docker":{"provision":"provision.sh","inputs":["provision.sh","sandbox"]}}`,
+			Marker{Image: "x@" + digest, Docker: &DockerVM{Provision: "provision.sh", Inputs: []string{"provision.sh", "sandbox"}}},
+		},
 		"docker block with the image form, paths cleaned": {
 			`{"image":"x@` + digest + `","docker":{"provision":"./ci/vm/provision.sh","inputs":["./ci/vm"]}}`,
 			Marker{Image: "x@" + digest, Docker: &DockerVM{Provision: "ci/vm/provision.sh", Inputs: []string{"ci/vm"}}},
@@ -79,7 +87,7 @@ func TestParseMarkerForms(t *testing.T) {
 		"neither form":                   {`{}`, "exactly one"},
 		"unknown field":                  {`{"image":"x@` + digest + `","extra":1}`, "extra"},
 		"dockerfile without inputs":      {`{"dockerfile":"d/Dockerfile"}`, "inputs"},
-		"empty inputs":                   {`{"dockerfile":"d/Dockerfile","inputs":[]}`, "inputs"},
+		"empty inputs":                   {`{"dockerfile":"d/Dockerfile","inputs":[]}`, "non-empty"},
 		"inputs without dockerfile":      {`{"inputs":["d"]}`, "dockerfile"},
 		"parent in inputs":               {`{"dockerfile":"d/Dockerfile","inputs":["d","../x"]}`, ".."},
 		"parent inside an input":         {`{"dockerfile":"d/Dockerfile","inputs":["d/../../x"]}`, ".."},
@@ -103,7 +111,7 @@ func TestParseMarkerForms(t *testing.T) {
 		"wrong type":                     {`{"image":3}`, ""},
 		"docker block without provision": {`{"image":"x@` + digest + `","docker":{"inputs":["ci/vm"]}}`, "provision"},
 		"docker block without inputs":    {`{"image":"x@` + digest + `","docker":{"provision":"ci/vm/p.sh"}}`, "inputs"},
-		"docker block, empty inputs":     {`{"image":"x@` + digest + `","docker":{"provision":"ci/vm/p.sh","inputs":[]}}`, "inputs"},
+		"docker block, empty inputs":     {`{"image":"x@` + digest + `","docker":{"provision":"ci/vm/p.sh","inputs":[]}}`, "non-empty"},
 		"docker provision outside":       {`{"image":"x@` + digest + `","docker":{"provision":"other/p.sh","inputs":["ci/vm"]}}`, "inside"},
 		"docker provision by prefix":     {`{"image":"x@` + digest + `","docker":{"provision":"ci/vm-evil/p.sh","inputs":["ci/vm"]}}`, "inside"},
 		"docker parent in input":         {`{"image":"x@` + digest + `","docker":{"provision":"ci/vm/p.sh","inputs":["ci/vm","../x"]}}`, ".."},
