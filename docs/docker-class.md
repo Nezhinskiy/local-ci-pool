@@ -1,7 +1,8 @@
 # Design: the docker class (a throwaway VM per job)
 
-Status: implemented, the marker's `docker` block, parsed and validated (`internal/discovery`). The pool does
-not act on it yet; everything below marked planned is the design.
+Status: implemented, the marker's `docker` block, parsed and validated (`internal/discovery`), and the Lima
+backend that builds a base and runs a job in a clone of it (`internal/vm`). The pool does not wire the backend
+in yet; everything below marked planned is the design.
 
 A pool job runs in a container on Docker Desktop's VM, as a non-root user, with no Docker socket
 ([SECURITY.md](../SECURITY.md)). A job that needs a Docker daemon of its own, for example to build images or to
@@ -52,10 +53,26 @@ before a repository commits the block.**
   Docker Desktop's slots. Below a free-disk threshold the pool starts no VM, and `/healthz` reports the
   class unhealthy with the reason. The job stays queued; the pool never moves it elsewhere.
 
-## What a job can reach (planned, to be measured)
+## What a job can reach (measured with Lima 2.3.0, `vz`, `--plain`)
 
 - Root inside its own VM, and so the runner's own credentials. They are valid for that one runner and job,
   and die with the VM, as in a container job.
 - The internet and the LAN through the VM's NAT, like a container job.
-- The Mac's loopback services: to be measured before the class ships, and stated here and in SECURITY.md.
-  Firewall rules inside the VM do not count, because the job is root there.
+- **The Mac's loopback services**, as from a container job: Lima's user-mode gateway `192.168.5.2`
+  (`host.lima.internal`) leads to the Mac's `127.0.0.1`. Listeners on `127.0.0.1` and `0.0.0.0` and a Docker
+  Desktop port published on `127.0.0.1` all answered from the VM. No Lima setting closes the gateway while
+  the VM stays usable (Lima's own SSH uses it), and firewall rules inside the VM do not count, because the
+  job is root there ([SECURITY.md](../SECURITY.md)).
+- Not the other way: in plain mode a port opened inside the VM is not forwarded to the Mac.
+
+## Measured cost (Apple Silicon, 4 CPU / 6 GiB per VM)
+
+| Step | Time |
+|---|---|
+| Base create (with the template image download) / first boot | 190 s / 126 s |
+| Clone of the stopped base | 0.1 s, no disk at clone time (APFS copy-on-write) |
+| Boot of a clone | 8 s |
+| A Docker-and-gVisor test suite in a warm clone (image builds from the base's cache) | 72 s (13 s of builds) |
+| Delete of a clone | 1 s |
+
+The base takes 9.4 GiB; a job clone's writes, about 2–4 GiB, go with the clone.
