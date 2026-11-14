@@ -758,6 +758,12 @@ type harness struct {
 	budget Budget
 	// serve is Deps.Serve, the health endpoint; nil serves none.
 	serve func(ctx context.Context, ln net.Listener)
+	// lima is Deps.VM's limactl and mirror Deps.Mirror (dockerclass_test.go);
+	// nil leaves Deps.VM nil.
+	lima     *fakeLima
+	mirror   *fakeMirror
+	freeGiB  float64
+	stateDir string
 
 	mu       sync.Mutex
 	images   map[string]string // identity -> image reference
@@ -912,6 +918,9 @@ func (h *harness) deps() Deps {
 		Caffeinate: h.caff.start,
 		Serve:      h.serve,
 		Budget:     h.budget,
+		VM:         h.vmBackend(),
+		Mirror:     h.mirrorDep(),
+		StateDir:   h.stateDir,
 	}
 }
 
@@ -980,11 +989,22 @@ func (h *harness) stop() {
 	h.docker.exitAll()
 	h.actions.ClearBusy()
 	h.cancel()
-	select {
-	case err := <-h.done:
-		h.result = &err
-	case <-time.After(20 * time.Second):
-		h.t.Errorf("Run did not return after cancel")
+	deadline := time.After(20 * time.Second)
+	for h.result == nil {
+		select {
+		case err := <-h.done:
+			h.result = &err
+		case <-time.After(10 * time.Millisecond):
+			if h.lima != nil {
+				for _, r := range h.lima.running() {
+					h.lima.finish(r) // every docker VM's job ends too
+				}
+			}
+			continue
+		case <-deadline:
+			h.t.Errorf("Run did not return after cancel")
+		}
+		break
 	}
 	h.dumpOnFailure()
 }

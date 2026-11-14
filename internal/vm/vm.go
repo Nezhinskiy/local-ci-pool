@@ -7,10 +7,11 @@
 // and deletes the clone once the runner exits or its deadline passes. Nothing a job writes survives it: its
 // writes, image builds and caches live in its own clone. Sweep deletes what a killed pool left behind.
 //
-// Every VM name carries the pool instance, so a probe pool and the main one on the same Mac never touch
-// each other's VMs.
+// Every VM name carries the pool instance. Probe mode runs no docker VMs (and its longer instance name
+// would not fit MaxNameLen); the instance in the name keeps one pool's Sweep off another's VMs.
 //
 // Contracts for the caller:
+//   - Sweep runs once, at start-up, before any BuildBase or Launch of this instance.
 //   - BuildBase and Launch of one identity never run at once: a clone made during the swap fails.
 //   - A build is a VM too: it takes the machine's one docker-VM slot, like a job.
 //   - The error Launch hands to done can end with text the job wrote (it is root in its VM): treat it like
@@ -25,7 +26,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
@@ -46,14 +49,22 @@ const (
 	// SourceDir is where the default branch's archive lies while provision runs; it is removed afterwards.
 	SourceDir = "/opt/local-ci-source"
 	// MaxNameLen bounds every VM name: Lima keeps sockets under ~/.lima/<name>/, and a Unix socket path is
-	// limited to about 104 bytes on macOS.
+	// limited to about 104 bytes on macOS. For the main instance that leaves 24 characters for a repository
+	// identity (local-ci-docker-base-main-<identity>).
 	MaxNameLen = 50
 	// DefaultJobTimeout bounds a job VM when Backend.JobTimeout is zero: GitHub's default job timeout of
 	// six hours, plus a margin for the boot and the runner's own start.
 	DefaultJobTimeout = 6*time.Hour + 10*time.Minute
 	// DefaultDeleteTimeout bounds one delete when Backend.DeleteTimeout is zero.
 	DefaultDeleteTimeout = 2 * time.Minute
+	// Recipe names BuildBase's own steps (the runner user, the tree and source directories, the
+	// provision script): a change of them changes Recipe, and the caller's base key with it.
+	Recipe = "1"
 )
+
+// ErrDeleteFailed marks a job clone that could not be deleted: it may still run, so the caller must
+// not start another VM until it is gone.
+var ErrDeleteFailed = errors.New("deleting the job's docker VM failed")
 
 // Lima runs one limactl command, with stdin when it is not nil, and returns its standard output.
 type Lima interface {
@@ -74,12 +85,46 @@ func (e Exec) Run(ctx context.Context, stdin io.Reader, args ...string) ([]byte,
 	cmd.Stdin = stdin
 	// limactl shell's ssh child can hold the output pipes after limactl itself is killed.
 	cmd.WaitDelay = 10 * time.Second
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	// A job is root in its VM and can write to the runner's streams without end: only the head of stdout
+	// (the small answers of list, --version, docker version) and the tail of stderr are kept.
+	stdout, stderr := &capped{max: maxStdout}, &tail{max: maxStderr}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	if err := cmd.Run(); err != nil {
-		return stdout.Bytes(), fmt.Errorf("limactl %s: %w: %s", args[0], err, strings.TrimSpace(lastLine(stderr.String())))
+		return stdout.b, fmt.Errorf("limactl %s: %w: %s", args[0], err, strings.TrimSpace(lastLine(string(stderr.b))))
 	}
-	return stdout.Bytes(), nil
+	return stdout.b, nil
+}
+
+const (
+	maxStdout = 1 << 20
+	maxStderr = 4 << 10
+)
+
+// capped keeps the first max bytes written to it and drops the rest.
+type capped struct {
+	b   []byte
+	max int
+}
+
+func (c *capped) Write(p []byte) (int, error) {
+	if room := c.max - len(c.b); room > 0 {
+		c.b = append(c.b, p[:min(len(p), room)]...)
+	}
+	return len(p), nil
+}
+
+// tail keeps the last max bytes written to it.
+type tail struct {
+	b   []byte
+	max int
+}
+
+func (t *tail) Write(p []byte) (int, error) {
+	t.b = append(t.b, p...)
+	if over := len(t.b) - t.max; over > 0 {
+		t.b = append(t.b[:0:0], t.b[over:]...)
+	}
+	return len(p), nil
 }
 
 func lastLine(s string) string {
@@ -150,14 +195,14 @@ func (b *Backend) BuildBase(ctx context.Context, identity string, runnerTree, so
 	if err != nil {
 		return "", err
 	}
-	building, err := b.name("building", identity)
+	building, err := b.name("new", identity)
 	if err != nil {
 		return "", err
 	}
+	_ = b.remove(ctx, building) // a build a killed pool left behind, before the disk is judged
 	if err := b.diskOK(); err != nil {
 		return "", err
 	}
-	_ = b.remove(ctx, building) // a build a killed pool left behind
 	steps := []struct {
 		stdin io.Reader
 		args  []string
@@ -173,6 +218,7 @@ func (b *Backend) BuildBase(ctx context.Context, identity string, runnerTree, so
 		{nil, []string{"shell", building, "--", "sudo", "docker", "version", "--format", "{{.Server.Version}}"}},
 		{nil, []string{"stop", building}},
 	}
+	const engineStep = 7 // the docker version step above
 	var engine string
 	for i, s := range steps {
 		out, err := b.Lima.Run(ctx, s.stdin, s.args...)
@@ -180,7 +226,7 @@ func (b *Backend) BuildBase(ctx context.Context, identity string, runnerTree, so
 			_ = b.remove(context.WithoutCancel(ctx), building)
 			return "", fmt.Errorf("building the docker base of %s: %w", identity, err)
 		}
-		if i == len(steps)-2 {
+		if i == engineStep {
 			engine = strings.TrimSpace(string(out))
 		}
 	}
@@ -188,12 +234,16 @@ func (b *Backend) BuildBase(ctx context.Context, identity string, runnerTree, so
 		_ = b.remove(context.WithoutCancel(ctx), building)
 		return "", fmt.Errorf("building the docker base of %s: the base reports no Docker Engine version", identity)
 	}
-	return engine, b.swap(context.WithoutCancel(ctx), identity, base, building)
+	if err := b.swap(context.WithoutCancel(ctx), identity, base, building); err != nil {
+		_ = b.remove(context.WithoutCancel(ctx), building)
+		return "", err
+	}
+	return engine, nil
 }
 
-// swap puts building in place of base. The old base is renamed aside first and deleted only once the new
-// one is in place; a failure on the way renames it back. It runs to the end even when the build's context
-// is cancelled.
+// swap puts building in place of base. The old base is renamed aside first, and a failure until the new
+// one is in place renames it back. It runs to the end even when the build's context is cancelled, and it
+// always ends by deleting the old base set aside (a no-op when there is none).
 func (b *Backend) swap(ctx context.Context, identity, base, building string) error {
 	old, err := b.name("old", identity)
 	if err != nil {
@@ -211,7 +261,7 @@ func (b *Backend) swap(ctx context.Context, identity, base, building string) err
 			return fail(err)
 		}
 		if _, err := b.Lima.Run(ctx, nil, "rename", base, old); err != nil {
-			_, _ = b.Lima.Run(ctx, nil, "protect", base)
+			b.protect(ctx, base)
 			return fail(err)
 		}
 	}
@@ -220,20 +270,37 @@ func (b *Backend) swap(ctx context.Context, identity, base, building string) err
 			if _, rerr := b.Lima.Run(ctx, nil, "rename", old, base); rerr != nil {
 				b.logf("the old docker base could not be put back", "identity", identity, "error", rerr.Error())
 			} else {
-				_, _ = b.Lima.Run(ctx, nil, "protect", base)
+				b.protect(ctx, base)
 			}
 		}
 		return fail(err)
 	}
-	// limactl protect refuses a removal of the base, so nothing deletes it by accident.
-	if _, err := b.Lima.Run(ctx, nil, "protect", base); err != nil {
-		return fmt.Errorf("protecting the docker base of %s: %w", identity, err)
-	}
-	if hadBase {
-		_ = b.remove(ctx, old)
-	}
+	// The new base serves from here on: a failed protect is logged (Sweep protects it again), not a
+	// failed build. limactl protect refuses a removal of the base, so nothing deletes it by accident.
+	b.protect(ctx, base)
+	_ = b.remove(ctx, old)
 	return nil
 }
+
+func (b *Backend) protect(ctx context.Context, base string) {
+	if _, err := b.Lima.Run(ctx, nil, "protect", base); err != nil {
+		b.logf("protecting a docker base failed", "vm", base, "error", err.Error())
+	}
+}
+
+// HasBase reports whether identity's base exists, for a caller that trusts a stored key only while its
+// base is there.
+func (b *Backend) HasBase(ctx context.Context, identity string) (bool, error) {
+	base, err := b.BaseName(identity)
+	if err != nil {
+		return false, err
+	}
+	names, err := b.list(ctx)
+	return names[base], err
+}
+
+// DiskOK reports ErrDiskShort, with the numbers, below MinFreeGiB of free disk.
+func (b *Backend) DiskOK() error { return b.diskOK() }
 
 func (b *Backend) diskOK() error {
 	free, err := b.FreeGiB()
@@ -267,7 +334,9 @@ func (b *Backend) Launch(ctx context.Context, identity, runner, jit string, done
 	}
 	for _, args := range [][]string{{"clone", "--tty=false", base, job}, {"start", "--tty=false", job}} {
 		if _, err := b.Lima.Run(ctx, nil, args...); err != nil {
-			_ = b.remove(context.WithoutCancel(ctx), job)
+			if derr := b.remove(context.WithoutCancel(ctx), job); derr != nil {
+				err = errors.Join(err, fmt.Errorf("%w: %s: %w", ErrDeleteFailed, job, derr))
+			}
 			return fmt.Errorf("starting docker VM %s: %w", job, err)
 		}
 	}
@@ -277,7 +346,19 @@ func (b *Backend) Launch(ctx context.Context, identity, runner, jit string, done
 		defer cancel()
 		_, err := b.Lima.Run(runCtx, strings.NewReader(jit+"\n"),
 			"shell", job, "--", "sudo", "-u", RunnerUser, "-H", TreeDir+"/entrypoint.sh")
-		done(errors.Join(err, b.remove(context.WithoutCancel(ctx), job)))
+		if runCtx.Err() != nil { // a killed process reports "signal: killed", not the deadline
+			err = errors.Join(err, runCtx.Err())
+		}
+		var delErr error
+		for try := 0; try < 3; try++ {
+			if delErr = b.remove(context.WithoutCancel(ctx), job); delErr == nil {
+				break
+			}
+		}
+		if delErr != nil {
+			delErr = fmt.Errorf("%w: %s: %w", ErrDeleteFailed, job, delErr)
+		}
+		done(errors.Join(err, delErr))
 	}()
 	return nil
 }
@@ -303,7 +384,8 @@ func (b *Backend) remove(ctx context.Context, name string) error {
 
 // Sweep cleans what a killed pool of this instance left behind: it deletes every job clone and unfinished
 // build, and resolves an interrupted swap (an old base set aside is put back when no base is in place, and
-// deleted otherwise).
+// deleted otherwise). A job clone or build it cannot delete is an error that wraps ErrDeleteFailed: it may
+// still run.
 func (b *Backend) Sweep(ctx context.Context) ([]string, error) {
 	names, err := b.list(ctx)
 	if err != nil {
@@ -311,10 +393,13 @@ func (b *Backend) Sweep(ctx context.Context) ([]string, error) {
 	}
 	scope := func(kind string) string { return prefix + kind + "-" + b.Instance + "-" }
 	var deleted []string
+	var errs []error
 	for n := range names {
 		switch {
-		case strings.HasPrefix(n, scope("job")), strings.HasPrefix(n, scope("building")):
-			if b.remove(ctx, n) == nil {
+		case strings.HasPrefix(n, scope("job")), strings.HasPrefix(n, scope("new")):
+			if err := b.remove(ctx, n); err != nil {
+				errs = append(errs, fmt.Errorf("%w: %s: %w", ErrDeleteFailed, n, err))
+			} else {
 				deleted = append(deleted, n)
 			}
 		case strings.HasPrefix(n, scope("old")):
@@ -323,12 +408,16 @@ func (b *Backend) Sweep(ctx context.Context) ([]string, error) {
 				if b.remove(ctx, n) == nil {
 					deleted = append(deleted, n)
 				}
-			} else if _, err := b.Lima.Run(ctx, nil, "rename", n, base); err == nil {
-				_, _ = b.Lima.Run(ctx, nil, "protect", base)
+			} else if _, err := b.Lima.Run(ctx, nil, "rename", n, base); err != nil {
+				b.logf("putting a docker base back failed", "vm", n, "error", err.Error())
+			} else {
+				b.protect(ctx, base)
 			}
+		case strings.HasPrefix(n, scope("base")):
+			b.protect(ctx, n) // a crash between rename and protect left it unprotected
 		}
 	}
-	return deleted, nil
+	return deleted, errors.Join(errs...)
 }
 
 func (b *Backend) list(ctx context.Context) (map[string]bool, error) {
@@ -365,13 +454,30 @@ func or(d, def time.Duration) time.Duration {
 	return def
 }
 
-// FreeGiBAt reports the free disk of the file system holding dir, for Backend.FreeGiB.
+// FreeGiBAt reports the free disk of the file system holding dir, for Backend.FreeGiB. A dir that does
+// not exist yet (limactl makes it at its first VM) is measured at its nearest existing parent.
 func FreeGiBAt(dir string) func() (float64, error) {
 	return func() (float64, error) {
 		var st syscall.Statfs_t
-		if err := syscall.Statfs(dir, &st); err != nil {
-			return 0, err
+		d := dir
+		for {
+			err := syscall.Statfs(d, &st)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, syscall.ENOENT) || filepath.Dir(d) == d {
+				return 0, err
+			}
+			d = filepath.Dir(d)
 		}
 		return float64(st.Bavail) * float64(st.Bsize) / (1 << 30), nil
 	}
+}
+
+// Home is where limactl keeps its VMs: $LIMA_HOME, else ~/.lima.
+func Home(userHome string) string {
+	if h := os.Getenv("LIMA_HOME"); h != "" {
+		return h
+	}
+	return filepath.Join(userHome, ".lima")
 }

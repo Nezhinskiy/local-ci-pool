@@ -89,7 +89,9 @@ type Config struct {
 // reports a lost login. A beat writes the variable of this machine to every
 // healthy project, and only while Docker answers and the pool is not in probe
 // mode (a probe serves a repository under its own names and must not attract
-// the real workflows).
+// the real workflows). A docker-class project never counts: the routing
+// action routes the <identity>-local jobs only, so a healthy docker class
+// must not advertise a container class that is down.
 func Run(ctx context.Context, cfg Config) {
 	log := cfg.Log
 	if log == nil {
@@ -133,7 +135,7 @@ func beat(ctx context.Context, cfg Config, now func() time.Time, log *slog.Logge
 		return false
 	}
 	for _, p := range snap.Projects {
-		if !p.Healthy {
+		if !p.Healthy || p.DockerClass {
 			continue
 		}
 		if ctx.Err() != nil {

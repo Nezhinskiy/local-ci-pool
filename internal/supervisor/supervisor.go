@@ -30,6 +30,7 @@ import (
 	"github.com/Nezhinskiy/local-ci-pool/internal/machine"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runner"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runnermount"
+	"github.com/Nezhinskiy/local-ci-pool/internal/vm"
 )
 
 const (
@@ -141,6 +142,7 @@ type Docker interface {
 	runner.Docker
 	image.Docker
 	runnermount.Docker
+	runnermount.TreeDocker
 	Info(ctx context.Context, options client.InfoOptions) (client.SystemInfoResult, error)
 }
 
@@ -262,6 +264,11 @@ type Deps struct {
 	// Budget admits the runners into the machine's budget, and adopts the
 	// survivors of a previous run into it. Nil: the budget is off.
 	Budget Budget
+	// VM runs the docker class's base VMs and job clones (dockerclass.go).
+	// Nil: a docker-class project fails its setup.
+	VM *vm.Backend
+	// StateDir keeps the pool's state across runs: the docker bases' keys.
+	StateDir string
 }
 
 // Snapshot is the pool's state for the health endpoint and the heartbeat.
@@ -272,7 +279,9 @@ type Snapshot struct {
 	Slots   int    `json:"slots"`
 	InUse   int    `json:"in_use"`
 	Busy    int    `json:"busy"`
-	Docker  bool   `json:"docker"`
+	// VMInUse is the docker class's VM slot in use, 0 or 1 (docs/docker-class.md).
+	VMInUse int  `json:"vm_in_use"`
+	Docker  bool `json:"docker"`
 	// Login is false while the last read of the token from gh failed: the
 	// pool waits for gh and takes no jobs meanwhile.
 	Login bool `json:"login"`
@@ -293,9 +302,15 @@ type ProjectHealth struct {
 	Image    string `json:"image"`
 	Reason   string `json:"reason"`
 	// Class is the kind of Reason, one of a fixed set: starting, draining,
-	// setup, down, image, preflight, runners. Empty while healthy.
+	// setup, down, image, preflight, vm, runners. Empty while healthy.
 	Class   string `json:"class,omitempty"`
 	Healthy bool   `json:"healthy"`
+	// DockerClass marks the repository's docker-class project
+	// (docs/docker-class.md), which no heartbeat advertises.
+	DockerClass bool `json:"docker_class,omitempty"`
+	// NotInstalled marks a docker-class entry on a Mac without limactl: it
+	// serves no docker jobs, and that is no fault (Healthy stays true).
+	NotInstalled bool `json:"not_installed,omitempty"`
 	// Waiting is the project's runners waiting for the budget.
 	Waiting int `json:"waiting"`
 	// Admitted is the project's runners and survivors that hold an
@@ -333,10 +348,15 @@ type Supervisor struct {
 	machine  machine.Machine
 	instance string
 	slots    *runner.Slots
+	// vmSlots is the docker class's one slot: one docker VM at a time.
+	vmSlots *runner.Slots
+	// vmLeak is set when a docker VM may still run (a delete, or the start-up
+	// sweep, failed): no docker VM starts until a restart.
+	vmLeak   string
 	mount    runnermount.Mount
 	dockerOK bool
-	projects map[string]*project // by owner/name
-	// public lists, by owner/name, the projects drained because their
+	projects map[string]*project // by project key: owner/name, plus dockerKey for the docker class
+	// public lists, by project key, the projects drained because their
 	// repository turned public, until the repository is served again.
 	public map[string]ProjectHealth
 	// survivors are the runners of a previous run still running at start, by
@@ -462,6 +482,12 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if s.cfg.Probe {
 		instance = "probe-" + m.Owner
 	}
+	if s.deps.VM != nil {
+		// Every docker VM's name carries the instance, so a probe and the main pool never touch each
+		// other's VMs.
+		s.deps.VM.Instance = instance
+		s.deps.VM.Log = s.log
+	}
 	var mount runnermount.Mount
 	err = s.retryTokenRead(ctx, func() error {
 		var err error
@@ -481,6 +507,8 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	s.machine, s.instance, s.mount = m, instance, mount
 	s.slots = runner.NewSlots(m.Slots)
 	s.slots.OnChange(s.requestCapacity)
+	s.vmSlots = runner.NewSlots(1)
+	s.vmSlots.OnChange(s.requestCapacity)
 	s.dockerOK = true
 	s.mu.Unlock()
 	// The pid lets the installer tell this process's lines in the shared log
@@ -493,6 +521,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	s.sweepVMs(ctx)
 
 	// The projects live on until they are drained, so a SIGTERM (ctx) does
 	// not cancel them; life ends after the drain.
@@ -688,6 +717,7 @@ func (s *Supervisor) discover(ctx, life context.Context) bool {
 	want := map[string]bool{}
 	for _, p := range res.Projects {
 		want[p.Repo] = true
+		want[p.Repo+dockerKey] = s.servesDocker(p)
 	}
 	errored := map[string]bool{}
 	for _, r := range res.Errored {
@@ -695,34 +725,46 @@ func (s *Supervisor) discover(ctx, life context.Context) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for repo, pr := range s.projects {
-		if want[repo] || errored[repo] || pr.isDraining() {
+	for key, pr := range s.projects {
+		if want[key] || errored[pr.repo] || pr.isDraining() {
 			continue
 		}
 		pr.log.Info("the project left discovery; draining")
 		s.drainLocked(life, pr, s.deps.Clock.Now().Add(s.cfg.Drain))
 	}
 	for _, p := range res.Projects {
-		pr := s.projects[p.Repo]
-		switch {
-		case pr == nil || pr.isFailed():
-			s.startLocked(life, p)
-		case pr.isDraining():
-			// It starts again on the first pass after its drain ends.
-		default:
-			s.goLocked(func() { pr.refresh(p) }, pr.claimRefresh())
+		s.applyLocked(life, p, false)
+		if s.servesDocker(p) {
+			s.applyLocked(life, p, true)
 		}
 	}
 	return true
 }
 
-func (s *Supervisor) startLocked(life context.Context, p discovery.Project) {
-	if old := s.projects[p.Repo]; old != nil {
+// applyLocked starts the project of p's class, or refreshes it.
+func (s *Supervisor) applyLocked(life context.Context, p discovery.Project, docker bool) {
+	key := p.Repo
+	if docker {
+		key += dockerKey
+	}
+	pr := s.projects[key]
+	switch {
+	case pr == nil || pr.isFailed():
+		s.startLocked(life, p, docker)
+	case pr.isDraining():
+		// It starts again on the first pass after its drain ends.
+	default:
+		s.goLocked(func() { pr.refresh(p) }, pr.claimRefresh())
+	}
+}
+
+func (s *Supervisor) startLocked(life context.Context, p discovery.Project, docker bool) {
+	pr := newProject(s, life, p, docker)
+	if old := s.projects[pr.key]; old != nil {
 		old.cancel() // a failed project; its goroutine has returned
 	}
-	delete(s.public, p.Repo)
-	pr := newProject(s, life, p)
-	s.projects[p.Repo] = pr
+	delete(s.public, pr.key)
+	s.projects[pr.key] = pr
 	pr.log.Info("serving the project")
 	s.goLocked(pr.run, true)
 }
@@ -735,10 +777,10 @@ func (s *Supervisor) drainLocked(life context.Context, pr *project, deadline tim
 		if pr.drain(life, deadline) {
 			h := pr.health()
 			s.mu.Lock()
-			if s.projects[pr.repo] == pr {
-				delete(s.projects, pr.repo)
+			if s.projects[pr.key] == pr {
+				delete(s.projects, pr.key)
 				if pr.isPublic() {
-					s.public[pr.repo] = ProjectHealth{Repo: h.Repo, Identity: h.Identity, Image: h.Image, Reason: h.Reason}
+					s.public[pr.key] = ProjectHealth{Repo: h.Repo, Identity: h.Identity, Image: h.Image, Reason: h.Reason, DockerClass: h.DockerClass}
 				}
 			}
 			s.mu.Unlock()
@@ -751,7 +793,7 @@ func (s *Supervisor) drainLocked(life context.Context, pr *project, deadline tim
 func (s *Supervisor) requestDrain(pr *project) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.projects[pr.repo] == pr && s.life != nil {
+	if s.projects[pr.key] == pr && s.life != nil {
 		s.drainLocked(s.life, pr, s.deps.Clock.Now().Add(s.cfg.Drain))
 	}
 }
@@ -784,7 +826,7 @@ func (s *Supervisor) projectList() []*project {
 	for _, pr := range s.projects {
 		prs = append(prs, pr)
 	}
-	slices.SortFunc(prs, func(a, b *project) int { return strings.Compare(a.repo, b.repo) })
+	slices.SortFunc(prs, func(a, b *project) int { return strings.Compare(a.key, b.key) })
 	return prs
 }
 
@@ -800,13 +842,15 @@ func (s *Supervisor) exited(name string) {
 	}
 }
 
+// scalers are the container class's scalers, whose runners have containers:
+// a docker-class runner has none, so no die event or reconcile releases it.
 func (s *Supervisor) scalers() []*runner.Scaler {
 	s.mu.Lock()
 	prs := s.projectList()
 	s.mu.Unlock()
 	var out []*runner.Scaler
 	for _, pr := range prs {
-		if sc := pr.getScaler(); sc != nil {
+		if sc := pr.getScaler(); sc != nil && !pr.docker {
 			out = append(out, sc)
 		}
 	}
@@ -871,18 +915,21 @@ func (s *Supervisor) Snapshot() Snapshot {
 		Login:   s.deps.Token == nil || s.deps.Token.ReadErr() == nil,
 		Probe:   s.cfg.Probe,
 	}
-	slots := s.slots
+	slots, vmSlots := s.slots, s.vmSlots
 	prs := s.projectList()
 	survivors := s.survivorCountsLocked()
 	var gone []ProjectHealth
-	for _, repo := range slices.Sorted(maps.Keys(s.public)) {
-		if s.projects[repo] == nil {
-			gone = append(gone, s.public[repo])
+	for _, key := range slices.Sorted(maps.Keys(s.public)) {
+		if s.projects[key] == nil {
+			gone = append(gone, s.public[key])
 		}
 	}
 	s.mu.Unlock()
 	if slots != nil {
 		snap.Slots, snap.InUse, snap.Busy = slots.Cap(), slots.InUse(), slots.Busy()
+	}
+	if vmSlots != nil {
+		snap.VMInUse = vmSlots.InUse()
 	}
 	// State reads the settings file: never under s.mu.
 	snap.Budget = budget.State{State: "off"}
@@ -891,16 +938,19 @@ func (s *Supervisor) Snapshot() Snapshot {
 	}
 	for _, pr := range prs {
 		h := pr.health()
-		c := survivors[pr.identity]
-		h.Admitted.Adopted += c.Adopted
-		h.Admitted.FailOpen += c.FailOpen
+		if !pr.docker {
+			c := survivors[pr.identity]
+			h.Admitted.Adopted += c.Adopted
+			h.Admitted.FailOpen += c.FailOpen
+		}
 		snap.Projects = append(snap.Projects, h)
 	}
 	snap.Projects = append(snap.Projects, gone...)
 	return snap
 }
 
-// caffeinate keeps the Mac awake while any slot is in use. JobStarted reaches
+// caffeinate keeps the Mac awake while any slot, a docker VM's included, is in
+// use. JobStarted reaches
 // the listener late, so slots in use, not busy runners, are the signal.
 func (s *Supervisor) caffeinate(ctx context.Context) {
 	var stop func()
@@ -910,7 +960,7 @@ func (s *Supervisor) caffeinate(ctx context.Context) {
 		}
 	}()
 	for {
-		inUse := s.slots.InUse()
+		inUse := s.slots.InUse() + s.vmSlots.InUse()
 		switch {
 		case inUse > 0 && stop == nil:
 			st, err := s.deps.Caffeinate()

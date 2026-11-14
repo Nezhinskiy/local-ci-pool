@@ -1,8 +1,8 @@
 # Design: the docker class (a throwaway VM per job)
 
-Status: implemented, the marker's `docker` block, parsed and validated (`internal/discovery`), and the Lima
-backend that builds a base and runs a job in a clone of it (`internal/vm`). The pool does not wire the backend
-in yet; everything below marked planned is the design.
+Status: wired. The marker's `docker` block is parsed and validated (`internal/discovery`), the Lima backend
+builds a base and runs a job in a clone of it (`internal/vm`), and the supervisor serves the class
+(`internal/supervisor/dockerclass.go`). What the owner sees and does: [the runbook](runbook.md#the-docker-class).
 
 A pool job runs in a container on Docker Desktop's VM, as a non-root user, with no Docker socket
 ([SECURITY.md](../SECURITY.md)). A job that needs a Docker daemon of its own, for example to build images or to
@@ -27,9 +27,15 @@ that predates the block refuses a marker carrying it (`DisallowUnknownFields`): 
 serves, that drains the repository, its `<identity>-local` jobs included. **Upgrade the pool on every Mac
 before a repository commits the block.**
 
-## How a job runs (planned)
+## How a job runs
 
-- The pool registers a second scale set for the repository, labelled `<identity>-docker`.
+- The pool registers a second scale set for the repository, `<identity>-docker-<machine>`, labelled
+  `<identity>-docker`, outside probe mode only, and only for a marker read at the default branch. It
+  is a project of its own in `/healthz` (`"docker_class": true`), with its own visibility checks and
+  drain: it leaves no later than the repository's container class would. It writes no heartbeat: the routing action routes `<identity>-local` jobs alone, so
+  a workflow names `<identity>-docker` in `runs-on` directly, and such a job waits for the Mac; it never
+  falls back to a hosted runner. A Mac without Lima registers no such scale set and reports the class as not installed, which is no
+  fault (`"not_installed": true`, healthy).
 - The pool keeps one base VM per repository (Lima, `vz`). It builds the base **only from the default branch**:
   - Lima's `docker-rootful` template (Ubuntu, with Docker Engine from Docker's install script, so the Engine
     version is not pinned), and the verified actions/runner tarball;
@@ -37,12 +43,24 @@ before a repository commits the block.**
     build the images the jobs will need);
   - then it stops the base.
 
-  The base's key is the block's inputs digest on the default branch, the `limactl` version, the
-  actions/runner release, and the Docker Engine version read back from the built base and recorded. The base
-  is rebuilt when the key changes. A new runner release already forces rebuilds every few weeks, which also
-  picks up a newer Engine and Ubuntu, so there is no scheduled rebuild. A failed build keeps the old base and marks the class
-  unhealthy, as a failed image build does. A pull request's own `provision` never reaches the base, and
-  probe mode does not build one.
+  The base is rebuilt when its key changes. The key is a SHA-256 over the block's inputs digest at the
+  default branch's commit and its `provision` path, Lima's template (`template:docker-rootful`) and
+  `limactl --version`, the runner tree's image ID (the actions/runner release and the pool's entrypoint)
+  and the VM's size. The Docker Engine version the build installed is read back from the new base and
+  recorded beside the key. The template takes Engine from Docker's install script, so its version is not
+  pinned; a new runner release changes the key every few weeks and so picks up a newer Engine, and there
+  is no scheduled rebuild. Ubuntu is not upgraded that way: Lima's template pins a dated Ubuntu image, so
+  the base's packages change only with the `limactl` version (in the key), and nothing runs an upgrade.
+  A repository identity may have at most 24 characters, the room the VM names leave (Lima's socket paths
+  are limited); a longer one fails the base build with that reason. The key and the Engine version are stored in
+  `~/Library/Application Support/local-ci-pool/docker-base-<identity>.key` once a build succeeds, and
+  checked at start and on every discovery pass; a key whose base is gone (deleted by hand, a wiped Lima home)
+  is built again. A failed build keeps the old base and marks the class
+  unhealthy (`docker base: …`), as a failed image build does, and is tried again on the next pass. One base
+  builds at a time on the machine. A failing build is retried on every discovery pass (10 minutes), with no backoff;
+  `/healthz` shows it failing, with the reason, until one passes. A pull request's own `provision` never reaches
+  the base, and probe mode
+  does not build one.
 - A job gets a copy-on-write clone of the stopped base:
   - booted with no host mounts, with guest-to-host port forwarding off, and with no Rosetta or containerd
     shares (Lima's plain mode);
@@ -51,9 +69,14 @@ before a repository commits the block.**
     behind.
 
   A job's writes, and its image builds and caches, stay in its clone; the base is never booted again.
-- One docker VM runs at a time on a machine, whatever the repository, with its own CPU and memory, outside
-  Docker Desktop's slots. Below a free-disk threshold the pool starts no VM, and `/healthz` reports the
-  class unhealthy with the reason. The job stays queued; the pool never moves it elsewhere.
+- One docker VM runs at a time on a machine, whatever the repository (one machine-wide slot), with its own
+  CPU and memory (4 CPUs, 6 GiB, a 30 GiB disk), outside Docker Desktop's slots and the core budget. A base
+  build is a VM too and takes the same slot: it waits for a running job, and no job starts while it builds.
+  Below 15 GiB free where Lima keeps its VMs (`$LIMA_HOME`, else `~/.lima`) the pool registers no runner and starts no VM, and
+  `/healthz` reports the class unhealthy (`docker vm: not enough free disk …`). The job stays queued; the pool never moves it elsewhere.
+- A docker runner has no container: the Docker die events, the reconcile and the start-up sweep of
+  containers never release or remove it. Its clone's end is its exit; an idle one beyond the assigned
+  jobs, or one left at the drain bound, is removed by deleting its clone.
 
 ## What a job can reach (measured with Lima 2.3.0, `vz`, `--plain`)
 

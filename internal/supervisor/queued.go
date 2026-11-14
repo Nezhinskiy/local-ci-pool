@@ -55,7 +55,7 @@ func (s *Supervisor) watchQueued(ctx context.Context) {
 func (s *Supervisor) checkQueued(ctx context.Context, pr *project) {
 	clock := s.deps.Clock
 	now := clock.Now()
-	free := s.slots.InUse() < s.slots.Cap()
+	free := pr.slots.InUse() < pr.slots.Cap()
 	pr.mu.Lock()
 	sc, ready := pr.scaler, pr.up && !pr.draining && !pr.failed
 	pr.mu.Unlock()

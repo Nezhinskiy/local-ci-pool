@@ -240,7 +240,7 @@ func TestFetchAndArchiveUseThePoolCredentialHelperAndWriteNoCredential(t *testin
 		}
 		if isFetch {
 			fetch = true
-			if !strings.Contains(joined, "fetch --filter=blob:none") || !strings.Contains(joined, "origin +main:main") {
+			if !strings.Contains(joined, "fetch --filter=blob:none") || !strings.Contains(joined, "origin +refs/heads/main:refs/heads/main") {
 				t.Errorf("unexpected fetch arguments: %s", joined)
 			}
 		}
@@ -421,6 +421,27 @@ func TestInputsDigestRefusesEmptyAndUnsafeInputs(t *testing.T) {
 	for _, bad := range []string{"HEAD", "--all", "main; rm", ""} {
 		if _, err := m.InputsDigest(ctx, dir, bad, []string{"a.txt"}); err == nil {
 			t.Errorf("InputsDigest with commit %q: want an error", bad)
+		}
+	}
+}
+
+// A tag named like the branch never decides the commit: git resolves a bare
+// name to refs/tags/<name> before refs/heads/<name>, so the fetch names the
+// branch in full.
+func TestFetchTakesTheBranchNotATagOfTheSameName(t *testing.T) {
+	s := newSource(t)
+	s.write("a.txt", "branch", 0o644)
+	branch := s.commit("branch")
+	s.git("checkout", "-q", "-b", "elsewhere")
+	s.write("a.txt", "tag", 0o644)
+	tagged := s.commit("tagged")
+	s.git("tag", "main", tagged)
+	s.git("checkout", "-q", "main")
+
+	for _, ref := range []string{"main", "refs/heads/main"} {
+		got, err := s.mirror(t).Fetch(context.Background(), "o/alpha", ref)
+		if err != nil || got != branch {
+			t.Fatalf("Fetch(%q) = %q, %v; want the branch %q, not the tag %q", ref, got, err, branch, tagged)
 		}
 	}
 }

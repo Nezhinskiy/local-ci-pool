@@ -112,7 +112,7 @@ func TestRepoAndReadFile(t *testing.T) {
 			if got := r.Header.Get("Accept"); got != "application/vnd.github.raw" {
 				t.Errorf("Accept = %q", got)
 			}
-			if got := r.URL.Query().Get("ref"); got != "feature/x" {
+			if got := r.URL.Query().Get("ref"); got != "refs/heads/feature/x" { // a branch, never a tag of that name
 				t.Errorf("ref = %q", got)
 			}
 			_, _ = io.WriteString(w, `{"image":"x"}`)

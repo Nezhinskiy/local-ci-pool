@@ -102,19 +102,28 @@ func formatStatus(s supervisor.Snapshot) string {
 	}
 	b.WriteByte('\n')
 
+	name := func(p supervisor.ProjectHealth) string {
+		if p.DockerClass {
+			return clean(p.Repo) + " (docker)"
+		}
+		return clean(p.Repo)
+	}
 	width := 0
 	for _, p := range s.Projects {
-		width = max(width, len(clean(p.Repo)))
+		width = max(width, len(name(p)))
 	}
 	for _, p := range s.Projects {
 		state := "healthy"
+		if p.NotInstalled {
+			state = "not installed (no limactl)"
+		}
 		if !p.Healthy {
 			state = "unhealthy: " + clean(p.Reason)
 		}
 		if p.Waiting > 0 {
 			state += fmt.Sprintf(", %d waiting for cores", p.Waiting)
 		}
-		fmt.Fprintf(&b, "  %-*s  %s\n", width, clean(p.Repo), state)
+		fmt.Fprintf(&b, "  %-*s  %s\n", width, name(p), state)
 		for _, j := range p.Stuck {
 			fmt.Fprintf(&b, "    queued %s: %s %s\n", time.Duration(j.QueuedS)*time.Second, clean(j.Job), clean(j.RunURL))
 		}

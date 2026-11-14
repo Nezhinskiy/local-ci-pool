@@ -194,6 +194,21 @@ func TestHeartbeatWritesOncePerHealthyProjectPerTick(t *testing.T) {
 	}
 }
 
+// A healthy docker class advertises nothing: the routing action sends only the
+// <identity>-local jobs here, and its container class is down.
+func TestHeartbeatSkipsTheDockerClass(t *testing.T) {
+	docker := project("example/alpha", true)
+	docker.DockerClass = true
+	snap := &fakeSnap{snap: snapshot(2, project("example/alpha", false), docker, project("example/beta", true))}
+	vars := &fakeVars{}
+	stop := start(t, Config{Every: time.Hour, Snapshot: snap.get, Vars: vars})
+	waitFor(t, "the first beat", func() bool { return len(vars.all()) >= 1 })
+	stop()
+	if got := vars.all(); len(got) != 1 || got[0].repo != "example/beta" {
+		t.Fatalf("writes = %+v, want example/beta's alone", got)
+	}
+}
+
 func TestHeartbeatSilentWhenDockerDownOrProbe(t *testing.T) {
 	for name, mutate := range map[string]func(*supervisor.Snapshot){
 		"docker down": func(s *supervisor.Snapshot) { s.Docker = false },

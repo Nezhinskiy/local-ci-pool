@@ -27,9 +27,9 @@ type Marker struct {
 	Image      string
 	Dockerfile string
 	Inputs     []string
-	// Docker opts the repository into the docker class (planned; nothing acts
-	// on it yet): jobs labelled <identity>-docker, each in a throwaway Linux VM
-	// with its own Docker daemon. Nil when the marker has no "docker" block.
+	// Docker opts the repository into the docker class: jobs labelled
+	// <identity>-docker, each in a throwaway Linux VM with its own Docker
+	// daemon. Nil when the marker has no "docker" block.
 	Docker *DockerVM
 }
 
@@ -204,7 +204,10 @@ type Project struct {
 	Identity string
 	Repo     string // owner/name
 	Ref      string // the ref the marker was read at
-	Marker   Marker
+	// DefaultBranch is the repository's default branch: the only ref the docker class's base is built from,
+	// whatever Ref is (docs/docker-class.md).
+	DefaultBranch string
+	Marker        Marker
 }
 
 // Source is what discovery needs from GitHub. *github.Client satisfies it.
@@ -217,7 +220,7 @@ type Source interface {
 // Options narrow discovery for probe mode.
 type Options struct {
 	OnlyRepo  string // owner/name; consider this repository only
-	MarkerRef string // read the marker at this ref instead of the default branch
+	MarkerRef string // read the marker at this branch instead of the default branch
 }
 
 // Result is one discovery pass. Projects are the repositories to serve.
@@ -315,7 +318,7 @@ func Discover(ctx context.Context, src Source, opt Options, log *slog.Logger) (R
 			continue
 		}
 		seen[id] = r.FullName
-		res.Projects = append(res.Projects, Project{Identity: id, Repo: r.FullName, Ref: ref, Marker: marker})
+		res.Projects = append(res.Projects, Project{Identity: id, Repo: r.FullName, Ref: ref, DefaultBranch: cur.DefaultBranch, Marker: marker})
 	}
 	if opt.OnlyRepo != "" && !only {
 		log.Warn("skipping repository: not among the private repositories this account owns", "repo", opt.OnlyRepo)

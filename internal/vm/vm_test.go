@@ -6,11 +6,17 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// errKilled is what exec.CommandContext's Wait returns for a process its context killed: an exit
+// error, never the context's own error.
+var errKilled = errors.New("signal: killed")
 
 type call struct {
 	args   string
@@ -29,6 +35,8 @@ type fakeLima struct {
 	hold  chan struct{}
 	// noEngine makes the base report no Docker Engine version.
 	noEngine bool
+	// holdDelete makes a delete wait until its context ends.
+	holdDelete bool
 }
 
 func (f *fakeLima) Run(ctx context.Context, stdin io.Reader, args ...string) ([]byte, error) {
@@ -38,6 +46,9 @@ func (f *fakeLima) Run(ctx context.Context, stdin io.Reader, args ...string) ([]
 		in = string(b)
 	}
 	joined := strings.Join(args, " ")
+	if f.holdDelete && args[0] == "delete" {
+		<-ctx.Done()
+	}
 	if f.hold != nil && strings.Contains(joined, "entrypoint.sh") {
 		select {
 		case <-f.hold:
@@ -48,7 +59,7 @@ func (f *fakeLima) Run(ctx context.Context, stdin io.Reader, args ...string) ([]
 	f.calls = append(f.calls, call{joined, in, ctx.Err()})
 	f.mu.Unlock()
 	if ctx.Err() != nil {
-		return nil, ctx.Err()
+		return nil, errKilled // as os/exec reports a process its context killed
 	}
 	for k, err := range f.fail {
 		if strings.HasPrefix(joined, k) {
@@ -92,7 +103,7 @@ func backend(f Lima, free float64) *Backend {
 
 const (
 	base     = "local-ci-docker-base-main-alpha"
-	building = "local-ci-docker-building-main-alpha"
+	building = "local-ci-docker-new-main-alpha"
 	old      = "local-ci-docker-old-main-alpha"
 	job      = "local-ci-docker-job-main-local-ci-0123456789ab"
 )
@@ -174,14 +185,16 @@ func TestAFailedSwapPutsTheOldBaseBack(t *testing.T) {
 		t.Fatal("a failed rename must fail the build")
 	}
 	got := f.argsList()
-	if tail := strings.Join(got[len(got)-2:], "\n"); tail != "rename "+old+" "+base+"\nprotect "+base {
-		t.Fatalf("the old base was not put back and protected:\n%s", strings.Join(got, "\n"))
+	if tail := strings.Join(got[len(got)-3:], "\n"); tail != "rename "+old+" "+base+"\nprotect "+base+"\ndelete --force "+building {
+		t.Fatalf("the old base was not put back and protected, or the build not deleted:\n%s", strings.Join(got, "\n"))
 	}
-	for _, c := range got[12:] {
+	at := slices.Index(got, "rename "+building+" "+base)
+	for _, c := range got[at:] {
 		if c == "delete --force "+old {
 			t.Fatalf("the old base was deleted after the failed swap: %v", got)
 		}
 	}
+
 }
 
 // cancelAfter cancels the build's context right after the call starting with after.
@@ -236,7 +249,8 @@ func TestBuildBaseRefusesWhatCouldEscapeOrCollide(t *testing.T) {
 func TestBuildBaseRefusesOnAShortDisk(t *testing.T) {
 	f := &fakeLima{}
 	_, err := backend(f, 9).BuildBase(context.Background(), "alpha", strings.NewReader(""), strings.NewReader(""), "p.sh")
-	if !errors.Is(err, ErrDiskShort) || len(f.calls) != 0 {
+	// Only the leftover build is deleted first, so a leak cannot block the rebuild that clears it.
+	if got := f.argsList(); !errors.Is(err, ErrDiskShort) || len(got) != 1 || got[0] != "delete --force "+building {
 		t.Fatalf("err %v, calls %v", err, f.argsList())
 	}
 }
@@ -380,7 +394,7 @@ func TestSweepKeepsToItsInstanceAndResolvesAnInterruptedSwap(t *testing.T) {
 	f := &fakeLima{list: `{"name":"local-ci-docker-base-main-alpha"}
 {"name":"local-ci-docker-job-main-local-ci-aa"}
 {"name":"local-ci-docker-job-probe-x-local-ci-bb"}
-{"name":"local-ci-docker-building-main-beta"}
+{"name":"local-ci-docker-new-main-beta"}
 {"name":"local-ci-docker-old-main-alpha"}
 {"name":"local-ci-docker-old-main-gamma"}
 {"name":"default"}
@@ -389,7 +403,7 @@ func TestSweepKeepsToItsInstanceAndResolvesAnInterruptedSwap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]bool{"local-ci-docker-job-main-local-ci-aa": true, "local-ci-docker-building-main-beta": true, "local-ci-docker-old-main-alpha": true}
+	want := map[string]bool{"local-ci-docker-job-main-local-ci-aa": true, "local-ci-docker-new-main-beta": true, "local-ci-docker-old-main-alpha": true}
 	if len(deleted) != len(want) {
 		t.Fatalf("deleted %v", deleted)
 	}
@@ -401,10 +415,47 @@ func TestSweepKeepsToItsInstanceAndResolvesAnInterruptedSwap(t *testing.T) {
 	if _, ok := f.find("rename local-ci-docker-old-main-gamma local-ci-docker-base-main-gamma"); !ok {
 		t.Fatalf("an old base with no base in place must be put back: %v", f.argsList())
 	}
+	if _, ok := f.find("protect local-ci-docker-base-main-gamma"); !ok {
+		t.Fatalf("a base put back must be protected: %v", f.argsList())
+	}
+	if _, ok := f.find("protect local-ci-docker-base-main-alpha"); !ok {
+		t.Fatalf("every base of the instance is protected again: %v", f.argsList())
+	}
 	for _, c := range f.argsList() {
 		if strings.Contains(c, "probe-x") || strings.Contains(c, "default") || c == "delete --force local-ci-docker-base-main-alpha" {
 			t.Fatalf("swept outside this instance's leftovers: %q", c)
 		}
+	}
+}
+
+func TestFreeGiBAtMeasuresAMissingDirAtItsParent(t *testing.T) {
+	gib, err := FreeGiBAt(filepath.Join(t.TempDir(), "not", "yet"))()
+	if err != nil || gib <= 0 {
+		t.Fatalf("free %v GiB, err %v", gib, err)
+	}
+}
+
+func TestHomeFollowsLimaHome(t *testing.T) {
+	t.Setenv("LIMA_HOME", "/elsewhere/lima")
+	if h := Home("/Users/x"); h != "/elsewhere/lima" {
+		t.Fatalf("home %q", h)
+	}
+	t.Setenv("LIMA_HOME", "")
+	if h := Home("/Users/x"); h != "/Users/x/.lima" {
+		t.Fatalf("home %q", h)
+	}
+}
+
+func TestSweepReportsACloneItCannotDelete(t *testing.T) {
+	f := &fakeLima{list: `{"name":"local-ci-docker-job-main-local-ci-aa"}
+{"name":"local-ci-docker-job-main-local-ci-bb"}
+`, fail: map[string]error{"delete --force local-ci-docker-job-main-local-ci-aa": errors.New("boom")}}
+	deleted, err := backend(f, 50).Sweep(context.Background())
+	if !errors.Is(err, ErrDeleteFailed) || !strings.Contains(err.Error(), "local-ci-aa") {
+		t.Fatalf("err %v, want ErrDeleteFailed naming the clone", err)
+	}
+	if len(deleted) != 1 || deleted[0] != "local-ci-docker-job-main-local-ci-bb" {
+		t.Fatalf("deleted %v, want the other clone still deleted", deleted)
 	}
 }
 
@@ -440,6 +491,125 @@ func TestABaseWithNoEngineVersionFailsAndKeepsTheOldOne(t *testing.T) {
 	for _, c := range f.argsList() {
 		if strings.Contains(c, base) {
 			t.Fatalf("the old base was touched: %q", c)
+		}
+	}
+}
+
+func TestAFailedSetAsideKeepsTheOldBaseProtected(t *testing.T) {
+	for _, step := range []string{"unprotect " + base, "rename " + base} {
+		f := &fakeLima{list: `{"name":"` + base + `"}`, fail: map[string]error{step: errors.New("boom")}}
+		if err := build(t, f); err == nil {
+			t.Fatalf("%s: a failed set-aside must fail the build", step)
+		}
+		got := f.argsList()
+		if slices.Contains(got, "rename "+building+" "+base) {
+			t.Fatalf("%s: the build was renamed in over a base still in place: %v", step, got)
+		}
+		if step != "unprotect "+base && !slices.Contains(got, "protect "+base) {
+			t.Fatalf("%s: the old base was left unprotected: %v", step, got)
+		}
+		if got[len(got)-1] != "delete --force "+building {
+			t.Fatalf("%s: the build was not deleted: %v", step, got)
+		}
+	}
+}
+
+func TestAFailedFinalProtectStillServesTheNewBase(t *testing.T) {
+	var logs bytes.Buffer
+	f := &fakeLima{list: `{"name":"` + base + `"}`, fail: map[string]error{"protect " + base: errors.New("boom")}}
+	b := backend(f, 50)
+	b.Log = slog.New(slog.NewTextHandler(&logs, nil))
+	if _, err := b.BuildBase(context.Background(), "alpha", strings.NewReader(""), strings.NewReader(""), "p.sh"); err != nil {
+		t.Fatalf("the new base serves: a failed protect is no failed build: %v", err)
+	}
+	if got := f.argsList(); got[len(got)-1] != "delete --force "+old || !strings.Contains(logs.String(), "protecting a docker base failed") {
+		t.Fatalf("the old base must still go, and the failure be logged: %v %q", got, logs.String())
+	}
+}
+
+func TestCleanupAfterACancelRunsOnALiveContext(t *testing.T) {
+	f := &fakeLima{}
+	ctx, cancel := context.WithCancel(context.Background())
+	b := backend(cancelAfter{f, "start --tty=false " + building, cancel}, 50)
+	if _, err := b.BuildBase(ctx, "alpha", strings.NewReader(""), strings.NewReader(""), "p.sh"); err == nil {
+		t.Fatal("a build cancelled half-way must fail")
+	}
+	f.mu.Lock()
+	last := f.calls[len(f.calls)-1]
+	f.mu.Unlock()
+	if last.args != "delete --force "+building || last.ctxErr != nil {
+		t.Fatalf("the half-built base was not deleted on a live context: %+v", last)
+	}
+	f2 := &fakeLima{}
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	if err := backend(cancelAfter{f2, "clone", cancel2}, 50).Launch(ctx2, "alpha", "r", "JIT", func(error) {}); err == nil {
+		t.Fatal("a launch cancelled after its clone must fail")
+	}
+	if c, _ := f2.find("delete --force local-ci-docker-job-main-r"); c.args == "" || c.ctxErr != nil {
+		t.Fatalf("the clone was not deleted on a live context: %+v", c)
+	}
+}
+
+func TestADeleteIsBounded(t *testing.T) {
+	f := &fakeLima{holdDelete: true}
+	b := backend(f, 50)
+	b.DeleteTimeout = 100 * time.Millisecond
+	start := time.Now()
+	if err := b.Remove(context.Background(), "r"); err == nil || time.Since(start) > 2*time.Second {
+		t.Fatalf("a hung delete must end at its timeout: %v after %v", err, time.Since(start))
+	}
+}
+
+func TestTheDiskThresholdIsInclusive(t *testing.T) {
+	f := &fakeLima{}
+	if err := backend(f, 15).Launch(context.Background(), "alpha", "r", "JIT", func(error) {}); err != nil {
+		t.Fatalf("exactly MinFreeGiB free must pass: %v", err)
+	}
+}
+
+func TestTheInstanceIsValidated(t *testing.T) {
+	b := backend(&fakeLima{}, 50)
+	for _, inst := range []string{"Main", "a_b", ""} {
+		b.Instance = inst
+		if _, err := b.BaseName("alpha"); err == nil {
+			t.Fatalf("instance %q accepted", inst)
+		}
+	}
+}
+
+func TestTheJobsOutputIsBounded(t *testing.T) {
+	c, tl := &capped{max: 8}, &tail{max: 8}
+	for range 1000 {
+		_, _ = c.Write([]byte("0123456789"))
+		_, _ = tl.Write([]byte("0123456789"))
+	}
+	if string(c.b) != "01234567" || string(tl.b) != "23456789" {
+		t.Fatalf("head %q, tail %q", c.b, tl.b)
+	}
+}
+
+func TestAnUndeletableCloneIsErrDeleteFailed(t *testing.T) {
+	f := &fakeLima{fail: map[string]error{"delete": errors.New("delete hung")}}
+	done := make(chan error, 1)
+	if err := backend(f, 50).Launch(context.Background(), "alpha", "local-ci-0123456789ab", "JIT", func(err error) { done <- err }); err != nil {
+		t.Fatal(err)
+	}
+	if err := wait(t, done); !errors.Is(err, ErrDeleteFailed) {
+		t.Fatalf("done got %v, want ErrDeleteFailed", err)
+	}
+	if n := strings.Count(strings.Join(f.argsList(), "\n"), "delete --force "+job); n != 3 {
+		t.Fatalf("%d delete attempts, want 3", n)
+	}
+	f2 := &fakeLima{fail: map[string]error{"start": errors.New("boom"), "delete": errors.New("delete hung")}}
+	if err := backend(f2, 50).Launch(context.Background(), "alpha", "r", "JIT", func(error) {}); !errors.Is(err, ErrDeleteFailed) {
+		t.Fatalf("a failed boot whose clone stays: %v, want ErrDeleteFailed", err)
+	}
+}
+
+func TestHasBase(t *testing.T) {
+	for list, want := range map[string]bool{`{"name":"` + base + `"}`: true, `{"name":"local-ci-docker-base-main-beta"}`: false, "": false} {
+		if got, err := backend(&fakeLima{list: list}, 50).HasBase(context.Background(), "alpha"); err != nil || got != want {
+			t.Fatalf("list %q: %v, %v; want %v", list, got, err, want)
 		}
 	}
 }
