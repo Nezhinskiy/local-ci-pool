@@ -21,24 +21,46 @@ import (
 const MarkerPath = ".github/local-ci.json"
 
 // Marker is a parsed .github/local-ci.json. Exactly one form is set: Image, or
-// Dockerfile together with Inputs.
+// Dockerfile together with Inputs. Docker is optional and independent of the
+// form.
 type Marker struct {
 	Image      string
 	Dockerfile string
 	Inputs     []string
+	// Docker opts the repository into the docker class (planned; nothing acts
+	// on it yet): jobs labelled <identity>-docker, each in a throwaway Linux VM
+	// with its own Docker daemon. Nil when the marker has no "docker" block.
+	Docker *DockerVM
+}
+
+// DockerVM is the marker's "docker" block. Planned, nothing acts on it yet:
+// the pool builds the class's base VM from the default branch only, running
+// Provision (a script inside Inputs) as root in it, and rebuilds the base when
+// Inputs change on the default branch, or when the pool's pinned Linux image,
+// Docker Engine or actions/runner release changes.
+type DockerVM struct {
+	Provision string
+	Inputs    []string
 }
 
 type rawMarker struct {
-	Image      *string   `json:"image"`
-	Dockerfile *string   `json:"dockerfile"`
-	Inputs     *[]string `json:"inputs"`
+	Image      *string      `json:"image"`
+	Dockerfile *string      `json:"dockerfile"`
+	Inputs     *[]string    `json:"inputs"`
+	Docker     *rawDockerVM `json:"docker"`
+}
+
+type rawDockerVM struct {
+	Provision *string   `json:"provision"`
+	Inputs    *[]string `json:"inputs"`
 }
 
 var imageRE = regexp.MustCompile(`^[^\s@]+@sha256:[0-9a-f]{64}$`)
 
 // ParseMarker validates a marker. Unknown fields, both forms at once, an image
 // without a digest, bad input paths and a Dockerfile outside the inputs are
-// errors.
+// errors, and so is a docker block without a provision script inside its own
+// inputs.
 func ParseMarker(b []byte) (Marker, error) {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
@@ -50,6 +72,10 @@ func ParseMarker(b []byte) (Marker, error) {
 		return Marker{}, errors.New("marker has trailing data after the JSON object")
 	}
 
+	docker, err := parseDockerVM(raw.Docker)
+	if err != nil {
+		return Marker{}, err
+	}
 	imageForm := raw.Image != nil
 	dockerForm := raw.Dockerfile != nil || raw.Inputs != nil
 	switch {
@@ -62,30 +88,69 @@ func ParseMarker(b []byte) (Marker, error) {
 			}
 			return Marker{}, fmt.Errorf("marker image %q must be pinned by digest as name@sha256:<64 hex>", *raw.Image)
 		}
-		return Marker{Image: *raw.Image}, nil
+		return Marker{Image: *raw.Image, Docker: docker}, nil
 	}
 
 	if raw.Dockerfile == nil || raw.Inputs == nil || len(*raw.Inputs) == 0 {
 		return Marker{}, errors.New("marker dockerfile form needs a dockerfile and a non-empty inputs list")
 	}
-	inputs := make([]string, 0, len(*raw.Inputs))
-	for _, in := range *raw.Inputs {
-		clean, err := CleanRepoPath(in)
-		if err != nil {
-			return Marker{}, fmt.Errorf("marker input %q: %w", in, err)
-		}
-		inputs = append(inputs, clean)
+	inputs, err := cleanInputs("marker input", *raw.Inputs)
+	if err != nil {
+		return Marker{}, err
 	}
 	dockerfile, err := CleanRepoPath(*raw.Dockerfile)
 	if err != nil {
 		return Marker{}, fmt.Errorf("marker dockerfile %q: %w", *raw.Dockerfile, err)
 	}
+	if !inside(dockerfile, inputs) {
+		return Marker{}, fmt.Errorf("marker dockerfile %q does not lie inside any of its inputs", dockerfile)
+	}
+	return Marker{Dockerfile: dockerfile, Inputs: inputs, Docker: docker}, nil
+}
+
+// parseDockerVM validates the optional docker block: a provision script and a
+// non-empty inputs list, every path plain and relative, the script inside the
+// inputs (the base is rebuilt when they change, so the script must be one of them).
+func parseDockerVM(raw *rawDockerVM) (*DockerVM, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	if raw.Provision == nil || raw.Inputs == nil || len(*raw.Inputs) == 0 {
+		return nil, errors.New("marker docker block needs a provision script and a non-empty inputs list")
+	}
+	inputs, err := cleanInputs("marker docker input", *raw.Inputs)
+	if err != nil {
+		return nil, err
+	}
+	provision, err := CleanRepoPath(*raw.Provision)
+	if err != nil {
+		return nil, fmt.Errorf("marker docker provision %q: %w", *raw.Provision, err)
+	}
+	if !inside(provision, inputs) {
+		return nil, fmt.Errorf("marker docker provision %q does not lie inside any of its inputs", provision)
+	}
+	return &DockerVM{Provision: provision, Inputs: inputs}, nil
+}
+
+func cleanInputs(what string, raw []string) ([]string, error) {
+	inputs := make([]string, 0, len(raw))
+	for _, in := range raw {
+		clean, err := CleanRepoPath(in)
+		if err != nil {
+			return nil, fmt.Errorf("%s %q: %w", what, in, err)
+		}
+		inputs = append(inputs, clean)
+	}
+	return inputs, nil
+}
+
+func inside(file string, inputs []string) bool {
 	for _, in := range inputs {
-		if in == "." || dockerfile == in || strings.HasPrefix(dockerfile, in+"/") {
-			return Marker{Dockerfile: dockerfile, Inputs: inputs}, nil
+		if in == "." || file == in || strings.HasPrefix(file, in+"/") {
+			return true
 		}
 	}
-	return Marker{}, fmt.Errorf("marker dockerfile %q does not lie inside any of its inputs", dockerfile)
+	return false
 }
 
 // CleanRepoPath accepts a relative path inside the repository and returns it
