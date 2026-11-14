@@ -220,7 +220,7 @@ type Source interface {
 // Options narrow discovery for probe mode.
 type Options struct {
 	OnlyRepo  string // owner/name; consider this repository only
-	MarkerRef string // read the marker at this ref instead of the default branch
+	MarkerRef string // read the marker at this branch instead of the default branch
 }
 
 // Result is one discovery pass. Projects are the repositories to serve.

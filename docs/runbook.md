@@ -306,8 +306,10 @@ A repository whose marker has a `docker` block ([docs/docker-class.md](docker-cl
 project, `<identity>-docker`, whose jobs each run in a throwaway Lima VM with a Docker daemon of their own.
 What you see and do:
 
-- **Install Lima** on every Mac that should take such jobs: `brew install lima`. Without it the class is
-  unhealthy with `docker class: limactl not found`; the repository's container jobs are served as ever.
+- **Install Lima** on every Mac that should take such jobs: `brew install lima`. A Mac without it takes no
+  docker jobs and registers no `<identity>-docker` scale set; that is no fault. Its entry stays healthy with
+  `"not_installed": true` (`pool status`: `not installed (no limactl)`), and the repository's container jobs
+  are served as ever. Install Lima later and the next discovery pass serves the class.
   Upgrade the pool on every Mac before a repository commits the block: an older pool refuses the marker.
 - **The first base build** takes several minutes (about five, with the template's image download) and
   9.4 GiB of disk. `pool status` shows the class as `<owner>/<repo> (docker)`, `starting` until the base
@@ -316,12 +318,13 @@ What you see and do:
 - **Disk:** the pool starts no VM while the volume of `$LIMA_HOME` (else `~/.lima`) has less than 15 GiB free; the job stays
   queued, and the class shows `docker vm: not enough free disk for a docker VM: … GiB free, needs 15`.
   Free the space; the next poll starts it. Clones a killed pool left are deleted at its next start.
-- **Reasons in `/healthz`** for the entry with `"docker_class": true`: `docker class: limactl not found`
-  (class `setup`); `docker base: …` (class `setup` while there is no base yet, `image` when a rebuild
+- **Reasons in `/healthz`** for the entry with `"docker_class": true`: `docker base: …` (class `setup` while there is no base yet, `image` when a rebuild
   failed and the old base still serves); `docker vm: …` (class `vm`, the last VM launch failed; cleared by
   the next one that succeeds). One reason does not clear: a docker VM the pool could not delete (after a job,
   a failed boot, or in the start-up sweep) may still run, so the pool starts no docker VM and builds no base
-  until it restarts. Check `limactl list`, delete the VM by hand, then restart the pool.
+  until it restarts; a drain's failed delete counts too. The runner of such a VM stays in use until then, so
+  the Mac is kept awake, and the restart's drain waits for it up to its bound. Check `limactl list`, delete
+  the VM by hand, then restart the pool.
 - **Rebuilding the base by hand:** delete
   `~/Library/Application Support/local-ci-pool/docker-base-<identity>.key`; the next discovery pass (or a
   restart) builds it again. The base itself, `local-ci-docker-base-main-<identity>`, is protected in Lima.
@@ -383,7 +386,7 @@ The fields:
 | `login` | `false` while the last read of the token from `gh` failed (see [Install](#install)); `/healthz` answers 503 then too |
 | `probe` | whether this is a probe run |
 | `budget` | the core budget: `state`, an `error` class when there is one, and `oldest_wait_s` (see [CI is waiting](#ci-is-waiting)) |
-| `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, a `reason` and its `class` (`starting`, `draining`, `setup`, `down`, `image`, `preflight`, `vm` or `runners`) when not healthy, `docker_class` on [the docker class](#the-docker-class)'s entry, the budget's `waiting` and `admitted` counts, and `stuck` when a job is queued that GitHub does not offer the pool (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)) |
+| `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, a `reason` and its `class` (`starting`, `draining`, `setup`, `down`, `image`, `preflight`, `vm` or `runners`) when not healthy, `docker_class` on [the docker class](#the-docker-class)'s entry and `not_installed` on such an entry on a Mac without Lima (healthy: it takes no docker jobs), the budget's `waiting` and `admitted` counts, and `stuck` when a job is queued that GitHub does not offer the pool (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)) |
 | `redacted` | `true` on the body served without the token; absent otherwise |
 
 `pool status` reads the same endpoint and prints it as text (see [CI went hosted](#ci-went-hosted)).

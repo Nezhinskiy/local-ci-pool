@@ -49,18 +49,22 @@ type project struct {
 	// mountErr: the newest runner failed the preflight with img, so the
 	// project's runners stay on the older mount.
 	mountErr string
-	// launchErr: the docker class's last VM launch failed.
-	launchErr  string
-	up         bool   // a listener runs on an open session
-	reason     string // why the project is not up
-	failed     bool   // setup failed; the next discovery pass starts it again
-	draining   bool
-	refreshing bool
-	client     ScaleSets
-	gen        int // the token generation client was built with
-	scaleSetID int
-	scaler     *runner.Scaler
-	listener   *listener.Listener
+	// launchErr: the docker class's last VM launch failed; diskShort: it
+	// failed for the free disk, which health clears once the disk recovers.
+	// notInstalled: the docker class's setup found no limactl.
+	launchErr    string
+	diskShort    bool
+	notInstalled bool
+	up           bool   // a listener runs on an open session
+	reason       string // why the project is not up
+	failed       bool   // setup failed; the next discovery pass starts it again
+	draining     bool
+	refreshing   bool
+	client       ScaleSets
+	gen          int // the token generation client was built with
+	scaleSetID   int
+	scaler       *runner.Scaler
+	listener     *listener.Listener
 	// session is open, and this process opened it. Only a scale set this
 	// process holds a session on is ever deleted: the service deletes a
 	// scale set even while another process holds its session.
@@ -146,9 +150,14 @@ func (pr *project) run() {
 			pr.s.fail(err)
 			return
 		}
-		pr.log.Error("the project cannot be served", "error", err.Error())
+		if errors.Is(err, errNotInstalled) {
+			pr.log.Debug("the docker class is not installed here", "error", err.Error())
+		} else {
+			pr.log.Error("the project cannot be served", "error", err.Error())
+		}
 		pr.mu.Lock()
 		pr.failed, pr.reason = true, err.Error()
+		pr.notInstalled = errors.Is(err, errNotInstalled)
 		pr.mu.Unlock()
 		return
 	}
@@ -831,6 +840,12 @@ func (pr *project) removeLeft(post context.Context) {
 		ctx, cancel := context.WithTimeout(post, callTimeout)
 		if err := runner.RemoveContainer(ctx, pr.remover, r.Name); err != nil {
 			pr.log.Warn("removing a runner left after the drain", "runner", r.Name, "error", err.Error())
+			if pr.docker {
+				// Its VM may still run: the slot stays held, and the class stops until a restart.
+				pr.s.leakVM(fmt.Errorf("%w: %s: %w", vm.ErrDeleteFailed, r.Name, err))
+				cancel()
+				continue
+			}
 		}
 		// Best effort: GitHub refuses it while it still counts the job as
 		// running, and the scale set delete then leaves the set for the
@@ -952,8 +967,8 @@ func (pr *project) health() ProjectHealth {
 	// A short-disk reason goes as soon as the disk recovers, also with no job
 	// queued to run the vet again. A VM that may still run is the reason until
 	// the pool restarts, also before any job has asked for a VM.
-	if pr.docker && strings.HasPrefix(pr.launchErr, "docker vm: "+vm.ErrDiskShort.Error()) && pr.s.deps.VM.DiskOK() == nil {
-		pr.launchErr = ""
+	if pr.diskShort && pr.s.deps.VM.DiskOK() == nil {
+		pr.launchErr, pr.diskShort = "", false
 	}
 	if leak != nil {
 		pr.launchErr = "docker vm: " + leak.Error()
@@ -964,6 +979,8 @@ func (pr *project) health() ProjectHealth {
 		h.Reason = notPrivate
 	case pr.draining:
 		h.Reason, h.Class = "draining", "draining"
+	case pr.notInstalled:
+		h.Healthy, h.NotInstalled = true, true // nothing is wrong: this Mac serves no docker jobs
 	case pr.failed:
 		h.Reason, h.Class = pr.reason, "setup"
 	case !pr.up && pr.reason == "starting":

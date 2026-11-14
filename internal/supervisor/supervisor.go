@@ -308,6 +308,9 @@ type ProjectHealth struct {
 	// DockerClass marks the repository's docker-class project
 	// (docs/docker-class.md), which no heartbeat advertises.
 	DockerClass bool `json:"docker_class,omitempty"`
+	// NotInstalled marks a docker-class entry on a Mac without limactl: it
+	// serves no docker jobs, and that is no fault (Healthy stays true).
+	NotInstalled bool `json:"not_installed,omitempty"`
 	// Waiting is the project's runners waiting for the budget.
 	Waiting int `json:"waiting"`
 	// Admitted is the project's runners and survivors that hold an

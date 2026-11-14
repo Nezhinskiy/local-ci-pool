@@ -114,6 +114,9 @@ func formatStatus(s supervisor.Snapshot) string {
 	}
 	for _, p := range s.Projects {
 		state := "healthy"
+		if p.NotInstalled {
+			state = "not installed (no limactl)"
+		}
 		if !p.Healthy {
 			state = "unhealthy: " + clean(p.Reason)
 		}

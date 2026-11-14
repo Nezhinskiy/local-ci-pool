@@ -415,16 +415,17 @@ func TestNoDockerClassInProbeModeOrAtAnotherRef(t *testing.T) {
 	}
 }
 
-// Without limactl the docker class is unhealthy with the reason; the container
-// class is served as ever.
+// Without limactl the docker class is not installed, which is no fault: the
+// entry stays healthy and says so, no docker scale set is registered, and the
+// container class is served as ever.
 func TestDockerClassWithoutLimactl(t *testing.T) {
 	h := newHarness(t, 2, 1000, "alpha")
 	h.withDocker("alpha")
 	h.lima.missing = true
 	h.start()
-	h.eventually("alpha healthy, its docker class not", func() bool {
+	h.eventually("alpha healthy, its docker class not installed", func() bool {
 		p, ok := h.dockerHealth(alphaRepo)
-		return h.healthy(alphaRepo) && ok && p.Class == "setup" && p.Reason == "docker class: limactl not found"
+		return h.healthy(alphaRepo) && ok && p.NotInstalled && p.Healthy && p.Reason == "" && p.Class == ""
 	})
 	if h.actions.ScaleSet(alphaDockerSet) != nil {
 		t.Fatal("a docker scale set without limactl")
@@ -637,10 +638,51 @@ func TestAnUndeletableCloneStopsTheDockerClass(t *testing.T) {
 	if snap := h.sup.Snapshot(); snap.VMInUse != 1 {
 		t.Fatalf("vm_in_use %d after a failed delete, want the slot kept", snap.VMInUse)
 	}
+	if !h.logged("deleting a docker VM failed") {
+		t.Fatal("the VM backend's own warning is not in the pool's log: Deps.VM.Log is not wired")
+	}
 	h.actions.Assign(alphaDockerSet, 1)
 	time.Sleep(300 * time.Millisecond)
 	if n := h.lima.count("clone"); n != 1 {
 		t.Fatalf("%d clones: a second VM booted beside one that may run", n)
+	}
+}
+
+// An unreadable `limactl list` is no reason to rebuild the base: the pass
+// fails, the old base keeps serving, and the next pass looks again.
+func TestAnUnreadableListRebuildsNothing(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.withDocker("alpha")
+	h.start()
+	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	built := h.lima.count("create")
+	h.lima.set(func(f *fakeLima) { f.fail = "list" })
+	h.eventually("the refresh fails", func() bool { p, _ := h.dockerHealth(alphaRepo); return p.Class == "image" })
+	time.Sleep(300 * time.Millisecond)
+	if n := h.lima.count("create"); n != built {
+		t.Fatalf("%d builds after an unreadable list, want %d", n, built)
+	}
+}
+
+// A drain that cannot delete a docker VM keeps its slot and stops the class:
+// the VM may still run.
+func TestADrainsFailedDeleteKeepsTheSlot(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.withDocker("alpha")
+	h.start()
+	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	h.actions.Assign(alphaDockerSet, 1)
+	h.eventually("a VM runs", func() bool { return len(h.lima.running()) == 1 })
+	h.actions.Started(alphaDockerSet, h.lima.running()[0])
+	h.delivered(alphaDockerSet)
+	h.lima.set(func(f *fakeLima) { f.fail = "delete --force " + testJobPrefix })
+	h.gh.edit(func() { h.gh.repos[alphaRepo].private = false })
+	time.Sleep(120 * time.Millisecond) // the cached answer is stale
+	h.actions.Assign(alphaDockerSet, 1)
+	h.eventually("the leak recorded", func() bool { return h.sup.vmLeakErr() != nil })
+	time.Sleep(100 * time.Millisecond)
+	if snap := h.sup.Snapshot(); snap.VMInUse != 1 {
+		t.Fatalf("vm_in_use %d after a drain's failed delete, want the slot kept", snap.VMInUse)
 	}
 }
 

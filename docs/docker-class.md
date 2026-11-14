@@ -34,7 +34,8 @@ before a repository commits the block.**
   is a project of its own in `/healthz` (`"docker_class": true`), with its own visibility checks and
   drain: it leaves no later than the repository's container class would. It writes no heartbeat: the routing action routes `<identity>-local` jobs alone, so
   a workflow names `<identity>-docker` in `runs-on` directly, and such a job waits for the Mac; it never
-  falls back to a hosted runner.
+  falls back to a hosted runner. A Mac without Lima registers no such scale set and reports the class as not installed, which is no
+  fault (`"not_installed": true`, healthy).
 - The pool keeps one base VM per repository (Lima, `vz`). It builds the base **only from the default branch**:
   - Lima's `docker-rootful` template (Ubuntu, with Docker Engine from Docker's install script, so the Engine
     version is not pinned), and the verified actions/runner tarball;

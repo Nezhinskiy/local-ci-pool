@@ -33,6 +33,11 @@ import (
 // container, so the Docker die events and the reconcile never see its runners:
 // a runner's exit is its Launch's done callback.
 
+// errNotInstalled is the docker class's setup on a Mac without limactl: a
+// state of the Mac, not a failure (health's not_installed), tried again on
+// every discovery pass.
+var errNotInstalled = errors.New("docker class: limactl not found")
+
 // dockerKey is the suffix of a docker-class project's key in s.projects.
 const dockerKey = " docker"
 
@@ -58,7 +63,7 @@ func (pr *project) baseKey(ctx context.Context, p discovery.Project, m runnermou
 	}
 	ver, err := b.Lima.Run(ctx, nil, "--version")
 	if errors.Is(err, exec.ErrNotFound) {
-		return "", "", errors.New("docker class: limactl not found")
+		return "", "", errNotInstalled
 	}
 	if err != nil {
 		return "", "", fmt.Errorf("docker class: %w", err)
@@ -103,7 +108,11 @@ func (pr *project) ensureBase(ctx context.Context, p discovery.Project, m runner
 	if old, err := os.ReadFile(path); err == nil && strings.SplitN(string(old), "\n", 2)[0] == key {
 		// The key is trusted only while its base is there: a base deleted by hand, or a wiped ~/.lima,
 		// is built again rather than served.
-		if ok, err := pr.s.deps.VM.HasBase(ctx, pr.identity); err == nil && ok {
+		ok, err := pr.s.deps.VM.HasBase(ctx, pr.identity)
+		if err != nil { // an unreadable list is no reason to rebuild: try again on the next pass
+			return Image{}, fmt.Errorf("docker base: %w", err)
+		}
+		if ok {
 			return img, nil
 		}
 	}
@@ -191,11 +200,8 @@ func (pr *project) startVM(ctx context.Context, name, jit string, _ int) error {
 		}
 		if errors.Is(err, vm.ErrDeleteFailed) {
 			// The clone may still run: its runner keeps the slot, and no docker runner starts
-			// anywhere until a restart's sweep deletes it.
+			// anywhere until a restart's sweep deletes it. health() reports it.
 			pr.s.leakVM(err)
-			pr.mu.Lock()
-			pr.launchErr = "docker vm: " + pr.s.vmLeakErr().Error()
-			pr.mu.Unlock()
 			return
 		}
 		if sc := pr.getScaler(); sc != nil {
@@ -207,7 +213,7 @@ func (pr *project) startVM(ctx context.Context, name, jit string, _ int) error {
 	}
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
-	pr.launchErr = ""
+	pr.launchErr, pr.diskShort = "", errors.Is(err, vm.ErrDiskShort)
 	if err != nil {
 		pr.launchErr = "docker vm: " + err.Error()
 	}
@@ -264,6 +270,7 @@ func (pr *project) vetFor() func(context.Context) error {
 		}
 		pr.mu.Lock()
 		defer pr.mu.Unlock()
+		pr.diskShort = errors.Is(err, vm.ErrDiskShort)
 		if err != nil {
 			pr.launchErr = "docker vm: " + err.Error()
 			return err
