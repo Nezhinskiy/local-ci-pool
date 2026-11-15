@@ -626,18 +626,25 @@ func (c *fakeCaffeinate) state() (starts, stops int, running bool) {
 
 // ---- fake settings ----
 
-// fakeSettings is the cap on jobs the settings file holds (Deps.JobsMax),
-// set by the test while the pool runs.
+// fakeSettings is what the settings file holds (Deps.Settings): the cap on
+// jobs and the docker VMs, set by the test while the pool runs.
 type fakeSettings struct {
 	mu      sync.Mutex
 	max     int
+	vms     int
 	invalid bool
 }
 
-func (f *fakeSettings) jobsMax() (int, bool) {
+func (f *fakeSettings) read() (Settings, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.max, f.invalid
+	return Settings{JobsMax: f.max, DockerVMs: f.vms}, f.invalid
+}
+
+func (f *fakeSettings) setVMs(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.vms = n
 }
 
 func (f *fakeSettings) set(max int, invalid bool) {
@@ -678,7 +685,7 @@ type harness struct {
 	cfg     Config
 	slots   int
 	logs    *syncBuffer
-	// settings is Deps.JobsMax; nil reads no settings file.
+	// settings is Deps.Settings; nil reads no settings file.
 	settings *fakeSettings
 	// hostMem is the Mac's memory Deps.HostMem reports; 0 leaves HostMem nil.
 	hostMem int64
@@ -845,7 +852,7 @@ func (h *harness) deps() Deps {
 		},
 		Caffeinate: h.caff.start,
 		Serve:      h.serve,
-		JobsMax:    h.jobsMax(),
+		Settings:   h.settingsDep(),
 		HostMem:    h.hostMemDep(),
 		VM:         h.vmBackend(),
 		Mirror:     h.mirrorDep(),
@@ -871,12 +878,12 @@ func (h *harness) hostMemDep() func() (int64, error) {
 	return func() (int64, error) { return mem, nil }
 }
 
-// jobsMax is Deps.JobsMax: the fake settings' read, or nil without them.
-func (h *harness) jobsMax() func() (int, bool) {
+// settingsDep is Deps.Settings: the fake settings' read, or nil without them.
+func (h *harness) settingsDep() func() (Settings, bool) {
 	if h.settings == nil {
 		return nil
 	}
-	return h.settings.jobsMax
+	return h.settings.read
 }
 
 // wait returns Run's result, failing the test if it does not return in time.

@@ -111,6 +111,44 @@ func TestJobsMax(t *testing.T) {
 	checkLoad(t, f, Settings{JobsMax: 3}, false)
 }
 
+func TestDockerVMs(t *testing.T) {
+	for n := 1; n <= MaxDockerVMs; n++ {
+		p := filepath.Join(t.TempDir(), "config.toml")
+		write(t, p, fmt.Sprintf("[jobs]\nmax = 5\n\n[docker]\nvms = %d\n", n))
+		f, _ := fileAt(p)
+		checkLoad(t, f, Settings{JobsMax: 5, DockerVMs: n}, false)
+	}
+	p := filepath.Join(t.TempDir(), "config.toml")
+	write(t, p, "[docker]\n")
+	f, _ := fileAt(p)
+	checkLoad(t, f, Settings{}, false)
+}
+
+// A vms outside 1 to MaxDockerVMs is invalid, and so is any other key under
+// [docker] or a [docker] in another case.
+func TestDockerVMsInvalid(t *testing.T) {
+	for _, body := range []string{
+		"[docker]\nvms = 0\n",
+		"[docker]\nvms = -1\n",
+		"[docker]\nvms = 5\n",
+		"[docker]\nvms = 1.5\n",
+		"[docker]\nvms = \"2\"\n",
+		"[docker]\nvms = 2\nmax = 1\n",
+		"[docker]\nVMs = 2\n",
+		"[Docker]\nvms = 2\n",
+		"Docker.vms = 2\n",
+		"[docker]\nvms = 2\n[jobs]\nvms = 2\n",
+	} {
+		p := filepath.Join(t.TempDir(), "config.toml")
+		write(t, p, body)
+		f, _ := fileAt(p)
+		got, invalid := f.Load()
+		if got != (Settings{}) || !invalid {
+			t.Errorf("%q: Load() = %+v, invalid %v; want nothing set, invalid", body, got, invalid)
+		}
+	}
+}
+
 func TestNoCapForms(t *testing.T) {
 	for _, body := range []string{"", "[other]\nx = 1\n", "[jobs]\n", "[Other]\nmax = 1\n"} {
 		p := filepath.Join(t.TempDir(), "config.toml")

@@ -377,7 +377,7 @@ The fields:
 | `version`, `commit` | the running build |
 | `machine` | the machine name |
 | `slots`, `in_use`, `busy` | the slot limit, after the cap on jobs; slots held by runners, including runners a killed previous run left running; runners known to be running a job, which excludes those left running |
-| `vm_in_use` | the docker class's one VM slot in use: 0 or 1 ([docs/docker-class.md](docker-class.md)) |
+| `vm_slots`, `vm_in_use` | the docker class's VM slots, `[docker] vms` (1 unless set) after the cap on jobs, and those in use ([docs/docker-class.md](docker-class.md)) |
 | `docker` | whether Docker answers |
 | `login` | `false` while the last read of the token from `gh` failed (see [Install](#install)); `/healthz` answers 503 then too |
 | `probe` | whether this is a probe run |
@@ -484,7 +484,8 @@ fresh heartbeat, so the question is why this one did not.
 
 The pool runs as many container jobs at once as it has slots (see [Changing slots](#changing-slots)),
 and one docker VM beside them. To run fewer, for example to leave the Mac room for local builds, set
-a cap in the settings file. Without the file the pool runs as it always has.
+a cap in the settings file; to run more docker VMs, set `[docker] vms`. Without the file the pool runs
+as it always has.
 
 Every container job the pool starts is held to its share of the Docker VM's CPUs: the VM's CPUs divided
 by the jobs that can run at once (the cap, never more than the slots; the slots without a cap), at least
@@ -530,11 +531,14 @@ never shows the path. The installer never writes the file; it warns when its own
 names another directory that holds one, which the installed pool does not read, and `--uninstall`
 leaves the file and prints its path.
 
-**The key.** One table, `[jobs]`, with one key:
+**The keys.** Two tables, `[jobs]` and `[docker]`, with one key each:
 
 ```toml
 [jobs]
 max = 4
+
+[docker]
+vms = 2
 ```
 
 `max` is the most jobs the pool runs at once on the Mac, container jobs and docker VMs together (a
@@ -545,16 +549,23 @@ container jobs run beside a docker job. `/healthz` shows the capped slots as `sl
 capped slots. Key names are case-sensitive: `Max = 4` is an unknown key and makes the file invalid,
 and so does a table spelled `[Jobs]`. Other tables are ignored.
 
+`vms` is the most [docker-class](docker-class.md) VMs that run at once on the Mac, base builds
+included: a whole number from 1 to 4, 1 without it. Each VM keeps its own 4 CPUs and 6 GiB of the
+Mac, outside Docker Desktop, so leave the Mac room for them. The VMs still count against `max`: with
+`max = 4` and `vms = 2`, two docker jobs leave two container slots. `/healthz` shows the VM slots,
+after the cap, as `vm_slots`. Like `max`, `Vms = 2` and `[Docker]` make the file invalid.
+
 **Edits apply without a restart.** The pool reads the file at start and every 30 seconds after. A
-raised cap starts the jobs that waited for it; a lowered one stops no running job, and starts none
-until enough have ended. Save the file by replacing it in one step: write a temporary file in the
+raised cap or `vms` starts the jobs that waited for it; a lowered one stops no running job or VM, and
+starts none until enough have ended. Save the file by replacing it in one step: write a temporary file in the
 same directory, then rename it over `config.toml`. A half-written file can read as invalid, and a
 file briefly absent removes the cap.
 
 **An invalid file** is one that is not a regular file (a directory, a FIFO), is larger than 64 KiB,
 cannot be read, has more than 64 dots, braces and brackets outside its comments and strings (a
 bound on nesting, which the TOML decoder's cost grows with), is not valid TOML, has another key
-under `[jobs]`, or a `max` that is not a whole number of at least 1 (`0`, `2.5`, `"4"`). The last
+under `[jobs]` or `[docker]`, a `max` that is not a whole number of at least 1 (`0`, `2.5`, `"4"`), or
+a `vms` that is not a whole number from 1 to 4. The last
 valid cap stays in force (none, when the file has been invalid since the start), `/healthz` shows
 `jobs.error = "config"`, `pool status` adds `config invalid`, and `pool.log` warns
 `config invalid; keeping the last valid settings` with the error, once per new error. The pool never

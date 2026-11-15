@@ -50,6 +50,19 @@ type fakeLima struct {
 	jobs     map[string]chan error // running job clones, by clone name
 	made     map[string]bool       // instances made by create, clone and rename, not yet deleted
 	version  string                // what --version prints; "" for 2.3.0
+	hold     string                // the first call whose arguments start with it waits for release
+	released chan struct{}         // closed to let the held call go on
+	held     chan struct{}         // closed once the held call waits
+}
+
+// holdOnce makes the next call starting with prefix wait until the returned
+// release is called, and returns a channel closed once that call waits.
+func (f *fakeLima) holdOnce(prefix string) (held <-chan struct{}, release func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hold, f.released, f.held = prefix, make(chan struct{}), make(chan struct{})
+	ch := f.released
+	return f.held, sync.OnceFunc(func() { close(ch) })
 }
 
 func newFakeLima() *fakeLima {
@@ -69,6 +82,18 @@ func (f *fakeLima) Run(ctx context.Context, stdin io.Reader, args ...string) ([]
 	if f.missing {
 		f.mu.Unlock()
 		return nil, &exec.Error{Name: "limactl", Err: exec.ErrNotFound}
+	}
+	if f.hold != "" && strings.HasPrefix(joined, f.hold) {
+		f.hold = ""
+		released := f.released
+		close(f.held)
+		f.mu.Unlock()
+		select {
+		case <-released:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		f.mu.Lock()
 	}
 	if (f.fail != "" && strings.HasPrefix(joined, f.fail)) || (f.failAlso != "" && strings.HasPrefix(joined, f.failAlso)) {
 		f.mu.Unlock()
@@ -349,6 +374,166 @@ func TestOneDockerVMAtATime(t *testing.T) {
 		got := h.lima.running()
 		return len(got) == 1 && got[0] != alpha
 	})
+}
+
+// [docker] vms sets the machine's docker VM slots: with 2, alpha's and beta's
+// VMs run at once and a third job waits for one of them to end; /healthz shows
+// the slots.
+func TestDockerVMsRunAtOnce(t *testing.T) {
+	h := newHarness(t, 4, 1, "alpha", "beta") // wall speed: no watchdog reconcile stands in for the exit
+	h.withDocker("alpha", "beta")
+	h.settings = &fakeSettings{vms: 2}
+	h.start()
+	h.eventually("both docker classes healthy", func() bool { return h.dockerHealthy(alphaRepo) && h.dockerHealthy(betaRepo) })
+	if snap := h.sup.Snapshot(); snap.VMSlots != 2 {
+		t.Fatalf("vm_slots %d with vms = 2", snap.VMSlots)
+	}
+
+	h.actions.Assign(alphaDockerSet, 1)
+	h.actions.Assign(betaDockerSet, 1)
+	h.eventually("alpha's and beta's VMs run", func() bool { return len(h.lima.running()) == 2 })
+	if snap := h.sup.Snapshot(); snap.VMInUse != 2 {
+		t.Fatalf("vm_in_use %d with two VMs running", snap.VMInUse)
+	}
+	first := h.lima.running()
+	for _, set := range []string{alphaDockerSet, betaDockerSet} {
+		h.actions.IgnoreCapacity(set)
+	}
+	h.actions.Assign(alphaDockerSet, 2)
+	h.delivered(alphaDockerSet)
+	time.Sleep(100 * time.Millisecond)
+	if got := h.lima.running(); len(got) != 2 {
+		t.Fatalf("VMs running %v with two slots, want two", got)
+	}
+	h.lima.finish(first[0])
+	h.eventually("the third VM runs after one ended", func() bool {
+		got := h.lima.running()
+		return len(got) == 2 && !slices.Contains(got, first[0])
+	})
+}
+
+// Without a cap on jobs every container slot and every VM slot takes a job:
+// one container job beside two VMs on a machine of one slot.
+func TestDockerVMsBesideEveryContainerSlot(t *testing.T) {
+	h := newHarness(t, 1, 1000, "alpha", "beta")
+	h.withDocker("alpha", "beta")
+	h.settings = &fakeSettings{vms: 2}
+	h.start()
+	h.eventually("every class healthy", func() bool {
+		return h.healthy(alphaRepo) && h.dockerHealthy(alphaRepo) && h.dockerHealthy(betaRepo)
+	})
+	h.actions.Assign(alphaSet, 1)
+	h.actions.Assign(alphaDockerSet, 1)
+	h.actions.Assign(betaDockerSet, 1)
+	img := h.imageOf("alpha")
+	h.eventually("a container job and two VMs", func() bool {
+		return len(h.docker.runners(img)) == 1 && len(h.lima.running()) == 2
+	})
+}
+
+// The VM slots nest within the cap on jobs: vms = 2 beside max = 1 runs one VM.
+func TestDockerVMsWithinTheJobsCap(t *testing.T) {
+	h := newHarness(t, 4, 1, "alpha", "beta")
+	h.withDocker("alpha", "beta")
+	h.settings = &fakeSettings{max: 1, vms: 2}
+	h.start()
+	h.eventually("both docker classes healthy", func() bool { return h.dockerHealthy(alphaRepo) && h.dockerHealthy(betaRepo) })
+	for _, set := range []string{alphaDockerSet, betaDockerSet} {
+		h.actions.IgnoreCapacity(set)
+		h.actions.Assign(set, 1)
+	}
+	h.eventually("one VM runs", func() bool { return len(h.lima.running()) == 1 })
+	h.delivered(betaDockerSet)
+	time.Sleep(100 * time.Millisecond)
+	if snap := h.sup.Snapshot(); len(h.lima.running()) != 1 || snap.VMSlots != 1 {
+		t.Fatalf("VMs running %v, vm_slots %d with max = 1; want one and 1", h.lima.running(), snap.VMSlots)
+	}
+}
+
+// [docker] vms is read again on every watchdog tick: raised, the job that
+// waited for a slot starts without a restart.
+func TestDockerVMsReadAgainWithoutARestart(t *testing.T) {
+	h := newHarness(t, 4, 1000, "alpha", "beta")
+	h.withDocker("alpha", "beta")
+	h.settings = &fakeSettings{}
+	h.start()
+	h.eventually("both docker classes healthy", func() bool { return h.dockerHealthy(alphaRepo) && h.dockerHealthy(betaRepo) })
+	h.actions.Assign(alphaDockerSet, 1)
+	h.eventually("alpha's VM runs", func() bool { return len(h.lima.running()) == 1 })
+	h.actions.Started(alphaDockerSet, h.lima.running()[0])
+	h.actions.IgnoreCapacity(betaDockerSet)
+	h.actions.Assign(betaDockerSet, 1)
+	h.delivered(betaDockerSet)
+	time.Sleep(100 * time.Millisecond)
+	if got := h.lima.running(); len(got) != 1 {
+		t.Fatalf("VMs running %v with one slot, want one", got)
+	}
+	h.settings.setVMs(2)
+	h.eventually("beta's VM runs beside alpha's", func() bool { return len(h.lima.running()) == 2 })
+	if snap := h.sup.Snapshot(); snap.VMSlots != 2 {
+		t.Fatalf("vm_slots %d after vms = 2", snap.VMSlots)
+	}
+}
+
+// With a second VM slot a job no longer waits for a build's slot, but a base
+// is never cloned while it builds: alpha's job waits for alpha's rebuild,
+// beside a free slot, and starts once the new base is in place.
+func TestNoCloneWhileItsBaseBuilds(t *testing.T) {
+	h := newHarness(t, 4, 1000, "alpha") // a discovery pass every 50 ms
+	h.withDocker("alpha")
+	h.settings = &fakeSettings{vms: 2}
+	h.start()
+	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	held, release := h.lima.holdOnce("shell local-ci-docker-new-main-alpha")
+	defer release()
+	h.mirror.setDigest("d2") // the next discovery pass rebuilds the base, and the build waits
+	select {
+	case <-held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("alpha's rebuild never started")
+	}
+	clones := func() int { return h.lima.count("clone --tty=false local-ci-docker-base-main-alpha") }
+	before, minted := clones(), h.actions.Count("JIT "+alphaDockerSet)
+	h.actions.Assign(alphaDockerSet, 1)
+	time.Sleep(300 * time.Millisecond)
+	if n := h.actions.Count("JIT " + alphaDockerSet); n != minted {
+		t.Fatalf("%d runners minted while the base built, want none: the vet refuses first", n-minted)
+	}
+	if snap := h.sup.Snapshot(); snap.VMInUse != 1 {
+		t.Fatalf("vm_in_use %d during the build, want the build's slot alone", snap.VMInUse)
+	}
+	if n := clones(); n != before {
+		t.Fatalf("alpha's base was cloned %d times while it built", n-before)
+	}
+	release()
+	h.eventually("alpha's VM runs once its base is built", func() bool { return clones() == before+1 && len(h.lima.running()) == 1 })
+}
+
+// A launch that passed the vet before a build began is refused, never cloned
+// from a base in the middle of its swap.
+func TestALaunchIsRefusedWhileItsBaseBuilds(t *testing.T) {
+	h := newHarness(t, 2, 1000, "alpha")
+	h.withDocker("alpha")
+	h.start()
+	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	h.sup.mu.Lock()
+	pr := h.sup.projects[alphaRepo+dockerKey]
+	h.sup.mu.Unlock()
+	pr.base.Lock() // as ensureBase holds it
+	errc := make(chan error, 1)
+	go func() { errc <- pr.startVM(context.Background(), "alpha-docker-x", "jit") }()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, errBuilding) {
+			t.Fatalf("startVM during a build: %v, want errBuilding", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("startVM waited for the build instead of refusing")
+	}
+	pr.base.Unlock()
+	if n := h.lima.count("clone"); n != 0 {
+		t.Fatalf("%d clones during a build", n)
+	}
 }
 
 // The reconcile compares runners with containers; a docker runner has none,

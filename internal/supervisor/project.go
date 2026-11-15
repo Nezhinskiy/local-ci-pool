@@ -41,6 +41,12 @@ type project struct {
 	cancel  context.CancelFunc
 	done    chan struct{} // closed when run returns
 
+	// base keeps the docker class's base build and its launches apart: a
+	// build holds it, a launch holds it shared while it clones and boots
+	// (vm.Backend's contract), and refuses rather than waits while a build
+	// holds it.
+	base sync.RWMutex
+
 	mu     sync.Mutex
 	p      discovery.Project
 	img    Image

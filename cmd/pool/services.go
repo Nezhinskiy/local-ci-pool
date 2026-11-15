@@ -63,14 +63,15 @@ func newRealPool(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, erro
 		Serve:  health.Serve(func() supervisor.Snapshot { return sup.Snapshot() }, supportDir(), log),
 		// The settings file at its default path, read at start and on every
 		// watchdog tick.
-		JobsMax: func() (int, bool) {
+		Settings: func() (supervisor.Settings, bool) {
 			s, invalid := settings.Load()
-			return s.JobsMax, invalid
+			return supervisor.Settings{JobsMax: s.JobsMax, DockerVMs: s.DockerVMs}, invalid
 		},
 		// The Mac's memory, which bounds a job's memory share.
 		HostMem: machine.HostMemory,
-		// The docker class's VMs (docs/docker-class.md): one at a time, below
-		// MinFreeGiB of free disk where Lima keeps them none.
+		// The docker class's VMs (docs/docker-class.md): [docker] vms at a
+		// time, one unless set; below MinFreeGiB of free disk where Lima keeps
+		// them none.
 		VM: &vm.Backend{
 			Lima: vm.Exec{}, CPUs: 4, MemoryGiB: 6, DiskGiB: 30, MinFreeGiB: 15,
 			FreeGiB: vm.FreeGiBAt(vm.Home(home)),

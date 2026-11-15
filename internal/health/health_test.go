@@ -179,13 +179,13 @@ func TestHealthzStatusAndShape(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &fields); err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []string{"version", "commit", "machine", "slots", "in_use", "busy", "vm_in_use", "docker", "login", "probe", "jobs", "projects"} {
+	for _, k := range []string{"version", "commit", "machine", "slots", "in_use", "busy", "vm_slots", "vm_in_use", "docker", "login", "probe", "jobs", "projects"} {
 		if _, ok := fields[k]; !ok {
 			t.Errorf("no %q field in %s", k, rec.Body.String())
 		}
 	}
-	if len(fields) != 12 {
-		t.Errorf("%d fields, want 12: %s", len(fields), rec.Body.String())
+	if len(fields) != 13 {
+		t.Errorf("%d fields, want 13: %s", len(fields), rec.Body.String())
 	}
 	var back supervisor.Snapshot
 	if err := json.Unmarshal(rec.Body.Bytes(), &back); err != nil {
