@@ -692,7 +692,7 @@ func (s *Supervisor) cpusPerJob() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	jobs := s.jobsAtOnceLocked()
-	return JobCPUs(s.machine.FP.CPUs, jobs, JobMemory(s.machine.FP.Mem, s.hostMem, jobs))
+	return JobCPUs(s.machine.FP.CPUs, jobs, JobMemory(s.machine.FP.Mem, s.hostMem, s.moreVMsGiBLocked(), jobs))
 }
 
 // gibPerCPU is the memory a job's limit holds for each CPU it is given.
@@ -726,7 +726,17 @@ func (s *Supervisor) jobsAtOnceLocked() int {
 func (s *Supervisor) memoryPerJob() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return JobMemory(s.machine.FP.Mem, s.hostMem, s.jobsAtOnceLocked())
+	return JobMemory(s.machine.FP.Mem, s.hostMem, s.moreVMsGiBLocked(), s.jobsAtOnceLocked())
+}
+
+// moreVMsGiBLocked is the Mac's memory that the docker VMs beyond the first
+// take, which no container job's share may count on ([docker] vms). The first
+// VM's is not counted, as before the VMs were configurable.
+func (s *Supervisor) moreVMsGiBLocked() int64 {
+	if s.deps.VM == nil {
+		return 0
+	}
+	return int64(max(s.dockerVMs-1, 0) * s.deps.VM.MemoryGiB)
 }
 
 // What a job's memory share leaves alone, in GiB: of the Docker VM, what
@@ -740,18 +750,20 @@ const (
 
 // JobMemory is the memory limit of one of jobs container jobs running at once:
 //
-//	max(4 GiB, floor(min(Docker VM GiB - 2, Mac GiB - 8) / jobs))
+//	max(4 GiB, floor(min(Docker VM GiB - 2, Mac GiB - 8 - moreVMsGiB) / jobs))
 //
 // with both sizes rounded to the nearest GiB as Slots rounds them (Docker
 // Desktop reports MemTotal slightly below its slider). The Docker VM term
 // keeps all jobs inside the VM; the Mac's term keeps them inside the Mac when
 // the VM is given nearly all of it, since the VM keeps the memory its guests
-// touch. hostBytes 0 (unknown) leaves the Mac's term out.
-func JobMemory(dockerBytes, hostBytes int64, jobs int) int64 {
+// touch, and beside the docker VMs beyond the first (moreVMsGiB), which take
+// the Mac's memory outside Docker. hostBytes 0 (unknown) leaves the Mac's
+// term out.
+func JobMemory(dockerBytes, hostBytes, moreVMsGiB int64, jobs int) int64 {
 	const gib = 1 << 30
 	avail := (dockerBytes+gib/2)/gib - dockerReserveGiB
 	if hostBytes > 0 {
-		avail = min(avail, (hostBytes+gib/2)/gib-hostReserveGiB)
+		avail = min(avail, (hostBytes+gib/2)/gib-hostReserveGiB-moreVMsGiB)
 	}
 	return max(avail/int64(max(jobs, 1)), jobMemoryMinGiB) * gib
 }

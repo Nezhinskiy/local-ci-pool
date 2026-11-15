@@ -507,7 +507,9 @@ the slots), or the slots without a cap, and both sizes rounded to the nearest Gi
 own, as in the slot count. The 8 GiB are left to macOS and its apps, because Docker Desktop's VM keeps
 the memory its jobs touch: on a 48 GiB Mac whose Docker VM has 47 GiB, the VM's term alone would allow
 four jobs 11 GiB each, 44 GiB in all, and the Mac would swap. With the Mac's term and a cap of 4, each job
-gets 10 GiB. A docker VM (6 GiB) counts as one of the jobs, so it always fits beside the others. The
+gets 10 GiB. A docker VM (6 GiB) counts as one of the jobs, so it always fits beside the others. With
+`[docker] vms` above 1, the Mac's term also leaves 6 GiB for each VM beyond the first: with `vms = 2`
+that Mac gives each of four jobs 8 GiB. The
 limit includes the job's HOME, a tmpfs. On a 16 GiB Mac with a 9.7 GiB Docker VM and 2 slots, a job
 keeps 4 GiB. The pool reads the Mac's memory once at start (`sysctl hw.memsize`) and logs each job's
 share then (`a job's share`) and on every change of the cap. A survivor keeps the limit it started

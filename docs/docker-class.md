@@ -73,7 +73,9 @@ before a repository commits the block.**
 - One docker VM runs at a time on a machine by default, whatever the repository (one machine-wide slot);
   `[docker] vms` in the [settings file](runbook.md#limiting-concurrent-jobs) raises it to at most 4. Each VM
   has its own CPU and memory (4 CPUs, 6 GiB, a 30 GiB disk), outside Docker Desktop's slots, so two VMs
-  take 8 CPUs and 12 GiB of the Mac. The VMs count with the container jobs against the
+  take 8 CPUs and 12 GiB of the Mac. A container job's memory share leaves the Mac room for the VMs beyond
+  the first (6 GiB each), not for the first: with one VM the share is what it was before the setting, so
+  leave the Mac 6 GiB beside Docker Desktop for it. The VMs count with the container jobs against the
   [cap on jobs](runbook.md#limiting-concurrent-jobs), when one is set. A base build is a VM too and takes one
   of the slots, waiting while jobs hold them all. A base is never cloned while it builds: its repository
   offers GitHub no free slot meanwhile, so its jobs are assigned once the build ends, while other
