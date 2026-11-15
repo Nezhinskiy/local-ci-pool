@@ -29,11 +29,17 @@ const maxSize = 64 << 10
 // and the file is read on every Load. The settings need a handful.
 const maxNesting = 64
 
+// MaxDockerVMs bounds [docker] vms: each docker VM has its own CPUs, memory and disk.
+const MaxDockerVMs = 4
+
 // Settings is what the settings file says.
 type Settings struct {
 	// JobsMax is [jobs] max: the most pool jobs, container jobs and docker VMs together, that run
 	// on the machine at once. 0: no cap beyond the slots.
 	JobsMax int
+	// DockerVMs is [docker] vms: the most docker-class VMs, base builds included, that run on the
+	// machine at once, from 1 to MaxDockerVMs. 0: not set, which is 1.
+	DockerVMs int
 	// Budget is set when the file still has a [budget] table, which nothing reads any more: the
 	// core budget was removed.
 	Budget bool
@@ -122,9 +128,10 @@ func read(p string) (s Settings, present bool, err error) {
 	return s, true, err
 }
 
-// parse checks the [jobs] table: only the key max, a whole number of at least 1, case-sensitive.
-// A [budget] table is reported, never read. Other tables are ignored, a table named jobs in another
-// case is refused, and so is a file nested more than maxNesting allows.
+// parse checks the [jobs] table, only the key max, a whole number of at least 1, and the [docker]
+// table, only the key vms, from 1 to MaxDockerVMs; names are case-sensitive. A [budget] table is
+// reported, never read. Other tables are ignored, a table named jobs or docker in another case is
+// refused, and so is a file nested more than maxNesting allows.
 func parse(data []byte) (Settings, error) {
 	if n := nesting(data); n > maxNesting {
 		return Settings{}, fmt.Errorf("%d dots, braces and brackets outside comments and strings: at most %d", n, maxNesting)
@@ -133,15 +140,19 @@ func parse(data []byte) (Settings, error) {
 		Jobs *struct {
 			Max *int `toml:"max"`
 		} `toml:"jobs"`
+		Docker *struct {
+			VMs *int `toml:"vms"`
+		} `toml:"docker"`
 	}
+	known := map[string]string{"jobs": "max", "docker": "vms"}
 	md, err := toml.NewDecoder(bytes.NewReader(data)).Decode(&doc)
 	if err != nil {
 		return Settings{}, err
 	}
 	var s Settings
 	// The decoder matches table and key names to fields case-insensitively and reports nothing
-	// undecoded for a miscased one, so the names are checked here: a table that is [jobs] but for
-	// its case, and any name under [jobs] but max, are refused.
+	// undecoded for a miscased one, so the names are checked here: a table that is [jobs] or
+	// [docker] but for its case, and any name under one but its key, are refused.
 	for _, k := range md.Keys() {
 		if len(k) == 0 {
 			continue
@@ -149,14 +160,17 @@ func parse(data []byte) (Settings, error) {
 		if k[0] == "budget" {
 			s.Budget = true
 		}
-		if k[0] != "jobs" && strings.EqualFold(k[0], "jobs") {
-			return Settings{}, fmt.Errorf("unknown table %q: the table is [jobs]", k[0])
+		for _, table := range []string{"jobs", "docker"} {
+			if k[0] != table && strings.EqualFold(k[0], table) {
+				return Settings{}, fmt.Errorf("unknown table %q: the table is [%s]", k[0], table)
+			}
 		}
-		if len(k) < 2 || k[0] != "jobs" {
+		key, ok := known[k[0]]
+		if len(k) < 2 || !ok {
 			continue
 		}
-		if len(k) != 2 || k[1] != "max" {
-			return Settings{}, fmt.Errorf("unknown key %q in [jobs]: want max", k.String())
+		if len(k) != 2 || k[1] != key {
+			return Settings{}, fmt.Errorf("unknown key %q in [%s]: want %s", k.String(), k[0], key)
 		}
 	}
 	if doc.Jobs != nil && doc.Jobs.Max != nil {
@@ -164,6 +178,12 @@ func parse(data []byte) (Settings, error) {
 			return Settings{}, fmt.Errorf("jobs.max = %d: want a whole number of at least 1", *doc.Jobs.Max)
 		}
 		s.JobsMax = *doc.Jobs.Max
+	}
+	if doc.Docker != nil && doc.Docker.VMs != nil {
+		if n := *doc.Docker.VMs; n < 1 || n > MaxDockerVMs {
+			return Settings{}, fmt.Errorf("docker.vms = %d: want a whole number from 1 to %d", n, MaxDockerVMs)
+		}
+		s.DockerVMs = *doc.Docker.VMs
 	}
 	return s, nil
 }

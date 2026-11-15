@@ -249,12 +249,11 @@ type Deps struct {
 	// Serve, if set, serves the health endpoint on the bound listener until
 	// ctx is cancelled.
 	Serve func(ctx context.Context, ln net.Listener)
-	// JobsMax reads the machine-wide cap on jobs, container jobs and docker
-	// VMs together, from the settings file, at start and on every watchdog
-	// tick: 0 is no cap beyond the slots, and invalid reports a file the
-	// pool could not use, whose last valid cap stays in force
-	// (config.File). Nil: no cap.
-	JobsMax func() (max int, invalid bool)
+	// Settings reads the settings file at start and on every watchdog tick:
+	// the machine-wide cap on jobs and the docker VMs at once (Settings), and
+	// whether the file was one the pool could not use, whose last valid
+	// settings stay in force (config.File). Nil: no cap, one docker VM.
+	Settings func() (s Settings, invalid bool)
 	// HostMem reads the Mac's physical memory in bytes (sysctl hw.memsize),
 	// once at start: a job's memory share never counts on more of it than
 	// there is (memoryPerJob). Nil or an error: the share follows the Docker
@@ -267,6 +266,16 @@ type Deps struct {
 	StateDir string
 }
 
+// Settings is what the settings file says (config.Settings).
+type Settings struct {
+	// JobsMax is the cap on jobs, container jobs and docker VMs together; 0
+	// is no cap beyond the slots.
+	JobsMax int
+	// DockerVMs is how many docker VMs, base builds included, run at once on
+	// the machine; 0 is 1.
+	DockerVMs int
+}
+
 // Snapshot is the pool's state for the health endpoint and the heartbeat.
 type Snapshot struct {
 	Version string `json:"version"`
@@ -275,7 +284,9 @@ type Snapshot struct {
 	Slots   int    `json:"slots"`
 	InUse   int    `json:"in_use"`
 	Busy    int    `json:"busy"`
-	// VMInUse is the docker class's VM slot in use, 0 or 1 (docs/docker-class.md).
+	// VMSlots and VMInUse are the docker class's VM slots, after the cap on
+	// jobs, and those in use (docs/docker-class.md).
+	VMSlots int  `json:"vm_slots"`
 	VMInUse int  `json:"vm_in_use"`
 	Docker  bool `json:"docker"`
 	// Login is false while the last read of the token from gh failed: the
@@ -339,8 +350,10 @@ type Supervisor struct {
 	machine  machine.Machine
 	instance string
 	slots    *runner.Slots
-	// vmSlots is the docker class's one slot: one docker VM at a time.
-	vmSlots *runner.Slots
+	// vmSlots is the docker class's slots, one per docker VM at a time;
+	// dockerVMs is their number as read (readSettings).
+	vmSlots   *runner.Slots
+	dockerVMs int
 	// jobs holds every container slot and VM slot taken, within the cap on
 	// jobs; jobsMax is that cap as read, 0 for none, and configInvalid
 	// whether the last read failed (readSettings).
@@ -506,10 +519,11 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	s.machine, s.instance, s.mount = m, instance, mount
 	s.slots = runner.NewSlots(m.Slots)
 	s.slots.OnChange(s.requestCapacity)
-	s.vmSlots = runner.NewSlots(1)
+	s.dockerVMs = 1
+	s.vmSlots = runner.NewSlots(s.dockerVMs)
 	s.vmSlots.OnChange(s.requestCapacity)
 	// Without a cap, every slot of both kinds: no limit beyond theirs.
-	s.jobs = runner.NewSlots(m.Slots + 1)
+	s.jobs = runner.NewSlots(m.Slots + s.dockerVMs)
 	s.slots.Within(s.jobs)
 	s.vmSlots.Within(s.jobs)
 	s.dockerOK = true
@@ -642,20 +656,22 @@ func (s *Supervisor) shutdown(life context.Context, stopLife context.CancelFunc)
 	}
 }
 
-// readSettings reads the cap on jobs (Deps.JobsMax) and applies it to the
-// slots of both kinds together: at start and on every watchdog tick, so an
-// edit of the settings file takes effect without a restart. A lowered cap
-// stops no job: it only starts none until enough have ended.
+// readSettings reads the settings file (Deps.Settings) and applies the cap
+// on jobs to the slots of both kinds together, and the docker VMs to the VM
+// slots: at start and on every watchdog tick, so an edit of the settings file
+// takes effect without a restart. A lowered cap stops no job or VM: it only
+// starts none until enough have ended.
 func (s *Supervisor) readSettings() {
-	if s.deps.JobsMax == nil {
+	if s.deps.Settings == nil {
 		return
 	}
-	n, invalid := s.deps.JobsMax()
+	set, invalid := s.deps.Settings()
+	n, vms := set.JobsMax, max(set.DockerVMs, 1)
 	s.mu.Lock()
 	s.configInvalid = invalid
-	changed := n != s.jobsMax
-	s.jobsMax = n
-	limit := s.machine.Slots + 1
+	changed := n != s.jobsMax || vms != s.dockerVMs
+	s.jobsMax, s.dockerVMs = n, vms
+	limit := s.machine.Slots + vms
 	s.mu.Unlock()
 	if !changed {
 		return
@@ -663,8 +679,9 @@ func (s *Supervisor) readSettings() {
 	if n > 0 {
 		limit = n
 	}
+	s.vmSlots.SetCap(vms)
 	s.jobs.SetCap(limit)
-	s.log.Info("cap on jobs", "max", n, "slots", s.slots.Cap(), "job_memory_gib", s.memoryPerJob()>>30, "job_cpus", s.cpusPerJob())
+	s.log.Info("cap on jobs", "max", n, "slots", s.slots.Cap(), "docker_vms", s.vmSlots.Cap(), "job_memory_gib", s.memoryPerJob()>>30, "job_cpus", s.cpusPerJob())
 	s.requestCapacity()
 }
 
@@ -675,7 +692,7 @@ func (s *Supervisor) cpusPerJob() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	jobs := s.jobsAtOnceLocked()
-	return JobCPUs(s.machine.FP.CPUs, jobs, JobMemory(s.machine.FP.Mem, s.hostMem, jobs))
+	return JobCPUs(s.machine.FP.CPUs, jobs, JobMemory(s.machine.FP.Mem, s.hostMem, s.moreVMsGiBLocked(), jobs))
 }
 
 // gibPerCPU is the memory a job's limit holds for each CPU it is given.
@@ -709,7 +726,17 @@ func (s *Supervisor) jobsAtOnceLocked() int {
 func (s *Supervisor) memoryPerJob() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return JobMemory(s.machine.FP.Mem, s.hostMem, s.jobsAtOnceLocked())
+	return JobMemory(s.machine.FP.Mem, s.hostMem, s.moreVMsGiBLocked(), s.jobsAtOnceLocked())
+}
+
+// moreVMsGiBLocked is the Mac's memory that the docker VMs beyond the first
+// take, which no container job's share may count on ([docker] vms). The first
+// VM's is not counted, as before the VMs were configurable.
+func (s *Supervisor) moreVMsGiBLocked() int64 {
+	if s.deps.VM == nil {
+		return 0
+	}
+	return int64(max(s.dockerVMs-1, 0) * s.deps.VM.MemoryGiB)
 }
 
 // What a job's memory share leaves alone, in GiB: of the Docker VM, what
@@ -723,18 +750,20 @@ const (
 
 // JobMemory is the memory limit of one of jobs container jobs running at once:
 //
-//	max(4 GiB, floor(min(Docker VM GiB - 2, Mac GiB - 8) / jobs))
+//	max(4 GiB, floor(min(Docker VM GiB - 2, Mac GiB - 8 - moreVMsGiB) / jobs))
 //
 // with both sizes rounded to the nearest GiB as Slots rounds them (Docker
 // Desktop reports MemTotal slightly below its slider). The Docker VM term
 // keeps all jobs inside the VM; the Mac's term keeps them inside the Mac when
 // the VM is given nearly all of it, since the VM keeps the memory its guests
-// touch. hostBytes 0 (unknown) leaves the Mac's term out.
-func JobMemory(dockerBytes, hostBytes int64, jobs int) int64 {
+// touch, and beside the docker VMs beyond the first (moreVMsGiB), which take
+// the Mac's memory outside Docker. hostBytes 0 (unknown) leaves the Mac's
+// term out.
+func JobMemory(dockerBytes, hostBytes, moreVMsGiB int64, jobs int) int64 {
 	const gib = 1 << 30
 	avail := (dockerBytes+gib/2)/gib - dockerReserveGiB
 	if hostBytes > 0 {
-		avail = min(avail, (hostBytes+gib/2)/gib-hostReserveGiB)
+		avail = min(avail, (hostBytes+gib/2)/gib-hostReserveGiB-moreVMsGiB)
 	}
 	return max(avail/int64(max(jobs, 1)), jobMemoryMinGiB) * gib
 }
@@ -1006,7 +1035,7 @@ func (s *Supervisor) Snapshot() Snapshot {
 		snap.Slots, snap.InUse, snap.Busy = slots.Cap(), slots.InUse(), slots.Busy()
 	}
 	if vmSlots != nil {
-		snap.VMInUse = vmSlots.InUse()
+		snap.VMSlots, snap.VMInUse = vmSlots.Cap(), vmSlots.InUse()
 	}
 	for _, pr := range prs {
 		snap.Projects = append(snap.Projects, pr.health())

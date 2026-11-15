@@ -264,7 +264,7 @@ func (s *Scaler) launch(ctx context.Context, name string) bool {
 		switch {
 		case drained:
 			s.log.Info("draining; not starting the runner", slog.String("runner", name))
-		case errors.Is(err, errRefused):
+		case errors.Is(err, ErrRefused):
 			s.log.Warn("refusing the runner", slog.String("runner", name), slog.String("error", err.Error()))
 		default:
 			s.log.Error("starting a runner", slog.String("runner", name), slog.String("error", err.Error()))
@@ -273,8 +273,9 @@ func (s *Scaler) launch(ctx context.Context, name string) bool {
 			s.forget(ctx, name)
 		}
 		// A runner that was registered and then could not start counts
-		// towards the no-job exits: a missing image fails every start.
-		s.release(name, minted && !drained)
+		// towards the no-job exits: a missing image fails every start. A
+		// refused start does not: nothing was tried.
+		s.release(name, minted && !drained && !errors.Is(err, ErrRefused))
 		return false
 	}
 	s.mu.Lock()
@@ -290,15 +291,17 @@ func (s *Scaler) launch(ctx context.Context, name string) bool {
 // errDrained stops a start whose scaler began draining while it minted.
 var errDrained = errors.New("the scaler is draining")
 
-// errRefused stops a start that Vet refused before its mint.
-var errRefused = errors.New("vet refused the runner")
+// ErrRefused stops a start that Vet refused before its mint, or that Start
+// refused before it made anything: a state of the machine, logged as a
+// warning and not counted as a failed start.
+var ErrRefused = errors.New("refused the runner")
 
 // startRunner reports whether the JIT configuration was minted, which
 // registers the runner on GitHub, and any error.
 func (s *Scaler) startRunner(ctx context.Context, name string) (minted bool, err error) {
 	if s.vet != nil {
 		if err := s.vet(ctx); err != nil {
-			return false, fmt.Errorf("%w: %w", errRefused, err)
+			return false, fmt.Errorf("%w: %w", ErrRefused, err)
 		}
 	}
 	s.mu.Lock()

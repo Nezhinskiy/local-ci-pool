@@ -15,6 +15,7 @@ import (
 	"github.com/moby/moby/client"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
+	"github.com/Nezhinskiy/local-ci-pool/internal/runner"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runnermount"
 	"github.com/Nezhinskiy/local-ci-pool/internal/vm"
 )
@@ -27,11 +28,19 @@ import (
 // runners runs in a throwaway clone of that base (Deps.VM). Like the container
 // class's project it runs its own visibility checks and its own drain, so it
 // leaves no later than the container class would. It shares nothing with it
-// but the identity: one machine-wide docker slot (one VM at a time) instead of the
-// container slots, counted with them against the cap on jobs, no survivors, no
+// but the identity: machine-wide docker VM slots ([docker] vms, one unless
+// set) instead of the container slots, counted with them against the cap on
+// jobs, no survivors, no
 // heartbeat (the routing action does not route docker jobs), and no
 // container, so the Docker die events and the reconcile never see its runners:
 // a runner's exit is its Launch's done callback.
+
+// errBuilding refuses a docker runner while its base builds: the clone would
+// fail during the swap. It is no reason of the project's. The project offers
+// no free slot meanwhile (capacity), so GitHub assigns it no job until the
+// build ends; the refusal guards a start that passed the capacity or the vet
+// just before the build began.
+var errBuilding = errors.New("docker class: the base is being built")
 
 // errNotInstalled is the docker class's setup on a Mac without limactl: a
 // state of the Mac, not a failure (health's not_installed), tried again on
@@ -92,8 +101,9 @@ func (pr *project) baseKey(ctx context.Context, p discovery.Project, m runnermou
 
 // ensureBase builds the project's base when its key differs from the one the
 // last build stored, and stores the new key. A failed build keeps the old base
-// (vm.Backend.BuildBase) and the old key. One base builds at a time on the
-// machine. It returns the base as the project's Image.
+// (vm.Backend.BuildBase) and the old key. A base builds once at a time (one
+// refresh per project), and none of its clones is made meanwhile. It returns
+// the base as the project's Image.
 func (pr *project) ensureBase(ctx context.Context, p discovery.Project, m runnermount.Mount) (Image, error) {
 	key, commit, err := pr.baseKey(ctx, p, m)
 	if err != nil {
@@ -116,9 +126,8 @@ func (pr *project) ensureBase(ctx context.Context, p discovery.Project, m runner
 			return img, nil
 		}
 	}
-	// A build is a VM too: it takes the machine's one docker-VM slot, so it
-	// waits for a running job and no job starts while it builds. A VM that may
-	// still run (leakVM) stops builds too.
+	// A build is a VM too: it takes a docker VM slot, waiting while every slot
+	// runs a job. A VM that may still run (leakVM) stops builds too.
 	for {
 		if err := pr.s.vmLeakErr(); err != nil {
 			return Image{}, fmt.Errorf("docker base: %w", err)
@@ -133,6 +142,16 @@ func (pr *project) ensureBase(ctx context.Context, p discovery.Project, m runner
 		}
 	}
 	defer pr.s.vmSlots.Release()
+	// No clone of this base while it builds: the launches under way end first,
+	// and the next ones are refused until the swap is done.
+	pr.base.Lock()
+	pr.building.Store(true)
+	pr.s.requestCapacity()
+	defer func() {
+		pr.building.Store(false)
+		pr.base.Unlock()
+		pr.s.requestCapacity()
+	}()
 	pr.log.Info("building the docker base", "commit", commit, "runner", m.Version)
 	engine, err := pr.buildBase(ctx, p, commit, m)
 	if err != nil {
@@ -194,6 +213,9 @@ func (pr *project) refreshBase(p discovery.Project) {
 // path unregisters the runner and frees the docker slot, and the job stays
 // queued.
 func (pr *project) startVM(ctx context.Context, name, jit string) error {
+	if !pr.base.TryRLock() {
+		return fmt.Errorf("%w: %w", runner.ErrRefused, errBuilding)
+	}
 	err := pr.s.deps.VM.Launch(ctx, pr.identity, name, jit, func(err error) {
 		if err != nil {
 			pr.log.Info("a docker VM's runner ended", "runner", name, "error", err.Error())
@@ -208,6 +230,7 @@ func (pr *project) startVM(ctx context.Context, name, jit string) error {
 			sc.Exited(name)
 		}
 	})
+	pr.base.RUnlock()
 	if errors.Is(err, vm.ErrDeleteFailed) {
 		pr.s.leakVM(err)
 	}
@@ -248,8 +271,8 @@ func (s *Supervisor) sweepVMs(ctx context.Context) {
 	}
 }
 
-// vmSlotPoll is how often a base build asks for the docker-VM slot while a
-// job holds it.
+// vmSlotPoll is how often a base build asks for a docker VM slot while jobs
+// hold them all.
 const vmSlotPoll = 200 * time.Millisecond
 
 // vetFor is the scaler's Vet: the repository's visibility, and for the docker
@@ -264,6 +287,10 @@ func (pr *project) vetFor() func(context.Context) error {
 		if err := pr.vet(ctx); err != nil {
 			return err
 		}
+		if !pr.base.TryRLock() { // before a runner is minted, which a refused start would drop
+			return errBuilding
+		}
+		pr.base.RUnlock()
 		err := pr.s.vmLeakErr()
 		if err == nil {
 			err = pr.s.deps.VM.DiskOK()

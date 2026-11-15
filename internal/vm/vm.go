@@ -13,7 +13,9 @@
 // Contracts for the caller:
 //   - Sweep runs once, at start-up, before any BuildBase or Launch of this instance.
 //   - BuildBase and Launch of one identity never run at once: a clone made during the swap fails.
-//   - A build is a VM too: it takes the machine's one docker-VM slot, like a job.
+//   - A build is a VM too: it takes one of the machine's docker VM slots, like a job.
+//   - The free disk is judged before each build and each clone, against what the VMs already running
+//     use: MinFreeGiB is a floor per VM started, not a reservation for the ones running.
 //   - The error Launch hands to done can end with text the job wrote (it is root in its VM): treat it like
 //     build output, never in a redacted health body.
 package vm

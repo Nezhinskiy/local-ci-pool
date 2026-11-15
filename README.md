@@ -500,18 +500,21 @@ runner with no labels, so a label check cannot match it.
 
 The pool needs no configuration. One optional setting caps the jobs it runs at once on the Mac,
 container jobs and [docker-class](docs/docker-class.md) VMs together, below what the slots allow,
-for example to leave room for local builds:
+for example to leave room for local builds; another lets more than one docker-class VM run at once:
 
 ```toml
 [jobs]
 max = 4      # a whole number, 1 or more
+
+[docker]
+vms = 2      # docker-class VMs at once, 1 to 4; 1 without it
 ```
 
 The file is `~/.config/local-ci-pool/config.toml`; when only
 `~/Library/Application Support/local-ci-pool/config.toml` exists, the pool reads that one
 ([the exact rule](docs/runbook.md#limiting-concurrent-jobs)). Without the file, or without `max`, the
 slots alone decide. With it, at most `min(slots, max)` container jobs run, and container jobs and the
-docker VM together never exceed `max`. The pool reads the file again every 30 seconds, so an edit
+docker VMs together never exceed `max`. Each docker VM keeps its own 4 CPUs and 6 GiB of the Mac. The pool reads the file again every 30 seconds, so an edit
 takes effect without a restart; a lowered cap stops no running job. `pool status` shows the cap
 (`at most 4 jobs`), and `/healthz` as `"jobs":{"max":4}`. A file the pool cannot use is ignored,
 the last valid cap staying in force, and reported (`config invalid`); the runbook has
