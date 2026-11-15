@@ -722,15 +722,19 @@ type harness struct {
 func newHarness(t *testing.T, slots int, factor time.Duration, repos ...string) *harness {
 	t.Helper()
 	h := &harness{
-		t:         t,
-		actions:   fakeactions.New(t),
-		docker:    newFakeDocker(),
-		gh:        &fakeGitHub{repos: map[string]*fakeRepo{}},
-		tok:       &fakeToken{},
-		caff:      &fakeCaffeinate{},
-		clock:     fastClock{start: time.Now(), factor: factor},
-		slots:     slots,
-		logs:      &syncBuffer{},
+		t:       t,
+		actions: fakeactions.New(t),
+		docker:  newFakeDocker(),
+		gh:      &fakeGitHub{repos: map[string]*fakeRepo{}},
+		tok:     &fakeToken{},
+		caff:    &fakeCaffeinate{},
+		clock:   fastClock{start: time.Now(), factor: factor},
+		slots:   slots,
+		logs:    &syncBuffer{},
+		// Made before the Cleanup of stop, so it is removed after the pool
+		// stopped: cleanups run last first, and a base build that ends while
+		// the test does writes its key here.
+		stateDir:  t.TempDir(),
 		images:    map[string]string{},
 		checkErr:  map[string]error{},
 		runnerErr: map[string]error{},

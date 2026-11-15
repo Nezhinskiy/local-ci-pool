@@ -256,7 +256,7 @@ func (f *fakeDocker) ContainerExport(context.Context, string, client.ContainerEx
 // withDocker gives the harness a docker backend and serves repos with a
 // docker block in their marker.
 func (h *harness) withDocker(repos ...string) {
-	h.lima, h.mirror, h.freeGiB, h.stateDir = newFakeLima(), &fakeMirror{digest: "d1"}, 50, h.t.TempDir()
+	h.lima, h.mirror, h.freeGiB = newFakeLima(), &fakeMirror{digest: "d1"}, 50
 	for _, r := range repos {
 		h.gh.repos["example/"+r].marker = dockerMarker()
 	}
