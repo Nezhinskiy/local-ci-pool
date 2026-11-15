@@ -143,10 +143,14 @@ func (pr *project) ensureBase(ctx context.Context, p discovery.Project, m runner
 	}
 	defer pr.s.vmSlots.Release()
 	// No clone of this base while it builds: the launches under way end first,
-	// and the next ones are refused until the swap is done.
-	pr.base.Lock()
+	// and the next ones are refused until the swap is done. The project offers
+	// no free slot from before the lock is asked for: Lock waits for a launch
+	// still booting, and a job assigned meanwhile could not start until the
+	// build ends. The slot's own OnChange advertised before the flag was set,
+	// so the flag's change is advertised here.
 	pr.building.Store(true)
 	pr.s.requestCapacity()
+	pr.base.Lock()
 	defer func() {
 		pr.building.Store(false)
 		pr.base.Unlock()
