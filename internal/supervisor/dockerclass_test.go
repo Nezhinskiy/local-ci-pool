@@ -548,6 +548,37 @@ func TestNoCloneWhileItsBaseBuilds(t *testing.T) {
 	h.eventually("alpha's VM runs once its base is built", func() bool { return clones() == before+1 && len(h.lima.running()) == 1 })
 }
 
+// A build that waits for a launch still booting offers no free slot while it
+// waits: with vms = 3, one launch booting and the build holding a slot, the
+// project offers only the launch's slot, not the third, free one, and says so
+// once the flag is set (the slot's own change was advertised before it).
+func TestABuildWaitingForALaunchOffersNoFreeSlot(t *testing.T) {
+	h := newHarness(t, 4, 1000, "alpha") // a discovery pass every 50 ms
+	h.withDocker("alpha")
+	h.settings = &fakeSettings{vms: 3}
+	h.start()
+	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	booting, boot := h.lima.holdOnce("start --tty=false local-ci-docker-job-")
+	defer boot()
+	h.actions.Assign(alphaDockerSet, 1)
+	select {
+	case <-booting:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the launch never booted")
+	}
+	h.mirror.setDigest("d2") // the next discovery pass rebuilds the base, behind the booting launch
+	h.eventually("the build holds a slot beside the launch", func() bool { return h.sup.Snapshot().VMInUse == 2 })
+	// What the pool hands its listener, which sends it with the next message request (capacity.go).
+	h.sup.mu.Lock()
+	pr := h.sup.projects[alphaRepo+dockerKey]
+	h.sup.mu.Unlock()
+	h.eventually("only the launch's slot offered", func() bool {
+		pr.mu.Lock()
+		defer pr.mu.Unlock()
+		return pr.advertised == 1
+	})
+}
+
 // A docker job queued while its base builds is no job stuck on a free pool:
 // the project offers no free slot meanwhile, so nothing is reported.
 func TestABuildingBaseReportsNoStuckJob(t *testing.T) {
