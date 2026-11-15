@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -369,6 +370,25 @@ func TestFailedStartReleasesItsSlot(t *testing.T) {
 	h2.jit.err = errors.New("jit refused")
 	if got := desired(t, h2.scaler, 2); got != 0 || slots.InUse() != 0 || len(h2.starter.started()) != 0 {
 		t.Fatalf("Desired with a failing JIT = %d, %d in use, %d starts", got, slots.InUse(), len(h2.starter.started()))
+	}
+}
+
+// A start that Start refused (ErrRefused) frees its slot like a failed one,
+// but is no failed start: it does not count towards the no-job exits.
+func TestARefusedStartIsNoFailedStart(t *testing.T) {
+	slots := NewSlots(1)
+	h := newHarness(slots)
+	h.starter.err = fmt.Errorf("%w: the base is being built", ErrRefused)
+	if got := desired(t, h.scaler, 1); got != 0 || slots.InUse() != 0 {
+		t.Fatalf("Desired(1) with a refused start = %d, %d in use; want 0, 0", got, slots.InUse())
+	}
+	if n := h.scaler.NoJobExits(); n != 0 {
+		t.Fatalf("no-job exits %d after a refused start, want 0", n)
+	}
+	h.starter.err = errors.New("create failed")
+	desired(t, h.scaler, 1)
+	if n := h.scaler.NoJobExits(); n != 1 {
+		t.Fatalf("no-job exits %d after a failed start, want 1", n)
 	}
 }
 

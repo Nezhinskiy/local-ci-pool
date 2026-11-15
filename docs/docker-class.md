@@ -56,8 +56,9 @@ before a repository commits the block.**
   `~/Library/Application Support/local-ci-pool/docker-base-<identity>.key` once a build succeeds, and
   checked at start and on every discovery pass; a key whose base is gone (deleted by hand, a wiped Lima home)
   is built again. A failed build keeps the old base and marks the class
-  unhealthy (`docker base: …`), as a failed image build does, and is tried again on the next pass. One base
-  builds at a time on the machine. A failing build is retried on every discovery pass (10 minutes), with no backoff;
+  unhealthy (`docker base: …`), as a failed image build does, and is tried again on the next pass. Each
+  repository's base builds once at a time; different repositories' bases may build at once, each in a VM
+  slot. A failing build is retried on every discovery pass (10 minutes), with no backoff;
   `/healthz` shows it failing, with the reason, until one passes. A pull request's own `provision` never reaches
   the base, and probe mode
   does not build one.
@@ -74,8 +75,9 @@ before a repository commits the block.**
   has its own CPU and memory (4 CPUs, 6 GiB, a 30 GiB disk), outside Docker Desktop's slots, so two VMs
   take 8 CPUs and 12 GiB of the Mac. The VMs count with the container jobs against the
   [cap on jobs](runbook.md#limiting-concurrent-jobs), when one is set. A base build is a VM too and takes one
-  of the slots, waiting while jobs hold them all. A base builds once at a time, and is never cloned while it
-  builds: its repository's jobs wait for the build to end, while other repositories' jobs may use a free slot.
+  of the slots, waiting while jobs hold them all. A base is never cloned while it builds: its repository
+  offers GitHub no free slot meanwhile, so its jobs are assigned once the build ends, while other
+  repositories' jobs may use a free slot.
   Below 15 GiB free where Lima keeps its VMs (`$LIMA_HOME`, else `~/.lima`) the pool registers no runner and
   starts no VM, and `/healthz` reports the class unhealthy (`docker vm: not enough free disk …`). The free disk
   is checked before each build and each clone, against what the VMs already running use: the 15 GiB is a

@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -44,8 +45,11 @@ type project struct {
 	// base keeps the docker class's base build and its launches apart: a
 	// build holds it, a launch holds it shared while it clones and boots
 	// (vm.Backend's contract), and refuses rather than waits while a build
-	// holds it.
-	base sync.RWMutex
+	// holds it. building is set while a build holds it: the project then
+	// offers GitHub no free slot (capacity), so no job is assigned to it that
+	// no runner could take before GitHub revokes it.
+	base     sync.RWMutex
+	building atomic.Bool
 
 	mu     sync.Mutex
 	p      discovery.Project

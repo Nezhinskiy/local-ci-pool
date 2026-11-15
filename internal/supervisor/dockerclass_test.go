@@ -19,6 +19,7 @@ import (
 	"github.com/moby/moby/client"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
+	"github.com/Nezhinskiy/local-ci-pool/internal/github"
 	"github.com/Nezhinskiy/local-ci-pool/internal/image"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runner"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runnermount"
@@ -475,9 +476,45 @@ func TestDockerVMsReadAgainWithoutARestart(t *testing.T) {
 	}
 }
 
+// A lowered vms stops no VM: with two running and vms lowered to 1, a third
+// job starts only once both have ended.
+func TestDockerVMsLoweredStopsNone(t *testing.T) {
+	h := newHarness(t, 4, 1000, "alpha", "beta") // watchdog ticks read the settings
+	h.withDocker("alpha", "beta")
+	h.settings = &fakeSettings{vms: 2}
+	h.start()
+	h.eventually("both docker classes healthy", func() bool { return h.dockerHealthy(alphaRepo) && h.dockerHealthy(betaRepo) })
+	h.actions.Assign(alphaDockerSet, 1)
+	h.eventually("alpha's VM runs", func() bool { return len(h.lima.running()) == 1 })
+	h.actions.Started(alphaDockerSet, h.lima.running()[0]) // a running job: no reap ends it
+	h.actions.Assign(betaDockerSet, 1)
+	h.eventually("two VMs run", func() bool { return len(h.lima.running()) == 2 })
+	first := h.lima.running()
+	for _, r := range first {
+		h.actions.Started(betaDockerSet, r)
+	}
+	h.settings.setVMs(1)
+	h.eventually("vm_slots 1", func() bool { return h.sup.Snapshot().VMSlots == 1 })
+	if got := h.lima.running(); len(got) != 2 {
+		t.Fatalf("VMs running %v after vms was lowered, want both", got)
+	}
+	h.actions.IgnoreCapacity(alphaDockerSet)
+	h.actions.Assign(alphaDockerSet, 1)
+	h.lima.finish(first[0])
+	time.Sleep(100 * time.Millisecond)
+	if got := h.lima.running(); len(got) != 1 {
+		t.Fatalf("VMs running %v with one of two ended and vms = 1, want the other alone", got)
+	}
+	h.lima.finish(first[1])
+	h.eventually("the third VM once both ended", func() bool {
+		got := h.lima.running()
+		return len(got) == 1 && !slices.Contains(first, got[0])
+	})
+}
+
 // With a second VM slot a job no longer waits for a build's slot, but a base
-// is never cloned while it builds: alpha's job waits for alpha's rebuild,
-// beside a free slot, and starts once the new base is in place.
+// is never cloned while it builds: beside a free slot, alpha offers GitHub
+// none, so its job is assigned, and starts, once the new base is in place.
 func TestNoCloneWhileItsBaseBuilds(t *testing.T) {
 	h := newHarness(t, 4, 1000, "alpha") // a discovery pass every 50 ms
 	h.withDocker("alpha")
@@ -492,8 +529,10 @@ func TestNoCloneWhileItsBaseBuilds(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("alpha's rebuild never started")
 	}
+	h.eventually("no free slot offered during the build", func() bool { return h.actions.Capacity(alphaDockerSet) == "0" })
 	clones := func() int { return h.lima.count("clone --tty=false local-ci-docker-base-main-alpha") }
 	before, minted := clones(), h.actions.Count("JIT "+alphaDockerSet)
+	h.actions.IgnoreCapacity(alphaDockerSet) // a job assigned just before the build began
 	h.actions.Assign(alphaDockerSet, 1)
 	time.Sleep(300 * time.Millisecond)
 	if n := h.actions.Count("JIT " + alphaDockerSet); n != minted {
@@ -507,6 +546,30 @@ func TestNoCloneWhileItsBaseBuilds(t *testing.T) {
 	}
 	release()
 	h.eventually("alpha's VM runs once its base is built", func() bool { return clones() == before+1 && len(h.lima.running()) == 1 })
+}
+
+// A docker job queued while its base builds is no job stuck on a free pool:
+// the project offers no free slot meanwhile, so nothing is reported.
+func TestABuildingBaseReportsNoStuckJob(t *testing.T) {
+	h := newHarness(t, 4, 1000, "alpha")
+	h.withDocker("alpha")
+	h.settings = &fakeSettings{vms: 2}
+	h.start()
+	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	held, release := h.lima.holdOnce("shell local-ci-docker-new-main-alpha")
+	defer release()
+	h.mirror.setDigest("d2")
+	select {
+	case <-held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("alpha's rebuild never started")
+	}
+	h.gh.setQueued(alphaRepo, github.QueuedJob{RunURL: stuckRun, ID: 1, Name: "sandbox",
+		Labels: []string{"alpha-docker"}, Created: h.clock.Now().Add(-time.Hour)})
+	time.Sleep(2 * time.Second) // queuedAfter and queuedPoll, several times over at 1000x
+	if p, _ := h.dockerHealth(alphaRepo); len(p.Stuck) != 0 {
+		t.Fatalf("Stuck = %+v while the base builds, want none", p.Stuck)
+	}
 }
 
 // A launch that passed the vet before a build began is refused, never cloned
@@ -524,8 +587,8 @@ func TestALaunchIsRefusedWhileItsBaseBuilds(t *testing.T) {
 	go func() { errc <- pr.startVM(context.Background(), "alpha-docker-x", "jit") }()
 	select {
 	case err := <-errc:
-		if !errors.Is(err, errBuilding) {
-			t.Fatalf("startVM during a build: %v, want errBuilding", err)
+		if !errors.Is(err, errBuilding) || !errors.Is(err, runner.ErrRefused) {
+			t.Fatalf("startVM during a build: %v, want errBuilding as a refusal", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("startVM waited for the build instead of refusing")

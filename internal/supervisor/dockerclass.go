@@ -15,6 +15,7 @@ import (
 	"github.com/moby/moby/client"
 
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
+	"github.com/Nezhinskiy/local-ci-pool/internal/runner"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runnermount"
 	"github.com/Nezhinskiy/local-ci-pool/internal/vm"
 )
@@ -35,8 +36,10 @@ import (
 // a runner's exit is its Launch's done callback.
 
 // errBuilding refuses a docker runner while its base builds: the clone would
-// fail during the swap. It is no reason of the project's: the job waits, as
-// it waited for the one VM slot before the slots were configurable.
+// fail during the swap. It is no reason of the project's. The project offers
+// no free slot meanwhile (capacity), so GitHub assigns it no job until the
+// build ends; the refusal guards a start that passed the capacity or the vet
+// just before the build began.
 var errBuilding = errors.New("docker class: the base is being built")
 
 // errNotInstalled is the docker class's setup on a Mac without limactl: a
@@ -142,7 +145,13 @@ func (pr *project) ensureBase(ctx context.Context, p discovery.Project, m runner
 	// No clone of this base while it builds: the launches under way end first,
 	// and the next ones are refused until the swap is done.
 	pr.base.Lock()
-	defer pr.base.Unlock()
+	pr.building.Store(true)
+	pr.s.requestCapacity()
+	defer func() {
+		pr.building.Store(false)
+		pr.base.Unlock()
+		pr.s.requestCapacity()
+	}()
 	pr.log.Info("building the docker base", "commit", commit, "runner", m.Version)
 	engine, err := pr.buildBase(ctx, p, commit, m)
 	if err != nil {
@@ -205,7 +214,7 @@ func (pr *project) refreshBase(p discovery.Project) {
 // queued.
 func (pr *project) startVM(ctx context.Context, name, jit string) error {
 	if !pr.base.TryRLock() {
-		return errBuilding
+		return fmt.Errorf("%w: %w", runner.ErrRefused, errBuilding)
 	}
 	err := pr.s.deps.VM.Launch(ctx, pr.identity, name, jit, func(err error) {
 		if err != nil {

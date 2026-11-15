@@ -113,7 +113,9 @@ on the Mac, one bound to `0.0.0.0`, and a Docker Desktop port published on `127.
 answered. The other direction is closed: in plain mode a port opened inside the VM is not forwarded
 to the Mac. A firewall inside the VM would not count, since the job is root there. Lima itself
 forwards a port on the Mac's loopback to the VM's SSH (how the pool runs the runner), so a local
-process holding Lima's key could open a shell in a job VM.
+process holding Lima's key could open a shell in a job VM. With `[docker] vms` above 1, a job VM can
+reach another VM's SSH forward on the Mac's loopback the same way; it is key-authenticated, and no VM
+holds Lima's key. No guest port is forwarded.
 
 ## Residual risk: no disk cap
 
