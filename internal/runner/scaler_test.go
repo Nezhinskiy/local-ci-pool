@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/events"
@@ -469,5 +470,398 @@ func TestNoJobExitsCountOnlyRunnersThatNeverTookAJob(t *testing.T) {
 	h.scaler.Completed("local-ci-000000000000") // late, for a runner already gone
 	if n := h.scaler.NoJobExits(); n != 0 {
 		t.Fatalf("no-job exits %d after a job report, want 0", n)
+	}
+}
+
+// fakeAdmit is the coreslot gate as a scaler sees it. With answers nil each
+// Bind returns true at once; otherwise each waits for its answer, and for its
+// context too unless deaf.
+type fakeAdmit struct {
+	bound chan string
+
+	mu       sync.Mutex
+	budgeted bool
+	answers  chan bool
+	deaf     bool
+	binds    []string
+	unbinds  []string
+	ctxs     map[string]context.Context
+}
+
+func newFakeAdmit(answers chan bool) *fakeAdmit {
+	return &fakeAdmit{bound: make(chan string, 16), budgeted: true, answers: answers, ctxs: map[string]context.Context{}}
+}
+
+func (a *fakeAdmit) Budgeted() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.budgeted
+}
+
+func (a *fakeAdmit) setBudgeted(b bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.budgeted = b
+}
+
+func (a *fakeAdmit) Bind(ctx context.Context, name string) bool {
+	a.mu.Lock()
+	a.binds = append(a.binds, name)
+	a.ctxs[name] = ctx
+	answers, deaf := a.answers, a.deaf
+	a.mu.Unlock()
+	a.bound <- name
+	if answers == nil {
+		return true
+	}
+	if deaf {
+		return <-answers
+	}
+	select {
+	case v := <-answers:
+		return v
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (a *fakeAdmit) Unbind(name string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.unbinds = append(a.unbinds, name)
+}
+
+func (a *fakeAdmit) bindsSoFar() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.binds)
+}
+
+func (a *fakeAdmit) unbound() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.unbinds)
+}
+
+func (a *fakeAdmit) ctxOf(name string) context.Context {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ctxs[name]
+}
+
+// nextBind is the name of the next Bind, within 1s.
+func (a *fakeAdmit) nextBind(t *testing.T) string {
+	t.Helper()
+	select {
+	case n := <-a.bound:
+		return n
+	case <-time.After(time.Second):
+		t.Fatal("no Bind within 1s")
+		return ""
+	}
+}
+
+// admitHarness is a harness whose scaler waits on a; at the end the waiting
+// Binds are answered false and the scaler's goroutines joined.
+func admitHarness(t *testing.T, slots int, a *fakeAdmit, configure func(*ScalerConfig)) *harness {
+	t.Helper()
+	h := newHarnessWith(NewSlots(slots), func(c *ScalerConfig) {
+		c.Admit = a
+		if configure != nil {
+			configure(c)
+		}
+	})
+	t.Cleanup(func() {
+		if a.answers != nil {
+			close(a.answers)
+		}
+		h.scaler.Abort()
+		h.scaler.Wait()
+	})
+	return h
+}
+
+// desiredSoon runs Desired in the background and fails unless it returns
+// within 1s.
+func desiredSoon(t *testing.T, s *Scaler, ctx context.Context, count int) int {
+	t.Helper()
+	done := make(chan int, 1)
+	go func() {
+		n, _ := s.Desired(ctx, count)
+		done <- n
+	}()
+	select {
+	case n := <-done:
+		return n
+	case <-time.After(time.Second):
+		t.Fatalf("Desired(%d) did not return within 1s", count)
+		return 0
+	}
+}
+
+// Mutation: calling admitThenLaunch inline in Desired (no goroutine) turns it
+// red: Desired waits for the permit.
+func TestAdmitWaitsOutsideTheLock(t *testing.T) {
+	a := newFakeAdmit(make(chan bool))
+	a.setBudgeted(false)
+	h := admitHarness(t, 3, a, nil)
+	desired(t, h.scaler, 1)
+	other := h.starter.started()[0]
+	a.setBudgeted(true)
+	if n := desiredSoon(t, h.scaler, context.Background(), 2); n != 2 {
+		t.Fatalf("Desired(2) = %d, want 2 (one idle, one waiting)", n)
+	}
+	waiting := a.nextBind(t)
+	if st := stateOf(h.scaler, waiting); st != stateWaiting {
+		t.Fatalf("state %d, want waiting", st)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.scaler.Exited(other)
+		h.scaler.Held()
+		_, _ = h.scaler.Desired(context.Background(), 2)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Exited, Held and Desired did not complete within 1s while a Bind waits")
+	}
+}
+
+// Mutation: activeLocked not counting waiting runners turns it red: the
+// second Desired reserves a second runner.
+func TestAdmitSecondDesiredStartsNoSecondRunner(t *testing.T) {
+	a := newFakeAdmit(make(chan bool))
+	h := admitHarness(t, 2, a, nil)
+	desiredSoon(t, h.scaler, context.Background(), 1)
+	a.nextBind(t)
+	if n := desiredSoon(t, h.scaler, context.Background(), 1); n != 1 {
+		t.Fatalf("second Desired(1) = %d, want 1", n)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if b := a.bindsSoFar(); len(b) != 1 || h.scaler.slots.InUse() != 1 {
+		t.Fatalf("binds %v, %d slots in use; want one of each", b, h.scaler.slots.InUse())
+	}
+}
+
+// Mutation: vetting only in launch (not before Bind) turns it red: the
+// refused runner spends a Bind.
+func TestAdmitVetBeforeBind(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	vet := func(context.Context) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls > 1 {
+			return errors.New("the base is being built")
+		}
+		return nil
+	}
+	a := newFakeAdmit(nil)
+	h := admitHarness(t, 2, a, func(c *ScalerConfig) { c.Vet = vet })
+	desiredSoon(t, h.scaler, context.Background(), 1)
+	eventually(t, "the refused runner's slot is released", func() bool { return h.scaler.slots.InUse() == 0 })
+	if b := a.bindsSoFar(); len(b) != 0 {
+		t.Fatalf("binds %v after a refused vet, want none", b)
+	}
+	if m := h.jit.minted(); len(m) != 0 || h.scaler.NoJobExits() != 0 {
+		t.Fatalf("minted %v, no-job exits %d; want none, 0", m, h.scaler.NoJobExits())
+	}
+}
+
+// Mutation: releasing a runner whose Bind returned false as a failed start
+// turns it red.
+func TestAdmitFalseReleasesTheSlot(t *testing.T) {
+	a := newFakeAdmit(make(chan bool))
+	h := admitHarness(t, 2, a, nil)
+	desiredSoon(t, h.scaler, context.Background(), 1)
+	a.nextBind(t)
+	a.answers <- false
+	eventually(t, "the slot is released", func() bool { return h.scaler.slots.InUse() == 0 && len(h.scaler.Held()) == 0 })
+	if n := h.scaler.NoJobExits(); n != 0 {
+		t.Fatalf("no-job exits %d after a withdrawn permit, want 0", n)
+	}
+	if m := h.jit.minted(); len(m) != 0 {
+		t.Fatalf("minted %v", m)
+	}
+}
+
+// Mutation: reap skipping waiting runners (no withdrawLocked) turns it red:
+// the Bind keeps waiting and the slot stays taken.
+func TestAdmitWithdrawnWhenCountDrops(t *testing.T) {
+	a := newFakeAdmit(make(chan bool))
+	h := admitHarness(t, 2, a, nil)
+	desiredSoon(t, h.scaler, context.Background(), 1)
+	name := a.nextBind(t)
+	if n := desiredSoon(t, h.scaler, context.Background(), 0); n != 0 {
+		t.Fatalf("Desired(0) = %d, want 0", n)
+	}
+	select {
+	case <-a.ctxOf(name).Done():
+	case <-time.After(time.Second):
+		t.Fatal("the waiting Bind's context did not end")
+	}
+	eventually(t, "the slot is released", func() bool { return h.scaler.slots.InUse() == 0 })
+	if m := h.jit.minted(); len(m) != 0 {
+		t.Fatalf("minted %v for a withdrawn runner", m)
+	}
+}
+
+// Mutation: counting stateWithdrawn in activeLocked turns it red: the second
+// Desired(1) withdraws the older runner too.
+func TestAdmitWithdrawsNewestOnce(t *testing.T) {
+	a := newFakeAdmit(make(chan bool))
+	a.deaf = true // a withdrawn runner stays withdrawn until its Bind answers
+	h := admitHarness(t, 2, a, nil)
+	h.scaler.names = scripted("local-ci-older", "local-ci-newer")
+	desiredSoon(t, h.scaler, context.Background(), 2)
+	a.nextBind(t)
+	a.nextBind(t)
+	desiredSoon(t, h.scaler, context.Background(), 1)
+	desiredSoon(t, h.scaler, context.Background(), 1)
+	if a.ctxOf("local-ci-newer").Err() == nil {
+		t.Fatal("the newer runner was not withdrawn")
+	}
+	if a.ctxOf("local-ci-older").Err() != nil {
+		t.Fatal("the older runner was withdrawn too")
+	}
+	if st := stateOf(h.scaler, "local-ci-older"); st != stateWaiting {
+		t.Fatalf("the older runner's state %d, want waiting", st)
+	}
+}
+
+// Mutation: launching a runner withdrawn while its admission came turns it
+// red: it is minted.
+func TestAdmitAdmissionRacingWithdrawal(t *testing.T) {
+	a := newFakeAdmit(make(chan bool))
+	a.deaf = true
+	h := admitHarness(t, 2, a, nil)
+	desiredSoon(t, h.scaler, context.Background(), 1)
+	name := a.nextBind(t)
+	desiredSoon(t, h.scaler, context.Background(), 0)
+	if st := stateOf(h.scaler, name); st != stateWithdrawn {
+		t.Fatalf("state %d, want withdrawn", st)
+	}
+	a.answers <- true
+	eventually(t, "the withdrawn runner is released", func() bool { return h.scaler.slots.InUse() == 0 })
+	if u := a.unbound(); !slices.Equal(u, []string{name}) {
+		t.Fatalf("unbinds %v, want %s once", u, name)
+	}
+	if m := h.jit.minted(); len(m) != 0 {
+		t.Fatalf("minted %v for a withdrawn runner", m)
+	}
+}
+
+// Mutation: Bind under the caller's ctx instead of WithoutCancel(ctx) turns
+// it red.
+func TestAdmitBindSurvivesCallerContext(t *testing.T) {
+	a := newFakeAdmit(make(chan bool))
+	h := admitHarness(t, 2, a, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	desiredSoon(t, h.scaler, ctx, 1)
+	name := a.nextBind(t)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+	if err := a.ctxOf(name).Err(); err != nil {
+		t.Fatalf("the Bind's context ended with its caller's: %v", err)
+	}
+	a.answers <- true
+	eventually(t, "the runner starts", func() bool { return len(h.starter.started()) == 1 })
+}
+
+func TestAdmitDrainBetweenBindAndMint(t *testing.T) {
+	a := newFakeAdmit(make(chan bool))
+	h := admitHarness(t, 2, a, nil)
+	desiredSoon(t, h.scaler, context.Background(), 1)
+	name := a.nextBind(t)
+	h.scaler.Drain()
+	a.answers <- true
+	eventually(t, "the drained runner is released", func() bool { return h.scaler.slots.InUse() == 0 })
+	if s := h.starter.started(); len(s) != 0 {
+		t.Fatalf("started %v while draining", s)
+	}
+	if u := a.unbound(); !slices.Equal(u, []string{name}) {
+		t.Fatalf("unbinds %v, want %s once", u, name)
+	}
+	if !strings.Contains(strings.Join(h.logs.lines(), "\n"), "draining; not starting the runner") {
+		t.Fatalf("no errDrained line: %v", h.logs.lines())
+	}
+}
+
+// Mutation: calling Unbind only from Exited (not from release) turns it red:
+// a launch that fails after its admission keeps its hold.
+func TestAdmitUnbindOnEveryRelease(t *testing.T) {
+	a := newFakeAdmit(nil)
+	h := admitHarness(t, 2, a, nil)
+	desiredSoon(t, h.scaler, context.Background(), 1)
+	eventually(t, "the runner starts", func() bool { return len(h.starter.started()) == 1 })
+	first := h.starter.started()[0]
+	eventually(t, "the runner is idle", func() bool { return stateOf(h.scaler, first) == stateIdle })
+	h.scaler.Exited(first)
+	if u := a.unbound(); !slices.Equal(u, []string{first}) {
+		t.Fatalf("unbinds %v after Exited, want %s", u, first)
+	}
+	h.starter.mu.Lock()
+	h.starter.err = errors.New("create failed")
+	h.starter.mu.Unlock()
+	desiredSoon(t, h.scaler, context.Background(), 1)
+	eventually(t, "the failed launch is released", func() bool {
+		return len(h.starter.started()) == 2 && h.scaler.slots.InUse() == 0
+	})
+	second := h.starter.started()[1]
+	eventually(t, "the failed launch is unbound", func() bool { return len(a.unbound()) == 2 })
+	if u := a.unbound(); !slices.Equal(u, []string{first, second}) {
+		t.Fatalf("unbinds %v, want %s then %s, once each", u, first, second)
+	}
+}
+
+// Mutation: waiting asynchronously regardless of Budgeted turns it red.
+func TestAdmitInlineWhenUnbudgeted(t *testing.T) {
+	a := newFakeAdmit(make(chan bool))
+	a.setBudgeted(false)
+	h := admitHarness(t, 2, a, nil)
+	desired(t, h.scaler, 1)
+	if s := h.starter.started(); len(s) != 1 {
+		t.Fatalf("started %v when Desired returned, want one runner inline", s)
+	}
+	if b := a.bindsSoFar(); len(b) != 0 {
+		t.Fatalf("binds %v while unbudgeted", b)
+	}
+}
+
+func TestScalerWaitJoins(t *testing.T) {
+	a := newFakeAdmit(make(chan bool))
+	h := admitHarness(t, 2, a, nil)
+	desiredSoon(t, h.scaler, context.Background(), 2)
+	a.nextBind(t)
+	a.nextBind(t)
+	h.scaler.Abort()
+	done := make(chan struct{})
+	go func() {
+		h.scaler.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Wait did not return within 1s of Abort")
+	}
+	if n := h.scaler.slots.InUse(); n != 0 {
+		t.Fatalf("%d slots in use after Wait, want 0", n)
+	}
+}
+
+func TestNilAdmitUnchanged(t *testing.T) {
+	h := newHarness(NewSlots(2))
+	desired(t, h.scaler, 1)
+	if s := h.starter.started(); len(s) != 1 {
+		t.Fatalf("started %v, want one runner inline", s)
+	}
+	h.scaler.Exited(h.starter.started()[0])
+	h.scaler.Wait()
+	if n := h.scaler.slots.InUse(); n != 0 {
+		t.Fatalf("%d slots in use, want 0", n)
 	}
 }
