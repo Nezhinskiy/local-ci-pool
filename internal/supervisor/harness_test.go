@@ -23,6 +23,7 @@ import (
 	"github.com/moby/moby/api/types/system"
 	"github.com/moby/moby/client"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/admit"
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
 	"github.com/Nezhinskiy/local-ci-pool/internal/fakeactions"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
@@ -653,6 +654,103 @@ func (f *fakeSettings) set(max int, invalid bool) {
 	f.max, f.invalid = max, invalid
 }
 
+// ---- fake coreslot ----
+
+// fakeRequest is one coreslot request. The test admits it, grants it outside
+// the budget, ends it with a status, or lets it hang.
+type fakeRequest struct {
+	args     []string
+	admitted chan admit.Grant
+	done     chan int
+	endOnce  sync.Once
+
+	mu        sync.Mutex
+	withdrawn int
+	closed    int
+}
+
+func (r *fakeRequest) Admitted() <-chan admit.Grant { return r.admitted }
+func (r *fakeRequest) Done() <-chan int             { return r.done }
+
+// Withdraw gives the request up, as coreslot does on SIGINT (exit 130).
+func (r *fakeRequest) Withdraw() {
+	r.mu.Lock()
+	r.withdrawn++
+	r.mu.Unlock()
+	r.end(130)
+}
+
+// Close ends the hold, as the real one does once its stdin closes.
+func (r *fakeRequest) Close() {
+	r.mu.Lock()
+	r.closed++
+	r.mu.Unlock()
+	r.end(0)
+}
+
+func (r *fakeRequest) admit(g admit.Grant) { r.admitted <- g }
+
+// end makes the child exit with status; before an admission, Admitted closes
+// empty.
+func (r *fakeRequest) end(status int) {
+	r.endOnce.Do(func() {
+		close(r.admitted)
+		r.done <- status
+	})
+}
+
+func (r *fakeRequest) counts() (withdrawn, closed int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.withdrawn, r.closed
+}
+
+// fakeCoreslot is Deps.AdmitStart. AutoAdmit admits every request at once;
+// otherwise each request started is sent on started.
+type fakeCoreslot struct {
+	AutoAdmit bool
+	started   chan *fakeRequest
+
+	mu   sync.Mutex
+	reqs []*fakeRequest
+}
+
+func newFakeCoreslot() *fakeCoreslot {
+	return &fakeCoreslot{AutoAdmit: true, started: make(chan *fakeRequest, 16)}
+}
+
+func (f *fakeCoreslot) start(_ context.Context, _ string, args, _ []string) (admit.Proc, error) {
+	r := &fakeRequest{args: args, admitted: make(chan admit.Grant, 1), done: make(chan int, 1)}
+	f.mu.Lock()
+	f.reqs = append(f.reqs, r)
+	auto := f.AutoAdmit
+	f.mu.Unlock()
+	if auto {
+		r.admit(admit.Grant{Hold: "h"})
+	} else {
+		f.started <- r
+	}
+	return r, nil
+}
+
+func (f *fakeCoreslot) requests() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.reqs)
+}
+
+// next is the next request started, within defaultWait.
+func (f *fakeCoreslot) next(t *testing.T) *fakeRequest {
+	t.Helper()
+	select {
+	case r := <-f.started:
+		return r
+	case <-time.After(defaultWait):
+		t.Fatal("no coreslot request started")
+		return nil
+	}
+}
+
 // ---- log ----
 
 type syncBuffer struct {
@@ -697,6 +795,11 @@ type harness struct {
 	mirror   *fakeMirror
 	freeGiB  float64
 	stateDir string
+	// coreslot is Deps.AdmitStart, admitting every request unless a test
+	// turns AutoAdmit off before start; coreslotPath is Deps.Coreslot, ""
+	// for a Mac without it.
+	coreslot     *fakeCoreslot
+	coreslotPath string
 
 	mu       sync.Mutex
 	images   map[string]string // identity -> image reference
@@ -734,10 +837,12 @@ func newHarness(t *testing.T, slots int, factor time.Duration, repos ...string) 
 		// Made before the Cleanup of stop, so it is removed after the pool
 		// stopped: cleanups run last first, and a base build that ends while
 		// the test does writes its key here.
-		stateDir:  t.TempDir(),
-		images:    map[string]string{},
-		checkErr:  map[string]error{},
-		runnerErr: map[string]error{},
+		stateDir:     t.TempDir(),
+		coreslot:     newFakeCoreslot(),
+		coreslotPath: "/opt/example/bin/coreslot",
+		images:       map[string]string{},
+		checkErr:     map[string]error{},
+		runnerErr:    map[string]error{},
 	}
 	for _, r := range repos {
 		h.gh.repos["example/"+r] = &fakeRepo{private: true, marker: marker()}
@@ -861,6 +966,9 @@ func (h *harness) deps() Deps {
 		VM:         h.vmBackend(),
 		Mirror:     h.mirrorDep(),
 		StateDir:   h.stateDir,
+		Coreslot:   h.coreslotPath,
+		Self:       "/opt/example/bin/pool",
+		AdmitStart: h.coreslot.start,
 	}
 }
 

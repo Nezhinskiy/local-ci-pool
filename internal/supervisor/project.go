@@ -14,6 +14,7 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/admit"
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
 	"github.com/Nezhinskiy/local-ci-pool/internal/machine"
@@ -74,7 +75,10 @@ type project struct {
 	gen          int // the token generation client was built with
 	scaleSetID   int
 	scaler       *runner.Scaler
-	listener     *listener.Listener
+	// gate is the docker class's coreslot gate, its scaler's Admit; nil on
+	// the container class.
+	gate     *admit.Gate
+	listener *listener.Listener
 	// session is open, and this process opened it. Only a scale set this
 	// process holds a session on is ever deleted: the service deletes a
 	// scale set even while another process holds its session.
@@ -221,8 +225,12 @@ func (pr *project) setup() error {
 		return err
 	}
 	start, survivors := pr.start, func() int { return s.survivorsOf(pr.identity) }
+	var gate *admit.Gate
+	var admitter runner.Admitter // a nil *admit.Gate would be a non-nil Admitter
 	if pr.docker {
 		start, survivors = pr.startVM, nil
+		gate = pr.newGate()
+		admitter = gate
 	}
 	sc := runner.NewScaler(runner.ScalerConfig{
 		ScaleSetID: id,
@@ -234,11 +242,15 @@ func (pr *project) setup() error {
 		Log:        pr.log,
 		Survivors:  survivors,
 		Vet:        pr.vetFor(),
+		Admit:      admitter,
 	})
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
-	pr.scaleSetID, pr.scaler = id, sc
+	pr.scaleSetID, pr.scaler, pr.gate = id, sc, gate
 	if pr.draining {
+		if gate != nil {
+			gate.Stop()
+		}
 		sc.Drain()
 	}
 	return nil
@@ -715,13 +727,21 @@ func (pr *project) claimRefresh() bool {
 // outlasts the drain bound by more than that. At the bound an in-flight start
 // or reap is aborted, and the runners left are removed. It reports false if
 // life ended first, leaving the session to Run.
+//
+// The docker class's runners waiting for coreslot are withdrawn first, so
+// none is minted only to be dropped; a running runner keeps its hold until
+// it exits. Once the wait is over every hold left is closed, and the scaler's
+// goroutines are joined before the runners left are removed.
 func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	clock := pr.s.deps.Clock
 	pr.mu.Lock()
-	l, sc := pr.listener, pr.scaler
+	l, sc, gate := pr.listener, pr.scaler, pr.gate
 	pr.mu.Unlock()
 	if l != nil {
 		l.SetMaxRunners(0)
+	}
+	if gate != nil {
+		gate.Stop()
 	}
 	if sc != nil {
 		sc.Drain()
@@ -754,7 +774,17 @@ func (pr *project) drain(life context.Context, deadline time.Time) bool {
 	postEnd := clock.Now().Add(budget)
 	post, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	if sc := pr.getScaler(); sc != nil && len(sc.Held()) > 0 {
+	pr.mu.Lock()
+	sc, gate = pr.scaler, pr.gate
+	pr.mu.Unlock()
+	switch {
+	case gate != nil:
+		// Drain before Wait: Abort does not stop a Desired from reserving.
+		sc.Drain()
+		gate.Close()
+		sc.Abort()
+		sc.Wait()
+	case sc != nil && len(sc.Held()) > 0:
 		sc.Abort()
 	}
 	pr.cancel()
@@ -980,8 +1010,12 @@ func (pr *project) health() ProjectHealth {
 		h.Healthy = true
 	}
 	h.Stuck = slices.Clone(pr.stuck)
-	sc := pr.scaler
+	sc, gate := pr.scaler, pr.gate
 	pr.mu.Unlock()
+	if gate != nil {
+		c := gate.Health()
+		h.Coreslot = &c
+	}
 	if h.Healthy && sc != nil {
 		if n := sc.NoJobExits(); n >= noJobLimit {
 			h.Healthy, h.Class = false, "runners"

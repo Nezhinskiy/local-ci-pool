@@ -18,6 +18,7 @@ import (
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/admit"
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
 	"github.com/Nezhinskiy/local-ci-pool/internal/image"
@@ -1048,5 +1049,255 @@ func TestAFailedBootWithAnUndeletableCloneStopsTheDockerClass(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if n := h.lima.count("clone"); n != 1 {
 		t.Fatalf("%d clones beside a clone that may still run", n)
+	}
+}
+
+// ---- the coreslot gate ----
+
+// coreslotOf is the docker class's coreslot health, failing the test when
+// the entry has none.
+func (h *harness) coreslotOf(repo string) admit.Health {
+	h.t.Helper()
+	p, ok := h.dockerHealth(repo)
+	if !ok || p.Coreslot == nil {
+		h.t.Fatalf("no coreslot health on %s's docker entry: %+v", repo, p)
+	}
+	return *p.Coreslot
+}
+
+// coreslotIs reports whether the docker class's coreslot health satisfies
+// cond.
+func (h *harness) coreslotIs(repo string, cond func(admit.Health) bool) bool {
+	p, ok := h.dockerHealth(repo)
+	return ok && p.Coreslot != nil && cond(*p.Coreslot)
+}
+
+// gatedHarness serves alpha with the docker class and a coreslot that admits
+// nothing by itself. The clock runs 10 times the wall clock's speed: the
+// gate's answer bound, Timeout and its slack, is then 27 s of the test's.
+func gatedHarness(t *testing.T, vms int) *harness {
+	h := newHarness(t, 2, 10, "alpha")
+	h.withDocker("alpha")
+	h.settings = &fakeSettings{vms: vms}
+	h.coreslot.AutoAdmit = false
+	h.start()
+	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	return h
+}
+
+// A docker job's runner waits for its coreslot permit holding its VM slot,
+// and no VM starts until coreslot admits it. The request is the docker
+// class's: labelled <identity>:docker-vm, sized as the VM, with coreslot's
+// 4-minute timeout running the hold outside the budget.
+// Mutation: launching before Bind returns (admitThenLaunch calling launch
+// ahead of Bind) starts the VM while the request waits.
+func TestDockerVMWaitsForPermit(t *testing.T) {
+	h := gatedHarness(t, 1)
+	h.actions.Assign(alphaDockerSet, 1)
+	req := h.coreslot.next(t)
+	want := []string{"run", "--restart=no", "--label", "alpha:docker-vm", "--mem", "6G",
+		"--timeout", "4m", "--on-timeout", "run", "--", "/opt/example/bin/pool", "hold"}
+	if !slices.Equal(req.args, want) {
+		t.Fatalf("request %q, want %q", req.args, want)
+	}
+	h.eventually("the waiting runner holds the VM slot", func() bool { return h.sup.vmSlots.InUse() == 1 })
+	time.Sleep(100 * time.Millisecond)
+	if n := h.lima.count("clone "); n != 0 || len(h.lima.running()) != 0 {
+		t.Fatalf("%d clones before coreslot admitted the runner: %v", n, h.lima.all())
+	}
+	if c := h.coreslotOf(alphaRepo); c.State != "waiting" || c.Waiting != 1 || c.Held != 0 {
+		t.Fatalf("coreslot health %+v while the runner waits", c)
+	}
+
+	req.admit(admit.Grant{Hold: "h-1"})
+	h.eventually("the VM runs once admitted", func() bool { return len(h.lima.running()) == 1 })
+	h.eventually("the runner held", func() bool {
+		return h.coreslotIs(alphaRepo, func(c admit.Health) bool { return c.State == "held" && c.Held == 1 && c.Unbudgeted == 0 })
+	})
+}
+
+// A grant coreslot gives outside the budget (its 4-minute timeout) starts the
+// VM, shows the runner as running without the budget, and latches nothing:
+// the next job asks coreslot again.
+// Mutation: latching the gate on a non-empty Unbudgeted turns it red.
+func TestDockerUnbudgetedGrantRuns(t *testing.T) {
+	h := gatedHarness(t, 2)
+	h.actions.Assign(alphaDockerSet, 1)
+	h.coreslot.next(t).admit(admit.Grant{Hold: "h-1", Unbudgeted: "timeout"})
+	h.eventually("the VM runs", func() bool { return len(h.lima.running()) == 1 })
+	h.eventually("the runner shown without the budget", func() bool {
+		return h.coreslotIs(alphaRepo, func(c admit.Health) bool {
+			return c.State == "held" && c.Held == 1 && c.Unbudgeted == 1 && c.LastUnbudgeted == "timeout"
+		})
+	})
+	h.actions.Assign(alphaDockerSet, 1)
+	h.coreslot.next(t)
+}
+
+// A request that ends before coreslot admits it, with any status but 64,
+// still starts the VM, without the budget.
+// Mutation: Bind returning false for it, which leaves the assigned job
+// without a runner, turns it red.
+func TestDockerFailedRequestStillRuns(t *testing.T) {
+	h := gatedHarness(t, 1)
+	h.actions.Assign(alphaDockerSet, 1)
+	h.coreslot.next(t).end(70)
+	h.eventually("the VM runs", func() bool { return len(h.lima.running()) == 1 })
+	if c := h.coreslotOf(alphaRepo); c.State != "held" || c.Unbudgeted != 1 || c.LastUnbudgeted != "exit 70" {
+		t.Fatalf("coreslot health %+v, want one runner without the budget, exit 70", c)
+	}
+}
+
+// A job cancelled, or assigned elsewhere, while its runner waits for coreslot
+// withdraws the request and frees the VM slot; no VM starts.
+// Mutation: reap skipping waiting runners (no withdrawLocked) keeps the
+// request and the slot.
+func TestCancelledJobWithdrawsWaiter(t *testing.T) {
+	h := gatedHarness(t, 1)
+	h.actions.Assign(alphaDockerSet, 1)
+	req := h.coreslot.next(t)
+	h.eventually("the waiting runner holds the VM slot", func() bool { return h.sup.vmSlots.InUse() == 1 })
+	h.actions.Assign(alphaDockerSet, -1)
+	h.eventually("the request withdrawn and the slot freed", func() bool {
+		w, _ := req.counts()
+		return w == 1 && h.sup.vmSlots.InUse() == 0
+	})
+	if n := h.lima.count("clone "); n != 0 {
+		t.Fatalf("%d clones for a withdrawn runner", n)
+	}
+	if c := h.coreslotOf(alphaRepo); c.Waiting != 0 || c.Held != 0 {
+		t.Fatalf("coreslot health %+v after the withdrawal", c)
+	}
+}
+
+// A drain withdraws a runner waiting for coreslot, frees its slot and
+// advertises 0; the running VM's hold stays until its runner exits.
+// Mutation: the drain calling the gate's Close instead of Stop closes the
+// running runner's hold at once.
+func TestDrainWithdrawsWaitingPermit(t *testing.T) {
+	h := gatedHarness(t, 2)
+	h.actions.Assign(alphaDockerSet, 2)
+	running, waiting := h.coreslot.next(t), h.coreslot.next(t)
+	running.admit(admit.Grant{Hold: "h-1"})
+	h.eventually("one VM runs", func() bool { return len(h.lima.running()) == 1 })
+	r := h.lima.running()[0]
+	h.actions.Started(alphaDockerSet, r)
+	h.delivered(alphaDockerSet)
+
+	h.cancel() // the pool stops: every project drains
+	h.eventually("the waiter withdrawn and its slot freed", func() bool {
+		w, _ := waiting.counts()
+		return w == 1 && h.sup.vmSlots.InUse() == 1
+	})
+	h.eventually("0 advertised", func() bool { return h.actions.Capacity(alphaDockerSet) == "0" })
+	time.Sleep(100 * time.Millisecond)
+	if _, closed := running.counts(); closed != 0 {
+		t.Fatalf("the running VM's hold closed %d times while its runner runs", closed)
+	}
+	if n := h.lima.count("clone "); n != 1 {
+		t.Fatalf("%d clones, want the running runner's alone", n)
+	}
+
+	h.actions.ClearBusy() // the job ended: GitHub lets the scale set go
+	h.lima.finish(r)
+	h.eventually("the hold closed once its runner exited", func() bool {
+		_, closed := running.counts()
+		return closed == 1
+	})
+	if err := h.wait(defaultWait); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+// The VM's runner exiting closes its hold, so coreslot's room is given back.
+// Mutation: release not calling Unbind keeps the hold.
+func TestPermitEndsWithRunner(t *testing.T) {
+	h := gatedHarness(t, 1)
+	h.actions.Assign(alphaDockerSet, 1)
+	req := h.coreslot.next(t)
+	req.admit(admit.Grant{Hold: "h-1"})
+	h.eventually("the VM runs", func() bool { return len(h.lima.running()) == 1 })
+	r := h.lima.running()[0]
+	if _, closed := req.counts(); closed != 0 {
+		t.Fatalf("the hold closed %d times while its runner runs", closed)
+	}
+	h.actions.Started(alphaDockerSet, r)
+	h.actions.Completed(alphaDockerSet, r)
+	h.delivered(alphaDockerSet)
+	h.lima.finish(r)
+	h.eventually("the hold closed", func() bool {
+		_, closed := req.counts()
+		return closed == 1 && h.sup.vmSlots.InUse() == 0
+	})
+}
+
+// A launch refused after the admission, for a disk that ran short while the
+// runner waited, closes the hold and frees the slot.
+// Mutation: Unbind only in Exited, not in release, keeps the hold of a launch
+// that failed.
+func TestLaunchFailureAfterAdmissionClosesHold(t *testing.T) {
+	h := gatedHarness(t, 1)
+	h.actions.Assign(alphaDockerSet, 1)
+	req := h.coreslot.next(t) // the vet before the wait passed
+	h.mu.Lock()
+	h.freeGiB = 1
+	h.mu.Unlock()
+	req.admit(admit.Grant{Hold: "h-1"})
+	h.eventually("the hold closed and the slot freed", func() bool {
+		_, closed := req.counts()
+		return closed == 1 && h.sup.vmSlots.InUse() == 0
+	})
+	if n := h.lima.count("clone "); n != 0 {
+		t.Fatalf("%d clones on a short disk", n)
+	}
+}
+
+// A Mac without coreslot runs as before: the VM is launched within the
+// message's handling, with no request, and the health says why.
+// Mutation: an asynchronous launch while unbudgeted (Desired ignoring
+// Budgeted) lets the listener take the next message while the VM starts.
+func TestNoCoreslotRunsAsToday(t *testing.T) {
+	h := newHarness(t, 2, 10, "alpha")
+	h.withDocker("alpha")
+	h.coreslotPath = ""
+	h.start()
+	h.eventually("alpha's docker class healthy", func() bool { return h.dockerHealthy(alphaRepo) })
+	if c := h.coreslotOf(alphaRepo); c.State != "unbudgeted" || c.Reason != admit.ReasonNotInstalled {
+		t.Fatalf("coreslot health %+v without coreslot", c)
+	}
+	held, release := h.lima.holdOnce("clone ")
+	defer release()
+	h.actions.Assign(alphaDockerSet, 1)
+	select {
+	case <-held:
+	case <-time.After(defaultWait):
+		t.Fatal("no clone started")
+	}
+	h.actions.Assign(alphaDockerSet, 0) // a second message, statistics only
+	time.Sleep(200 * time.Millisecond)
+	if n := h.actions.Pending(alphaDockerSet); n != 1 {
+		t.Fatalf("%d messages pending while the VM starts, want the second one: the launch is not inline", n)
+	}
+	release()
+	h.delivered(alphaDockerSet)
+	h.eventually("the VM runs", func() bool { return len(h.lima.running()) == 1 })
+	if n := h.coreslot.requests(); n != 0 {
+		t.Fatalf("%d coreslot requests without coreslot", n)
+	}
+}
+
+// The container class asks coreslot nothing: its job starts with no request.
+func TestContainerClassUngated(t *testing.T) {
+	h := gatedHarness(t, 1)
+	h.actions.Assign(alphaSet, 1)
+	img := h.imageOf("alpha")
+	h.eventually("a container runner", func() bool { return len(h.docker.runners(img)) == 1 })
+	if n := h.coreslot.requests(); n != 0 {
+		t.Fatalf("%d coreslot requests for a container job", n)
+	}
+	for _, p := range h.sup.Snapshot().Projects {
+		if p.Repo == alphaRepo && !p.DockerClass && p.Coreslot != nil {
+			t.Fatalf("the container class has coreslot health %+v", *p.Coreslot)
+		}
 	}
 }
