@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 
@@ -40,6 +41,7 @@ commands:
   forget         delete this Mac's heartbeat variable from every repository
   version        print the version and the commit
   print-defaults print the built-in defaults as JSON
+  hold           (internal) wait as a coreslot request's command
 `
 
 // pool is the supervisor as run needs it. *supervisor.Supervisor satisfies it.
@@ -78,7 +80,7 @@ type services struct {
 }
 
 // run executes one command line and returns the process exit code.
-func run(ctx context.Context, args []string, stdout, stderr io.Writer, svc services) int {
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, svc services) int {
 	if len(args) == 0 {
 		_, _ = fmt.Fprint(stderr, usage)
 		return exitUsage
@@ -103,6 +105,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, svc servi
 			return usageError(stderr, "print-defaults takes no arguments")
 		}
 		return cmdPrintDefaults(stdout, stderr)
+	case "hold":
+		if len(rest) != 0 {
+			return usageError(stderr, "hold takes no arguments")
+		}
+		return hold(os.Getenv, stdin, stdout)
 	case "help", "-h", "--help":
 		_, _ = fmt.Fprint(stdout, usage)
 		return exitOK

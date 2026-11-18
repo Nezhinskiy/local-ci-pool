@@ -90,7 +90,7 @@ func do(t *testing.T, s services, args ...string) (code int, stdout, stderr stri
 	var out, errb bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	code = run(ctx, args, &out, &errb, s)
+	code = run(ctx, args, strings.NewReader(""), &out, &errb, s)
 	return code, out.String(), errb.String()
 }
 
@@ -138,7 +138,9 @@ func TestCleanDrainExitsZero(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var out, errb bytes.Buffer
 	done := make(chan int, 1)
-	go func() { done <- run(ctx, []string{"run"}, &out, &errb, poolServices(p, &recVars{})) }()
+	go func() {
+		done <- run(ctx, []string{"run"}, strings.NewReader(""), &out, &errb, poolServices(p, &recVars{}))
+	}()
 	time.Sleep(20 * time.Millisecond)
 	cancel() // SIGTERM
 	select {
