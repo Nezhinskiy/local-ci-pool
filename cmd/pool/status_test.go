@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/admit"
 	"github.com/Nezhinskiy/local-ci-pool/internal/health"
 	"github.com/Nezhinskiy/local-ci-pool/internal/supervisor"
 )
@@ -338,5 +339,50 @@ func TestFetchHealthDoesNotFollowRedirects(t *testing.T) {
 	svc := services{fetchHealth: fetchHealth}
 	if code, _, stderr := do(t, svc, "status", "--health-addr", addr); code != exitError || !strings.Contains(stderr, "not the pool's health endpoint") {
 		t.Errorf("status: exit %d, stderr %q, want the not-the-pool line", code, stderr)
+	}
+}
+
+// A docker-class entry with a coreslot gate gets one line under it: the
+// runners waiting and held, the oldest wait, and the runners running without
+// the budget with the last reason; a gate that is off says why. /healthz
+// carries the gate as "coreslot" on that entry alone.
+func TestStatusShowsCoreslot(t *testing.T) {
+	snap := statusFixture()
+	snap.Projects = []supervisor.ProjectHealth{
+		{Repo: "example/alpha", Healthy: true},
+		{Repo: "example/alpha", DockerClass: true, Healthy: true,
+			Coreslot: &admit.Health{State: "waiting", Waiting: 1, OldestWaitS: 42}},
+		{Repo: "example/beta", DockerClass: true, Healthy: true,
+			Coreslot: &admit.Health{State: "held", Held: 1, Unbudgeted: 1, LastUnbudgeted: "timeout"}},
+		{Repo: "example/gamma", DockerClass: true, Healthy: true,
+			Coreslot: &admit.Health{State: "unbudgeted", Reason: "not-installed"}},
+	}
+	svc, body := statusServices(http.StatusOK, snap, nil)
+	_, stdout, _ := do(t, svc, "status")
+	want := "  example/alpha           healthy\n" +
+		"  example/alpha (docker)  healthy\n    coreslot: waiting 1, held 0, oldest 42 s\n" +
+		"  example/beta (docker)   healthy\n    coreslot: waiting 0, held 1, unbudgeted 1 (timeout)\n" +
+		"  example/gamma (docker)  healthy\n    coreslot: unbudgeted (not-installed)\n"
+	if !strings.Contains(stdout, want) {
+		t.Fatalf("stdout lacks\n%s\ngot:\n%s", want, stdout)
+	}
+
+	var back struct {
+		Projects []map[string]json.RawMessage `json:"projects"`
+	}
+	if err := json.Unmarshal(body, &back); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := back.Projects[0]["coreslot"]; ok {
+		t.Errorf("the container class's entry carries coreslot: %s", body)
+	}
+	for i, want := range []string{
+		`{"state":"waiting","waiting":1,"held":0,"unbudgeted":0,"oldest_wait_s":42}`,
+		`{"state":"held","waiting":0,"held":1,"unbudgeted":1,"last_unbudgeted":"timeout","oldest_wait_s":0}`,
+		`{"state":"unbudgeted","reason":"not-installed","waiting":0,"held":0,"unbudgeted":0,"oldest_wait_s":0}`,
+	} {
+		if got := string(back.Projects[i+1]["coreslot"]); got != want {
+			t.Errorf("project %d: coreslot %s, want %s", i+1, got, want)
+		}
 	}
 }

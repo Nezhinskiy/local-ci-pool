@@ -327,6 +327,66 @@ What you see and do:
 - **After the block is removed** the pool stops the class but keeps its base (about 10 GiB) and its key
   file. To reclaim them: `limactl unprotect local-ci-docker-base-main-<identity>`, `limactl delete
   local-ci-docker-base-main-<identity>`, and delete `docker-base-<identity>.key`.
+- **coreslot:** where it is installed, each VM waits for coreslot to admit its 6 GiB after GitHub
+  assigned the job, at most 4 minutes, and `pool status` adds a `coreslot:` line under the class (see
+  [coreslot](#coreslot)). A base build takes its VM slot without asking coreslot.
+
+## coreslot
+
+coreslot admits work on a Mac by its memory. When it is installed, a [docker-class](#the-docker-class)
+VM starts only once coreslot has admitted its 6 GiB, or after 4 minutes without it. The container class
+does not ask coreslot.
+
+- **Where the pool looks.** Once, at start, in this order: `~/.local/bin/coreslot`,
+  `/opt/homebrew/bin/coreslot`, `/usr/local/bin/coreslot`, then the launchd agent's `PATH`. The pool
+  runs the installed coreslot and carries no copy of it. A Mac where none was found at start runs its
+  docker VMs as before, without the budget, until the pool restarts: after installing coreslot, restart
+  the pool once no job runs (`launchctl kickstart -k gui/$(id -u)/com.local-ci-pool.pool`). An upgraded
+  coreslot needs no restart.
+- **One request per runner.** Once GitHub has assigned a docker job to the Mac, the pool takes a VM
+  slot for its runner as before, then runs
+  `coreslot run --restart=no --label <identity>:docker-vm --mem 6G --timeout 4m --on-timeout run -- <pool> hold`.
+  `coreslot status` lists it under the label, `alpha:docker-vm` for the repository `alpha`. Once
+  coreslot admits it, `pool hold` keeps the room while the VM runs; the room is given back when the
+  runner exits, or when its VM could not be started after all.
+- **While it waits** the job shows as queued at GitHub, `pool status` shows
+  `coreslot: waiting 1, held 0, oldest 42 s` under the class, and no VM runs. The wait lasts at most 4
+  minutes; then coreslot runs the hold outside the budget and the VM starts anyway, rather than lose the
+  job. The wait never holds up the pool's other projects or messages. A job cancelled meanwhile, or
+  given to another Mac, withdraws its request on the next message.
+- **Unbudgeted.** A runner runs without the budget, and the rest stays as it is, when coreslot ran its
+  hold outside the budget (its timeout or its fail-open; coreslot's text, such as `timeout`, is shown as
+  it is), when the request ended before it was admitted (`exit 70`, for example), or when coreslot did
+  not answer within 4 minutes 30 seconds (`no-answer`). `pool status` shows such runners while they
+  run: `coreslot: waiting 0, held 1, unbudgeted 1 (timeout)`. Three causes turn the budget off for the
+  whole class: no coreslot found or the found one could not be run (`not-installed`), any other failure
+  to start it (`start`), and a coreslot too old for these flags, which exits 64 (`coreslot-too-old`).
+  Every VM then starts at once, as without coreslot; `pool status` shows
+  `coreslot: unbudgeted (not-installed)` and `/healthz` `"state":"unbudgeted"` with the reason. It turns
+  on again by itself, at the next job, once the coreslot binary the pool found changes (an upgrade, or a
+  reinstall after it was removed); a Mac where none was found at start needs the restart above.
+- **A killed pool.** Each `hold` exits as soon as the pool is gone (its stdin closes), which gives its
+  room back; a request still waiting ends by itself within 4 minutes.
+- **Uninstall.** Nothing to undo in coreslot: the holds end with the pool, and the pool keeps no file in
+  coreslot's state directory. `./install.sh --uninstall` leaves coreslot installed.
+- **Not a security control.** The admission is scheduling: it keeps a docker VM from starting before
+  coreslot admitted its room or 4 minutes passed. A process of your own that edits coreslot's state can
+  delay the pool's VMs or let them all start, as it can for any coreslot client.
+
+The stated limits:
+
+1. GitHub assigns the job to the Mac before coreslot admits it: the pool cannot hold room before the
+   assignment. A wait that reaches 4 minutes starts the VM outside the budget.
+2. A wait plus the VM's start past 300 seconds makes GitHub reissue the job; a runner that has only
+   registered does not stop that. With another Mac's scale set on the label, the reissued job goes
+   there, and this Mac's waiting runner is withdrawn on the next message (or, if its VM already started,
+   it idles and is removed). With no other Mac the job comes back to this one.
+3. GitHub counts assigned jobs against the scale set's capacity, not registered runners, so a runner
+   waiting for coreslot draws no second job.
+4. A hold whose runner found no job still counts as a coreslot run, and so does one whose VM could not
+   start after the admission: the checks made before the request (a base build, the free disk) see the
+   Mac as it was when the wait began, and one that begins during the wait refuses the VM only after
+   coreslot admitted it.
 
 ## A repository is not served
 
@@ -382,7 +442,7 @@ The fields:
 | `login` | `false` while the last read of the token from `gh` failed (see [Install](#install)); `/healthz` answers 503 then too |
 | `probe` | whether this is a probe run |
 | `jobs` | the cap on jobs: `max` (0: none) and `error`, `config` while the settings file is invalid, absent otherwise (see [Limiting concurrent jobs](#limiting-concurrent-jobs)) |
-| `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, a `reason` and its `class` (`starting`, `draining`, `setup`, `down`, `image`, `preflight`, `vm` or `runners`) when not healthy, `docker_class` on [the docker class](#the-docker-class)'s entry and `not_installed` on such an entry on a Mac without Lima (healthy: it takes no docker jobs), and `stuck` when a job is queued that GitHub does not offer the pool (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)) |
+| `projects` | one entry per project: `repo`, `identity`, `image`, `healthy`, a `reason` and its `class` (`starting`, `draining`, `setup`, `down`, `image`, `preflight`, `vm` or `runners`) when not healthy, `docker_class` on [the docker class](#the-docker-class)'s entry and `not_installed` on such an entry on a Mac without Lima (healthy: it takes no docker jobs), `stuck` when a job is queued that GitHub does not offer the pool (see [A job stays queued on a free pool](#a-job-stays-queued-on-a-free-pool)), and `coreslot` on a docker-class entry once the class is set up (see [coreslot](#coreslot)): its `state` (`idle`, `waiting`, `held`, or `unbudgeted` while the budget is off, with the `reason`; the `reason` is `hold-lost` while a held runner's hold has ended before the runner), `waiting` and `held` (runners waiting for coreslot and runners admitted), `unbudgeted` and `last_unbudgeted` (the runners running without the budget and the last reason), and `oldest_wait_s` |
 | `redacted` | `true` on the body served without the token; absent otherwise |
 
 `pool status` reads the same endpoint and prints it as text (see [CI went hosted](#ci-went-hosted)).

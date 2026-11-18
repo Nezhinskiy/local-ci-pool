@@ -97,25 +97,25 @@ type Config struct {
 	Log   *slog.Logger
 }
 
-// Health is the gate's state for /healthz.
+// Health is the gate's state for /healthz, with its field names.
 type Health struct {
 	// State is "unbudgeted" (latched), "waiting", "held" or "idle", in that
 	// precedence.
-	State string
+	State string `json:"state"`
 	// Reason is the latch's reason while latched, else "hold-lost" while a
 	// held runner's hold has ended, else "".
-	Reason string
+	Reason string `json:"reason,omitempty"`
 	// Waiting is the number of Binds waiting for an answer.
-	Waiting int
+	Waiting int `json:"waiting"`
 	// Held is the number of bound runners.
-	Held int
+	Held int `json:"held"`
 	// Unbudgeted is the number of bound runners running without the budget.
-	Unbudgeted int
+	Unbudgeted int `json:"unbudgeted"`
 	// LastUnbudgeted is the reason of the last runner bound without the
 	// budget.
-	LastUnbudgeted string
+	LastUnbudgeted string `json:"last_unbudgeted,omitempty"`
 	// OldestWaitS is the age of the oldest waiting Bind, in seconds.
-	OldestWaitS int
+	OldestWaitS int `json:"oldest_wait_s"`
 }
 
 // held is one bound runner. proc is nil when the request ended before it was

@@ -520,6 +520,10 @@ takes effect without a restart; a lowered cap stops no running job. `pool status
 the last valid cap staying in force, and reported (`config invalid`); the runbook has
 [the details](docs/runbook.md#limiting-concurrent-jobs). Nothing writes the file for you.
 
+Where [coreslot](docs/runbook.md#coreslot) is installed, each docker-class VM also waits, at most 4
+minutes after GitHub assigned its job, for coreslot to admit its 6 GiB; `pool status` shows the wait
+(`coreslot: waiting 1, held 0, oldest 42 s`). Without coreslot the VMs start at once.
+
 
 ## Status
 

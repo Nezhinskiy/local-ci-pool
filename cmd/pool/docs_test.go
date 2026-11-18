@@ -83,3 +83,24 @@ func dedent(s string) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// Uninstalling the pool leaves nothing in coreslot: the runbook's coreslot
+// section says that the holds end with the pool and that the pool keeps no
+// file in coreslot's state directory.
+func TestRunbookNamesUninstall(t *testing.T) {
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "runbook.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, section, ok := strings.Cut(string(doc), "\n## coreslot\n")
+	if !ok {
+		t.Fatal("the runbook has no coreslot section")
+	}
+	section, _, _ = strings.Cut(section, "\n## ")
+	section = strings.Join(strings.Fields(section), " ") // a phrase may wrap
+	for _, want := range []string{"**Uninstall.**", "the holds end with the pool", "no file in coreslot's state directory"} {
+		if !strings.Contains(section, want) {
+			t.Errorf("the runbook's coreslot section lacks %q", want)
+		}
+	}
+}

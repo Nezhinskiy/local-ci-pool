@@ -85,6 +85,12 @@ before a repository commits the block.**
   is checked before each build and each clone, against what the VMs already running use: the 15 GiB is a
   floor for each VM started, not room kept for the ones running. The job stays queued; the pool never moves
   it elsewhere.
+- A docker VM waits for coreslot after its job is assigned. Where [coreslot](runbook.md#coreslot) is
+  installed, a runner whose job GitHub assigned holds its VM slot and asks coreslot to admit the VM's
+  6 GiB, under the label `<identity>:docker-vm`, before its JIT configuration is minted. The VM starts
+  once coreslot admits it, or after 4 minutes outside the budget rather than lose the job, and the room
+  is given back when the runner exits. The job shows as queued at GitHub meanwhile. Without coreslot the
+  VMs start at once, as before.
 - A docker runner has no container: the Docker die events, the reconcile and the start-up sweep of
   containers never release or remove it. Its clone's end is its exit; an idle one beyond the assigned
   jobs, or one left at the drain bound, is removed by deleting its clone.

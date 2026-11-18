@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/admit"
 	"github.com/Nezhinskiy/local-ci-pool/internal/supervisor"
 )
 
@@ -83,8 +84,9 @@ func clean(s string) string {
 }
 
 // formatStatus lays the snapshot out: one line for the pool, one per project
-// with the repository column padded to the longest, and a line under a project
-// for each job that waits too long for a runner. Every string from the
+// with the repository column padded to the longest, a line under a docker
+// project for its coreslot gate, and a line under a project for each job that
+// waits too long for a runner. Every string from the
 // snapshot goes through clean.
 func formatStatus(s supervisor.Snapshot) string {
 	var b strings.Builder
@@ -124,6 +126,9 @@ func formatStatus(s supervisor.Snapshot) string {
 			state = "unhealthy: " + clean(p.Reason)
 		}
 		fmt.Fprintf(&b, "  %-*s  %s\n", width, name(p), state)
+		if p.Coreslot != nil {
+			fmt.Fprintf(&b, "    coreslot: %s\n", coreslotLine(*p.Coreslot))
+		}
 		for _, j := range p.Stuck {
 			fmt.Fprintf(&b, "    queued %s: %s %s\n", time.Duration(j.QueuedS)*time.Second, clean(j.Job), clean(j.RunURL))
 		}
@@ -132,4 +137,21 @@ func formatStatus(s supervisor.Snapshot) string {
 		b.WriteString("reasons shown as classes only: the pool's health token could not be read; run pool status as the user the pool runs as\n")
 	}
 	return b.String()
+}
+
+// coreslotLine is a docker project's coreslot gate: why it is off, or its
+// runners waiting and held, the oldest wait, and the runners running without
+// the budget with the last reason.
+func coreslotLine(c admit.Health) string {
+	if c.State == "unbudgeted" {
+		return fmt.Sprintf("unbudgeted (%s)", clean(c.Reason))
+	}
+	line := fmt.Sprintf("waiting %d, held %d", c.Waiting, c.Held)
+	if c.Waiting > 0 {
+		line += fmt.Sprintf(", oldest %d s", c.OldestWaitS)
+	}
+	if c.Unbudgeted > 0 {
+		line += fmt.Sprintf(", unbudgeted %d (%s)", c.Unbudgeted, clean(c.LastUnbudgeted))
+	}
+	return line
 }
