@@ -78,6 +78,22 @@ type ScalerConfig struct {
 	// no-job exit), and that Desired call starts no runner. The supervisor
 	// binds it to the repository's visibility, cached. Nil vets nothing.
 	Vet func(ctx context.Context) error
+	// Admit, while Budgeted, makes each reserved runner wait for a coreslot
+	// permit before its JIT configuration is minted; the wait runs in a
+	// goroutine of its own, outside the scaler's lock. Not budgeted, or nil,
+	// every start is inline. *admit.Gate satisfies it.
+	Admit Admitter
+}
+
+// Admitter is the coreslot gate as a Scaler uses it. Bind returns true when
+// the runner may start (admitted, or to run without the budget) and false
+// only when its context ended or the gate stopped. Unbind is called for every
+// runner the scaler forgets; an unknown name is a no-op. The gate never calls
+// back into the scaler.
+type Admitter interface {
+	Bind(ctx context.Context, name string) bool
+	Unbind(name string)
+	Budgeted() bool
 }
 
 type runnerState int
@@ -94,7 +110,20 @@ const (
 	stateReaping
 	// stateDone: the job completed; the container is on its way out.
 	stateDone
+	// stateWaiting: the slot is taken and the runner waits for its permit;
+	// it counts as a starting runner.
+	stateWaiting
+	// stateWithdrawn: a waiting runner the count no longer needs. It holds
+	// its slot until its goroutine releases it, but no longer counts.
+	stateWithdrawn
 )
+
+// waiter is a runner waiting for its permit: its reserve order and the cancel
+// that withdraws its Bind.
+type waiter struct {
+	seq    uint64
+	cancel context.CancelFunc
+}
 
 // Scaler keeps one scale set's runners. Every runner it knows holds one slot,
 // given back exactly once, when release forgets the runner (Exited, a failed
@@ -109,7 +138,11 @@ type Scaler struct {
 	log        *slog.Logger
 	survivors  func() int
 	vet        func(ctx context.Context) error
+	admit      Admitter
 	names      func() (string, error)
+
+	// wg joins the goroutines that wait for a permit; see Wait.
+	wg sync.WaitGroup
 
 	// abort ends every launch and reap in flight; see Abort.
 	abort   context.Context
@@ -118,6 +151,9 @@ type Scaler struct {
 	mu       sync.Mutex
 	runners  map[string]runnerState
 	draining bool
+	// waits holds the waiting runners; seq numbers the reserved ones.
+	waits map[string]waiter
+	seq   uint64
 	// noJob counts the runners in a row that went away without ever
 	// reporting a job: a container that exited idle, or a start that failed
 	// after its JIT configuration was minted. Any job report clears it.
@@ -143,8 +179,10 @@ func NewScaler(cfg ScalerConfig) *Scaler {
 		log:        log.With(slog.Int("scaleSetID", cfg.ScaleSetID)),
 		survivors:  cfg.Survivors,
 		vet:        cfg.Vet,
+		admit:      cfg.Admit,
 		names:      newName,
 		runners:    map[string]runnerState{},
+		waits:      map[string]waiter{},
 	}
 }
 
@@ -161,9 +199,10 @@ func (s *Scaler) countLocked(states ...runnerState) int {
 	return n
 }
 
-// activeLocked counts the runners that can still take a job. s.mu is held.
+// activeLocked counts the runners that can still take a job, those waiting
+// for a permit included. s.mu is held.
 func (s *Scaler) activeLocked() int {
-	return s.countLocked(stateStarting, stateIdle, stateBusy)
+	return s.countLocked(stateWaiting, stateStarting, stateIdle, stateBusy)
 }
 
 // Desired brings the scale set towards count runners. While draining it adds
@@ -178,7 +217,13 @@ func (s *Scaler) activeLocked() int {
 // survivor's job gets no idle runner beside it.
 //
 // A start that fails ends this call's starts and is retried on the next.
+//
+// While Admit is budgeted each new runner waits for its permit in a goroutine
+// of its own and starts from there; this call does not wait for it, and the
+// starts are bounded by the count alone, which counts the waiting runners.
 func (s *Scaler) Desired(ctx context.Context, count int) (int, error) {
+	// Budgeted may stat a file: once per call, never under s.mu.
+	budgeted := s.admit != nil && s.admit.Budgeted()
 	// A survivor's job is vetted too: an idle survivor could take any job
 	// the count holds.
 	refused := count > 0 && !s.vetted(ctx)
@@ -196,8 +241,15 @@ func (s *Scaler) Desired(ctx context.Context, count int) (int, error) {
 	// need is fixed up front, so a runner that dies while it starts is not
 	// replaced within the same call.
 	for range max(need, 0) {
-		name, ok := s.reserve(ctx, count)
-		if !ok || !s.launch(ctx, name) {
+		name, wait, ok := s.reserve(ctx, count, budgeted)
+		if !ok {
+			break
+		}
+		if wait != nil {
+			go s.admitThenLaunch(ctx, wait, name)
+			continue
+		}
+		if !s.launch(ctx, name) {
 			break
 		}
 	}
@@ -224,29 +276,82 @@ func (s *Scaler) vetted(ctx context.Context) bool {
 }
 
 // reserve names a new runner, takes a slot for it and records it starting,
-// if the scale set is below its target.
-func (s *Scaler) reserve(ctx context.Context, count int) (string, bool) {
+// if the scale set is below its target. With budgeted it records the runner
+// waiting instead and returns the context its Bind waits under: free of the
+// caller's cancellation, ended by a withdrawal or by Abort.
+func (s *Scaler) reserve(ctx context.Context, count int, budgeted bool) (string, context.Context, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if ctx.Err() != nil {
-		return "", false
+		return "", nil, false
 	}
 	if s.draining || s.activeLocked() >= min(s.slots.Cap(), count) {
-		return "", false
+		return "", nil, false
 	}
 	name, err := s.names()
 	if err != nil {
 		s.log.Error("naming a runner", slog.String("error", err.Error()))
-		return "", false
+		return "", nil, false
 	}
 	if _, taken := s.runners[name]; taken {
-		return "", false
+		return "", nil, false
 	}
 	if !s.slots.TryAcquire() {
-		return "", false
+		return "", nil, false
 	}
-	s.runners[name] = stateStarting
-	return name, true
+	if !budgeted {
+		s.runners[name] = stateStarting
+		return name, nil, true
+	}
+	wait, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stop := context.AfterFunc(s.abort, cancel)
+	s.seq++
+	s.waits[name] = waiter{seq: s.seq, cancel: func() {
+		stop()
+		cancel()
+	}}
+	s.runners[name] = stateWaiting
+	s.wg.Add(1)
+	return name, wait, true
+}
+
+// admitThenLaunch is a waiting runner's goroutine: the vet, so that a refusal
+// spends no admission, then the wait for the permit, then the launch, unless
+// the runner was withdrawn meanwhile. The vet and the launch run under ctx
+// stripped of its cancellation: the caller returned long ago.
+func (s *Scaler) admitThenLaunch(ctx context.Context, wait context.Context, name string) {
+	defer s.wg.Done()
+	ctx = context.WithoutCancel(ctx)
+	if !s.vetted(ctx) {
+		s.release(name, false)
+		return
+	}
+	if !s.admit.Bind(wait, name) {
+		s.log.Info("the runner's permit was withdrawn", slog.String("runner", name))
+		s.release(name, false)
+		return
+	}
+	s.mu.Lock()
+	st, ok := s.runners[name]
+	if st == stateWaiting {
+		s.runners[name] = stateStarting
+	}
+	if w, waiting := s.waits[name]; waiting {
+		w.cancel()
+		delete(s.waits, name)
+	}
+	s.mu.Unlock()
+	switch {
+	case !ok:
+		// Forgotten while it waited: nothing releases it again.
+		s.admit.Unbind(name)
+		return
+	case st != stateWaiting:
+		// Withdrawn while the admission came: release unbinds it.
+		s.release(name, false)
+		return
+	}
+	s.launch(ctx, name)
 }
 
 // launch mints the runner's JIT configuration and starts its container,
@@ -364,6 +469,7 @@ func (s *Scaler) unregister(ctx context.Context, name string) error {
 // leaves the runner idle for the next call.
 func (s *Scaler) reap(ctx context.Context, count int) {
 	s.mu.Lock()
+	s.withdrawLocked(count)
 	excess := min(s.countLocked(stateStarting, stateIdle), s.activeLocked()-count)
 	var victims []string
 	for name, st := range s.runners {
@@ -379,6 +485,28 @@ func (s *Scaler) reap(ctx context.Context, count int) {
 
 	for _, name := range victims {
 		s.reapOne(ctx, name)
+	}
+}
+
+// withdrawLocked withdraws the newest waiting runners until the active ones
+// are within count. A withdrawn runner no longer counts, so a later call does
+// not withdraw a second one for the same drop; its goroutine releases its
+// slot once its Bind returns. s.mu is held.
+func (s *Scaler) withdrawLocked(count int) {
+	for s.activeLocked() > count {
+		newest, best := "", uint64(0)
+		for name, w := range s.waits {
+			if s.runners[name] == stateWaiting && w.seq > best {
+				newest, best = name, w.seq
+			}
+		}
+		if newest == "" {
+			return
+		}
+		s.runners[newest] = stateWithdrawn
+		s.waits[newest].cancel()
+		delete(s.waits, newest)
+		s.log.Info("withdrawing a runner waiting for its permit", slog.String("runner", newest))
 	}
 }
 
@@ -500,10 +628,18 @@ func (s *Scaler) release(name string, failedStart bool) {
 		s.noJob++
 	}
 	delete(s.runners, name)
+	if w, ok := s.waits[name]; ok {
+		w.cancel()
+		delete(s.waits, name)
+	}
 	if st == stateBusy {
 		s.slots.SetBusy(-1)
 	}
 	s.slots.Release()
+	// The lock order is scaler, then gate; the gate never calls back.
+	if s.admit != nil {
+		s.admit.Unbind(name)
+	}
 }
 
 // NoJobExits is the number of runners in a row that went away without
@@ -528,6 +664,11 @@ func (s *Scaler) ResetNoJobExits() {
 // its runner, within forgetTimeout. Abort never blocks.
 func (s *Scaler) Abort() { s.aborted() }
 
+// Wait returns once every goroutine waiting for a permit, and the launch it
+// went on to, has ended. After Abort each Bind returns at once and each launch
+// is bounded by launchTimeout, so Wait is too.
+func (s *Scaler) Wait() { s.wg.Wait() }
+
 // Drain stops new starts: Desired starts nothing from now on, and a start
 // whose JIT configuration is being minted is unregistered and released instead
 // of started. A start already creating its container completes. Desired still
@@ -548,16 +689,17 @@ func (s *Scaler) SetScaleSetID(id int) {
 	s.scaleSetID = id
 }
 
-// Idle is the number of runners started, or starting, that have not reported
-// a job.
+// Idle is the number of runners started, or starting (waiting for a permit
+// included), that have not reported a job.
 func (s *Scaler) Idle() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.countLocked(stateStarting, stateIdle)
+	return s.countLocked(stateWaiting, stateStarting, stateIdle)
 }
 
 // HeldRunner is one runner a Scaler holds a slot for. Starting is true while
-// its container may not exist yet.
+// its container may not exist yet: it is starting, or waiting for its permit,
+// or withdrawn from that wait.
 type HeldRunner struct {
 	Name     string
 	Starting bool
@@ -571,7 +713,8 @@ func (s *Scaler) Held() []HeldRunner {
 	defer s.mu.Unlock()
 	out := make([]HeldRunner, 0, len(s.runners))
 	for name, st := range s.runners {
-		out = append(out, HeldRunner{Name: name, Starting: st == stateStarting})
+		starting := st == stateStarting || st == stateWaiting || st == stateWithdrawn
+		out = append(out, HeldRunner{Name: name, Starting: starting})
 	}
 	slices.SortFunc(out, func(a, b HeldRunner) int { return strings.Compare(a.Name, b.Name) })
 	return out

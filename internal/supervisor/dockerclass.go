@@ -14,6 +14,7 @@ import (
 
 	"github.com/moby/moby/client"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/admit"
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runner"
 	"github.com/Nezhinskiy/local-ci-pool/internal/runnermount"
@@ -245,6 +246,23 @@ func (pr *project) startVM(ctx context.Context, name, jit string) error {
 		pr.launchErr = "docker vm: " + err.Error()
 	}
 	return err
+}
+
+// newGate is the docker class's coreslot gate: before a runner's VM starts,
+// one request for the VM's memory, labelled <identity>:docker-vm, waits for
+// coreslot to admit it (internal/admit).
+func (pr *project) newGate() *admit.Gate {
+	s := pr.s
+	size := []string{"--mem", fmt.Sprintf("%dG", s.deps.VM.MemoryGiB)}
+	return admit.New(admit.Config{
+		Coreslot: s.deps.Coreslot,
+		Label:    pr.identity + ":docker-vm",
+		Self:     s.deps.Self,
+		Size:     func() []string { return size },
+		Start:    s.deps.AdmitStart,
+		Clock:    s.deps.Clock.Now,
+		Log:      pr.log,
+	})
 }
 
 // vmRemover is a docker-class scaler's remover: removing a runner deletes its

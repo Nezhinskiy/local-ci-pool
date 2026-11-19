@@ -26,7 +26,7 @@ func main() {
 		<-ctx.Done()
 		stop()
 	}()
-	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr, realServices())
+	code := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr, realServices())
 	stop()
 	os.Exit(code)
 }

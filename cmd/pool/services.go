@@ -7,11 +7,13 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
 	"github.com/moby/moby/client"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/admit"
 	"github.com/Nezhinskiy/local-ci-pool/internal/config"
 	"github.com/Nezhinskiy/local-ci-pool/internal/ghauth"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
@@ -45,6 +47,10 @@ func newRealPool(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, erro
 	if err != nil {
 		return nil, nil, fmt.Errorf("finding the home directory: %w", err)
 	}
+	self, err := os.Executable()
+	if err != nil {
+		return nil, nil, fmt.Errorf("finding the pool's executable: %w", err)
+	}
 	settings := config.NewFile(nil, log)
 	tok := ghauth.NewSource(nil)
 	gh := github.New(tok, "")
@@ -77,8 +83,31 @@ func newRealPool(cfg supervisor.Config, log *slog.Logger) (pool, varWriter, erro
 			FreeGiB: vm.FreeGiBAt(vm.Home(home)),
 		},
 		StateDir: supportDir(),
+		// A docker VM waits for the installed coreslot to admit its room,
+		// asked through `pool hold`; without coreslot it starts at once.
+		Coreslot:   findCoreslot(home),
+		Self:       self,
+		AdmitStart: admit.StartProc,
 	})
 	return sup, gh, nil
+}
+
+// findCoreslot is the installed coreslot, "" when there is none: the first
+// executable coreslot in ~/.local/bin, /opt/homebrew/bin and /usr/local/bin,
+// then on PATH, which under launchd holds few directories. The pool runs the
+// installed one and carries no copy of its protocol.
+func findCoreslot(home string) string {
+	for _, dir := range []string{filepath.Join(home, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin"} {
+		path := filepath.Join(dir, "coreslot")
+		if fi, err := os.Stat(path); err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0 {
+			return path
+		}
+	}
+	path, err := exec.LookPath("coreslot")
+	if err != nil {
+		return ""
+	}
+	return path
 }
 
 func newRealForgetter(*slog.Logger) (forgetter, error) {

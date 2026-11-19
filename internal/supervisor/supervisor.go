@@ -23,6 +23,7 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/moby/moby/client"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/admit"
 	"github.com/Nezhinskiy/local-ci-pool/internal/discovery"
 	"github.com/Nezhinskiy/local-ci-pool/internal/github"
 	"github.com/Nezhinskiy/local-ci-pool/internal/image"
@@ -264,6 +265,13 @@ type Deps struct {
 	VM *vm.Backend
 	// StateDir keeps the pool's state across runs: the docker bases' keys.
 	StateDir string
+	// Coreslot is the installed coreslot's path, "" when none was found;
+	// Self is the pool's executable, which a request runs as `<Self> hold`.
+	// Each docker VM waits for coreslot to admit its room before it starts
+	// (internal/admit); without coreslot it starts at once, as before.
+	Coreslot, Self string
+	// AdmitStart starts one coreslot request (admit.StartProc, the default).
+	AdmitStart func(ctx context.Context, path string, args, env []string) (admit.Proc, error)
 }
 
 // Settings is what the settings file says (config.Settings).
@@ -321,6 +329,9 @@ type ProjectHealth struct {
 	// Stuck is the jobs the queued-job watch reports (queued.go); absent
 	// when there are none.
 	Stuck []StuckJob `json:"stuck,omitempty"`
+	// Coreslot is a docker-class entry's coreslot gate (internal/admit);
+	// absent on the container class and before the docker class is set up.
+	Coreslot *admit.Health `json:"coreslot,omitempty"`
 }
 
 // JobsHealth is the machine-wide cap on jobs, container jobs and docker VMs
@@ -432,6 +443,9 @@ func New(cfg Config, deps Deps) *Supervisor {
 	}
 	if s.deps.Caffeinate == nil {
 		s.deps.Caffeinate = caffeinate
+	}
+	if s.deps.AdmitStart == nil {
+		s.deps.AdmitStart = admit.StartProc
 	}
 	return s
 }
