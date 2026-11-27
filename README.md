@@ -1,5 +1,8 @@
 # local-ci-pool
 
+[![ci](https://github.com/Nezhinskiy/local-ci-pool/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Nezhinskiy/local-ci-pool/actions/workflows/ci.yml?query=branch%3Amain)
+[![Latest release](https://img.shields.io/github/v/release/Nezhinskiy/local-ci-pool)](https://github.com/Nezhinskiy/local-ci-pool/releases/latest)
+
 A pool of ephemeral GitHub Actions runners on the Macs you already own, for private repositories
 on a personal account. A Mac runs each job in a throwaway Docker container while it is awake; when no
 Mac is awake, GitHub-hosted runners take the job, with no token stored in the repository.
