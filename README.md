@@ -19,8 +19,10 @@ Mac is awake, GitHub-hosted runners take the job, with no token stored in the re
 - **CI still runs when the Macs sleep, with no secret.** Each Mac writes a heartbeat into a
   repository variable, and a `route` job reads it to choose the Mac's label or a hosted one. The
   usual selector, runner-fallback-action, needs a token that can read the repository's runners,
-  and it cannot see a pool that scales to zero: it chose the hosted runner in all three cases we
-  tried, also while a Mac was free ([Compared with](#compared-with)).
+  and it cannot see a pool that scales to zero: the runners API lists no runner while the pool is
+  idle, and a scale-set runner with no labels while one is up. In three manual tries on 2026-10-28,
+  not recorded in this repository, it chose the hosted runner each time, also while a Mac was free
+  (setup in [Compared with](#compared-with)).
 - **A job gets a throwaway container, not your Mac.** A plain self-hosted runner runs jobs as your
   user, with your files and your Docker. Here each job runs in a fresh container that is removed
   when it ends, as a non-root user, with no Docker socket and no host folders.
