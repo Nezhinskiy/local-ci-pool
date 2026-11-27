@@ -16,6 +16,15 @@
   CI does not run them; run them before a change to the runner mount, the entrypoint or the container
   spec.
 
+## AI-assisted contributions
+
+You may use coding assistants. In the pull request, say which parts a tool wrote. Run
+`go test -race ./...` and the other checks above that your change touches, read every changed line,
+and be ready to explain any of them. Pull requests that cannot answer a reviewer's question about
+their own code are closed. Issues and comments must be written or checked by you; do not paste
+unreviewed model output. Open tasks are labelled
+[`help wanted`](https://github.com/Nezhinskiy/local-ci-pool/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22).
+
 ## Public repository hygiene
 
 This repository is public and serves private ones. Keep every fixture, comment, document and

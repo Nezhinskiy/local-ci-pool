@@ -457,7 +457,10 @@ Supported upstream: `actions/scaleset v0.5.0`, pinned exactly.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the tests, the checks CI runs and the rules that keep this
-public repository free of private names. Report a vulnerability as [SECURITY.md](SECURITY.md#reporting)
+public repository free of private names. Open tasks are labelled
+[`help wanted`](https://github.com/Nezhinskiy/local-ci-pool/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22).
+You may use coding assistants: say in the pull request which parts a tool wrote, and be ready to
+explain every changed line ([the rule](CONTRIBUTING.md#ai-assisted-contributions)). Report a vulnerability as [SECURITY.md](SECURITY.md#reporting)
 describes. The code that adapts `actions/scaleset` is credited in [third_party/NOTICE](third_party/NOTICE).
 
 ## License
