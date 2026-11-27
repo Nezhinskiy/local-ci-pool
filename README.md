@@ -39,6 +39,19 @@ on most of the day. It is not built to be faster than GitHub's runners, and noth
 is; [bench/](bench/README.md) is a harness to measure your own jobs. Check
 [What does not work](#what-does-not-work) before you install.
 
+## Quick start at a glance
+
+The [Quick Start](#quick-start) below has each step with what you should see. In short, on a Mac
+that meets the [Requirements](#requirements):
+
+```sh
+gh auth login --scopes repo,workflow,read:org
+# in a private repository you own: commit the marker and the route job (Quick Start steps 2 and 3)
+gh repo clone Nezhinskiy/local-ci-pool && cd local-ci-pool
+git checkout "$(gh release view --json tagName --jq .tagName)" && ./install.sh
+"$HOME/Library/Application Support/local-ci-pool/bin/pool" status
+```
+
 ## Requirements
 
 | What | Needs | Check |
