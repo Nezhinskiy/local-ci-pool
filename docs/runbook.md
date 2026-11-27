@@ -483,7 +483,7 @@ fresh heartbeat, so the question is why this one did not.
    ```
 
    ```
-   pool v0.6.0 (a4d3acb) on examplemacbo: docker ok, login ok, 3 slots, 0 in use, at most 4 jobs
+   pool v0.7.3 (ef3a6ca) on examplemacbo: docker ok, login ok, 3 slots, 0 in use, at most 4 jobs
      alice/alpha  healthy
      alice/beta   unhealthy: draining
        queued 12m0s: test https://github.com/alice/beta/actions/runs/1

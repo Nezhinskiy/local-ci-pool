@@ -4,6 +4,9 @@ A pool of ephemeral GitHub Actions runners on the Macs you already own, for priv
 on a personal account. A Mac runs each job in a throwaway Docker container while it is awake; when no
 Mac is awake, GitHub-hosted runners take the job, with no token stored in the repository.
 
+Status: pre-1.0 (v0.7.x), one maintainer. It has run only on Apple silicon Macs with Docker Desktop
+on macOS 27; the other combinations are untested ([Requirements](#requirements)).
+
 ![Each Mac writes a heartbeat into a repository variable; a hosted route job reads it and sends the jobs to the Mac's label, or to a hosted label when no heartbeat is fresh](docs/img/routing.svg)
 
 ![pool status, then route: a Mac with a fresh heartbeat gets the job, a sleeping one falls back to hosted](docs/demo/demo.gif)
@@ -206,11 +209,11 @@ and cut to its letters and digits, at most 12):
 
 ```
 machine: examplemacbo (3 slots; heartbeat variable CI_POOL_HB_EXAMPLEMACBO)
-downloading v0.6.0 for darwin_arm64
+downloading v0.7.3 for darwin_arm64
 verifying the build provenance of …
-release: v0.6.0 a4d3acb
+release: v0.7.3 ef3a6ca
 …
-the pool v0.6.0 answers on http://127.0.0.1:8737/healthz
+the pool v0.7.3 answers on http://127.0.0.1:8737/healthz
 ```
 
 If it fails, it says why, and the checks run before it replaces anything: `gh is not logged in`,
@@ -229,14 +232,14 @@ binary is not on your `PATH`, and the pool does not run in your shell; it logs t
 While the runner and your image are being fetched or built, the project is not healthy yet:
 
 ```
-pool v0.6.0 (a4d3acb) on examplemacbo: docker ok, login ok, 3 slots, 0 in use
+pool v0.7.3 (ef3a6ca) on examplemacbo: docker ok, login ok, 3 slots, 0 in use
   alice/alpha  unhealthy: starting
 ```
 
 Run it again until the project reads `healthy`:
 
 ```
-pool v0.6.0 (a4d3acb) on examplemacbo: docker ok, login ok, 3 slots, 0 in use
+pool v0.7.3 (ef3a6ca) on examplemacbo: docker ok, login ok, 3 slots, 0 in use
   alice/alpha  healthy
   alice/beta   healthy
 ```
@@ -529,8 +532,8 @@ minutes after GitHub assigned its job, for coreslot to admit its 6 GiB; `pool st
 
 ## Status
 
-The latest release is the one `install.sh` installs, and `pool version` prints it; v0.6.0 at the time
-of writing. A release has `darwin_arm64` and `darwin_amd64` archives, their checksums and build
+The latest release is the one `install.sh` installs, and `pool version` prints it; the
+[releases page](https://github.com/Nezhinskiy/local-ci-pool/releases) lists them. A release has `darwin_arm64` and `darwin_amd64` archives, their checksums and build
 provenance. Of those, only Apple silicon with Docker Desktop on macOS 27 has run the pool; the other
 combinations are untested ([Requirements](#requirements)).
 

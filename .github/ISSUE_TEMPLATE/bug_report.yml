@@ -27,7 +27,7 @@ body:
     attributes:
       label: Pool version
       description: '`"$HOME/Library/Application Support/local-ci-pool/bin/pool" version`, or "not installed" when the installer failed'
-      placeholder: v0.6.0 a4d3acb
+      placeholder: v0.7.3 ef3a6ca
     validations:
       required: true
   - type: input
