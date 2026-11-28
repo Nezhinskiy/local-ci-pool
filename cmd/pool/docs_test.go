@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Nezhinskiy/local-ci-pool/internal/quickstartfixture"
 	"github.com/Nezhinskiy/local-ci-pool/internal/supervisor"
 )
 
@@ -17,8 +18,8 @@ import (
 func TestDocsQuoteStatusOutput(t *testing.T) {
 	base := func() supervisor.Snapshot {
 		return supervisor.Snapshot{
-			Version: "v0.7.3",
-			Commit:  "ef3a6ca",
+			Version: quickstartfixture.Version,
+			Commit:  quickstartfixture.Commit,
 			Machine: "examplemacbo",
 			Slots:   3,
 			Docker:  true,

@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Nezhinskiy/local-ci-pool/internal/quickstartfixture"
 )
 
 // The installer is driven with stubs for every tool that would touch the real
@@ -208,7 +210,7 @@ esac
 const stubPool = `#!/bin/sh
 echo "pool $*" >> "$STUB_LOG"
 case "$1" in
-version) echo "v0.1.0 abc1234" ;;
+version) echo "${STUB_POOL_VERSION:-v0.1.0} ${STUB_POOL_COMMIT:-abc1234}" ;;
 print-defaults) echo "{\"drain_seconds\":2400,\"stop_seconds\":2580,\"health_addr\":\"${STUB_HEALTH_ADDR:-127.0.0.1:8737}\"}" ;;
 forget)
 	p=gone
@@ -1953,5 +1955,67 @@ func TestUninstallKeepsSettings(t *testing.T) {
 	out, err := e.install("--uninstall")
 	if err != nil || strings.Contains(out, "kept ") {
 		t.Errorf("without a settings file: %v\n%s", err, out)
+	}
+}
+
+// The Quick Start's plain fenced sample quotes a stubbed install.
+func TestInstallOutputMatchesReadme(t *testing.T) {
+	doc, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, section, ok := strings.Cut(string(doc), "\n### 4. Install the pool\n")
+	if !ok {
+		t.Fatal("README has no installment Quick Start section")
+	}
+	section, _, _ = strings.Cut(section, "\n### ")
+	var fence string
+	var sample []string
+sampleBlock:
+	for _, line := range strings.Split(section, "\n") {
+		switch {
+		case strings.HasPrefix(line, "```") && fence == "":
+			fence = line
+		case line == "```":
+			if fence == "```" {
+				break sampleBlock
+			}
+			fence = ""
+		case fence == "```":
+			sample = append(sample, line)
+		}
+	}
+	if len(sample) == 0 {
+		t.Fatal("README has no installer output sample")
+	}
+
+	e := newEnv(t)
+	e.vars["STUB_DOCKER_INFO"] = fmt.Sprintf("%d 6", 18<<30)
+	e.vars["STUB_LATEST"] = quickstartfixture.Version
+	e.vars["STUB_NEW_VERSION"] = quickstartfixture.Version
+	e.vars["STUB_POOL_VERSION"] = quickstartfixture.Version
+	e.vars["STUB_POOL_COMMIT"] = quickstartfixture.Commit
+	output, err := e.install()
+	if err != nil {
+		t.Fatalf("stubbed install failed: %v\n%s", err, output)
+	}
+	lines := strings.Split(output, "\n")
+	for _, want := range sample {
+		if want == "…" {
+			continue
+		}
+		prefix, partial := strings.CutSuffix(want, "…")
+		matched := false
+		for len(lines) > 0 {
+			line := lines[0]
+			lines = lines[1:]
+			if line == want || (partial && strings.HasPrefix(line, prefix)) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Fatalf("installer output lacks README sample line %q in order:\n%s", want, output)
+		}
 	}
 }
